@@ -267,6 +267,7 @@ connection.onReferences((params: ReferenceParams): Location[] => {
 
     const aliases = [word, `dbo.${word}`];
     const locations: Location[] = [];
+    const seen = new Set<string>();
 
     for (const [uri] of definitions.entries()) {
         try {
@@ -291,13 +292,17 @@ connection.onReferences((params: ReferenceParams): Location[] => {
                     if (tableRefRegex.test(normLine) || colRefRegex.test(normLine)) {
                         const start = line.toLowerCase().indexOf(candidate);
                         if (start >= 0) {
-                            locations.push({
-                                uri,
-                                range: {
-                                    start: { line: i, character: start },
-                                    end: { line: i, character: start + candidate.length }
-                                }
-                            });
+                            const key = `${uri}:${i}:${start}:${candidate}`;
+                            if (!seen.has(key)) {
+                                seen.add(key);
+                                locations.push({
+                                    uri,
+                                    range: {
+                                        start: { line: i, character: start },
+                                        end: { line: i, character: start + candidate.length }
+                                    }
+                                });
+                            }
                         }
                     }
                 }
