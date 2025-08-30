@@ -2,6 +2,13 @@
   "name": "saralsql",
   "displayName": "SaralSQL : Initial Preview",
   "description": "Language Server for SQL (SSDT Projects in VS Code)",
+  "publisher":"SaralStalin"
+  ,"keywords": [
+    "SQL",
+    "language server",
+    "VS Code"
+  ],
+  "license": "MIT",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.103.0"
