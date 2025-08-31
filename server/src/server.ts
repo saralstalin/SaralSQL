@@ -88,60 +88,66 @@ function parseColumnsFromCreate(sql: string, startLine: number): ColumnDef[] {
         return [];
     }
 
-    let body = m[1];
-    body = stripComments(body);
+    const body = stripComments(m[1]);
+    const lines = body.split(/\r?\n/);
 
-    // Split by commas not inside parentheses
-    let parts: string[] = [];
-    let current = "";
-    let depth = 0;
-    for (const ch of body) {
-        if (ch === "(") {
-            depth++;
-        } else if (ch === ")") {
-            depth--;
-        }
-        if (ch === "," && depth === 0) {
-            parts.push(current);
-            current = "";
-        } else {
-            current += ch;
-        }
-    }
-    if (current.trim()) {
-        parts.push(current);
-    }
-
-    const constraintKeywords = ["primary key", "foreign key", "constraint", "index", "check", "unique"];
     const cols: ColumnDef[] = [];
-    for (let idx = 0; idx < parts.length; idx++) {
-        const p = parts[idx];
-        const trimmed = p.trim();
-        if (!trimmed) {
-            continue;
-        }
-        const lowered = trimmed.toLowerCase();
-        if (constraintKeywords.some((k) => lowered.startsWith(k))) {
+    const constraintKeywords = ["primary key", "foreign key", "constraint", "index", "check", "unique"];
+
+    for (let offset = 0; offset < lines.length; offset++) {
+        const line = lines[offset];
+        if (!line.trim()) {
             continue;
         }
 
-        // Column name = first identifier, type = next token
-        const match = /^\s*([A-Za-z_][A-Za-z0-9_\[\]]*)\s+(.+)/.exec(trimmed);
-        if (match) {
-            const rawCol = match[1].replace(/[\[\]]/g, "");
-            const type = match[2].split(/\s+/)[0];
-            if (!cols.some((c) => c.rawName === rawCol)) {
-                cols.push({
-                    name: rawCol.toLowerCase(),
-                    rawName: rawCol,
-                    type,
-                    line: startLine + idx
-                });
+        // --- split this line into column parts by commas not in parentheses ---
+        let parts: string[] = [];
+        let current = "";
+        let depth = 0;
+        for (const ch of line) {
+            if (ch === "(") { depth++; }
+            else if (ch === ")") { depth--; }
+            if (ch === "," && depth === 0) {
+                parts.push(current);
+                current = "";
+            } else {
+                current += ch;
+            }
+        }
+        if (current.trim()) {
+            parts.push(current);
+        }
+
+        for (const part of parts) {
+            const trimmed = part.trim();
+            if (!trimmed) {
+                continue;
+            }
+            const lowered = trimmed.toLowerCase();
+            if (constraintKeywords.some((k) => lowered.startsWith(k))) {
+                continue;
+            }
+
+            // Column name + type
+            const match = /^\s*([A-Za-z_][A-Za-z0-9_\[\]]*)\s+(.+)/.exec(trimmed);
+            if (match) {
+                const rawCol = match[1].replace(/[\[\]]/g, "");
+                const type = match[2].split(/\s+/)[0];
+                if (!cols.some((c) => c.rawName === rawCol)) {
+                    cols.push({
+                        name: rawCol.toLowerCase(),
+                        rawName: rawCol,
+                        type,
+                        line: startLine + offset  // correct file line
+                    });
+                }
             }
         }
     }
+
     return cols;
 }
+
 
 // ---------- Indexing ----------
 function indexText(uri: string, text: string): void {
@@ -228,31 +234,98 @@ documents.onDidClose((e) => {
 // --- Definition ---
 connection.onDefinition((params: DefinitionParams): Location[] | null => {
     const doc = documents.get(params.textDocument.uri);
-    if (!doc) {
-        return null;
-    }
+    if (!doc) { return null; }
 
     const wordRange = getWordRangeAtPosition(doc, params.position);
-    if (!wordRange) {
-        return null;
-    }
-    const word = normalizeName(doc.getText(wordRange));
+    if (!wordRange) { return null; }
 
-    const results: Location[] = [];
-    for (const defs of definitions.values()) {
-        for (const def of defs) {
-            if (def.name === word) {
-                results.push({
-                    uri: def.uri,
-                    range: { start: { line: def.line, character: 0 }, end: { line: def.line, character: 200 } }
-                });
+    const rawWord = doc.getText(wordRange);
+    let word = normalizeName(rawWord);
+
+    // If it's alias.column, keep only the column part
+    if (rawWord.includes(".")) {
+        const parts = rawWord.split(".");
+        if (parts.length === 2) {
+            word = normalizeName(parts[1]);
+        }
+    }
+
+    // Full line text where cursor is
+    const lineText = doc.getText({
+        start: { line: params.position.line, character: 0 },
+        end: { line: params.position.line, character: Number.MAX_VALUE }
+    });
+
+   
+    // 1) --- Alias.column case ---
+    const aliasRegex = /([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)/g;
+    let match: RegExpExecArray | null;
+    while ((match = aliasRegex.exec(lineText))) {
+        const alias = match[1].toLowerCase();
+        const colName = normalizeName(match[2]);
+
+        if (colName === word) {
+            const aliases = extractAliases(doc.getText());
+            const tableName = aliases.get(alias);
+
+            if (tableName) {
+                for (const defs of definitions.values()) {
+                    for (const def of defs) {
+                       if (normalizeName(def.name) === normalizeName(tableName) && def.columns) {
+                            for (const col of def.columns) {
+                                if (col.name === colName) {
+                                    return [{
+                                        uri: def.uri,
+                                        range: {
+                                            start: { line: col.line, character: 0 },
+                                            end: { line: col.line, character: 200 }
+                                        }
+                                    }];
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
+
+    // 2) --- Bare word case (table or column) ---
+    const results: Location[] = [];
+    for (const defs of definitions.values()) {
+        for (const def of defs) {
+            if (normalizeName(def.name) === word) {
+                results.push({
+                    uri: def.uri,
+                    range: {
+                        start: { line: def.line, character: 0 },
+                        end: { line: def.line, character: 200 }
+                    }
+                });
+            }
+            if (def.columns) {
+                for (const col of def.columns) {
+                    if (col.name === word) {
+                       results.push({
+                            uri: def.uri,
+                            range: {
+                                start: { line: col.line, character: 0 },
+                                end: { line: col.line, character: 200 }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if (results.length === 0) {
+    }
+
     return results.length > 0 ? results : null;
 });
 
-// --- References ---
+// --- References (unchanged from last version, context-aware) ---
 connection.onReferences((params: ReferenceParams): Location[] => {
     const doc = documents.get(params.textDocument.uri);
     if (!doc) {
@@ -263,7 +336,23 @@ connection.onReferences((params: ReferenceParams): Location[] => {
     if (!wordRange) {
         return [];
     }
-    const word = normalizeName(doc.getText(wordRange));
+    const rawWord = doc.getText(wordRange);
+    const word = normalizeName(rawWord);
+
+    // Determine context: is it a table or a column?
+    let isTable = false;
+    let isColumn = false;
+
+    for (const defs of definitions.values()) {
+        for (const def of defs) {
+            if (def.name === word) {
+                isTable = true;
+            }
+            if (def.columns?.some((c) => c.name === word)) {
+                isColumn = true;
+            }
+        }
+    }
 
     const aliases = [word, `dbo.${word}`];
     const locations: Location[] = [];
@@ -281,27 +370,46 @@ connection.onReferences((params: ReferenceParams): Location[] => {
                 const normLine = clean.toLowerCase();
 
                 for (const candidate of aliases) {
-                    const regex = new RegExp(`\\b${candidate}\\b`, "i");
-                    if (!regex.test(normLine)) {
-                        continue;
+                    // Only check table refs if the symbol is a table
+                    if (isTable) {
+                        const tableRefRegex = new RegExp(`\\b(from|join)\\s+${candidate}\\b`, "i");
+                        if (tableRefRegex.test(normLine)) {
+                            const start = normLine.indexOf(candidate);
+                            if (start >= 0) {
+                                const key = `${uri}:${i}:${start}:${candidate}`;
+                                if (!seen.has(key)) {
+                                    seen.add(key);
+                                    locations.push({
+                                        uri,
+                                        range: {
+                                            start: { line: i, character: start },
+                                            end: { line: i, character: start + candidate.length }
+                                        }
+                                    });
+                                }
+                            }
+                        }
                     }
 
-                    const tableRefRegex = new RegExp(`\\b(from|join)\\s+${candidate}\\b`, "i");
-                    const colRefRegex = new RegExp(`\\.${candidate}\\b`, "i");
+                    // Only check column refs if the symbol is a column
+                    if (isColumn) {
+                        const colAliasRegex = new RegExp(`\\.${candidate}\\b`, "i"); // e.EmployeeId
+                        const colBareRegex = new RegExp(`\\b${candidate}\\b`, "i");  // EmployeeId
 
-                    if (tableRefRegex.test(normLine) || colRefRegex.test(normLine)) {
-                        const start = line.toLowerCase().indexOf(candidate);
-                        if (start >= 0) {
-                            const key = `${uri}:${i}:${start}:${candidate}`;
-                            if (!seen.has(key)) {
-                                seen.add(key);
-                                locations.push({
-                                    uri,
-                                    range: {
-                                        start: { line: i, character: start },
-                                        end: { line: i, character: start + candidate.length }
-                                    }
-                                });
+                        if (colAliasRegex.test(normLine) || colBareRegex.test(normLine)) {
+                            const start = normLine.indexOf(candidate);
+                            if (start >= 0) {
+                                const key = `${uri}:${i}:${start}:${candidate}`;
+                                if (!seen.has(key)) {
+                                    seen.add(key);
+                                    locations.push({
+                                        uri,
+                                        range: {
+                                            start: { line: i, character: start },
+                                            end: { line: i, character: start + candidate.length }
+                                        }
+                                    });
+                                }
                             }
                         }
                     }
