@@ -81,7 +81,6 @@ interface ReferenceDef {
 }
 
 
-
 // ---------- Helpers ----------
 function normalizeName(name: string): string {
     let n = name.toLowerCase();
@@ -206,10 +205,13 @@ function parseColumnsFromCreate(sql: string, startLine: number): ColumnDef[] {
 
 // ---------- Indexing ----------
 function indexText(uri: string, text: string): void {
+    // --- normalize URI ---
+    const normUri = uri.startsWith("file://") ? uri : url.pathToFileURL(uri).toString();
+
     // --- cleanup old entries for this file ---
-    definitions.delete(uri);
+    definitions.delete(normUri);
     for (const [key, refs] of referencesIndex.entries()) {
-        const filtered = refs.filter(r => r.uri !== uri);
+        const filtered = refs.filter(r => r.uri !== normUri);
         if (filtered.length > 0) {
             referencesIndex.set(key, filtered);
         } else {
@@ -230,7 +232,7 @@ function indexText(uri: string, text: string): void {
             const rawName = match[2];
             const norm = normalizeName(rawName);
 
-            const sym: SymbolDef = { name: norm, rawName, uri, line: i };
+            const sym: SymbolDef = { name: norm, rawName, uri: normUri, line: i };
 
             if (kind === "TABLE" || (kind === "TYPE" && /\bAS\s+TABLE\b/i.test(line))) {
                 const cols = parseColumnsFromCreate(text, i);
@@ -238,13 +240,28 @@ function indexText(uri: string, text: string): void {
 
                 // update fast lookup map
                 const set = new Set<string>();
-                for (const c of cols) { set.add(c.name); }
+                for (const c of cols) set.add(c.name);
                 columnsByTable.set(norm, set);
+
+                // also index each column definition as a reference
+                for (const c of cols) {
+                    const colIdx = lines[i].toLowerCase().indexOf(c.rawName.toLowerCase());
+                    if (colIdx >= 0) {
+                        localRefs.push({
+                            name: `${norm}.${c.name}`,
+                            uri: normUri,
+                            line: i,
+                            start: colIdx,
+                            end: colIdx + c.rawName.length,
+                            kind: "column"
+                        });
+                    }
+                }
 
                 if (cols.length > 0) {
                     safeLog(
                         `Indexed ${rawName} with ${cols.length} cols: ${cols
-                            .map((c) => c.rawName + (c.type ? ":" + c.type : ""))
+                            .map(c => c.rawName + (c.type ? ":" + c.type : ""))
                             .join(", ")}`
                     );
                 }
@@ -252,15 +269,18 @@ function indexText(uri: string, text: string): void {
 
             defs.push(sym);
 
-            // add definition reference (table name itself)
-            localRefs.push({
-                name: norm,
-                uri,
-                line: i,
-                start: 0,
-                end: line.length,
-                kind: "table"
-            });
+            // add definition reference (table name itself at correct span)
+            const idx = line.toLowerCase().indexOf(rawName.toLowerCase());
+            if (idx >= 0) {
+                localRefs.push({
+                    name: norm,
+                    uri: normUri,
+                    line: i,
+                    start: idx,
+                    end: idx + rawName.length,
+                    kind: "table"
+                });
+            }
         }
     }
 
@@ -276,13 +296,12 @@ function indexText(uri: string, text: string): void {
             const raw = m[2];
             const norm = normalizeName(raw);
 
-            // compute correct offset for just the table name
             const keywordIndex = m.index;
             const tableIndex = keywordIndex + m[0].indexOf(raw);
 
             localRefs.push({
                 name: norm,
-                uri,
+                uri: normUri,
                 line: i,
                 start: tableIndex,
                 end: tableIndex + raw.length,
@@ -300,7 +319,7 @@ function indexText(uri: string, text: string): void {
                 const key = `${normalizeName(table)}.${col}`;
                 localRefs.push({
                     name: key,
-                    uri,
+                    uri: normUri,
                     line: i,
                     start: m.index,
                     end: m.index + m[0].length,
@@ -309,22 +328,20 @@ function indexText(uri: string, text: string): void {
             }
         }
 
-        // --- unaliased column usages (semantic resolution) ---
+        // --- unaliased column usages ---
         const bareColRegex = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
         while ((m = bareColRegex.exec(clean))) {
             const col = normalizeName(m[1]);
 
             // skip obvious SQL keywords
-            if (["from", "join", "on", "where", "and", "or", "select", "insert", "update", "delete", "into", "as", "count", "group", "by", "order"].includes(col)) {
-                continue;
-            }
+            if ([
+                "from","join","on","where","and","or","select","insert","update","delete",
+                "into","as","count","group","by","order"
+            ].includes(col)) continue;
 
             // already handled as alias.column
-            if (clean.includes(".")) {
-                continue;
-            }
+            if (clean.includes(".")) continue;
 
-            // find tables in scope for this line
             const tablesInScope: string[] = [];
             const fromJoinRegex = /\b(from|join)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
             let fm: RegExpExecArray | null;
@@ -332,7 +349,6 @@ function indexText(uri: string, text: string): void {
                 tablesInScope.push(normalizeName(fm[2]));
             }
 
-            // filter only tables that actually have this column (fast lookup)
             const candidateTables: string[] = [];
             for (const t of tablesInScope) {
                 if (columnsByTable.get(t)?.has(col)) {
@@ -344,47 +360,48 @@ function indexText(uri: string, text: string): void {
                 const key = `${candidateTables[0]}.${col}`;
                 localRefs.push({
                     name: key,
-                    uri,
+                    uri: normUri,
                     line: i,
                     start: m.index,
                     end: m.index + m[1].length,
                     kind: "column"
                 });
             } else if (candidateTables.length > 1) {
-                // ambiguous → store for all matches (demo-friendly)
                 for (const t of candidateTables) {
                     const key = `${t}.${col}`;
                     localRefs.push({
                         name: key,
-                        uri,
+                        uri: normUri,
                         line: i,
                         start: m.index,
                         end: m.index + m[1].length,
                         kind: "column"
                     });
                 }
-            } else {
-                // no match in any table → skip
             }
         }
     }
 
-    definitions.set(uri, defs);
+    definitions.set(normUri, defs);
 
-    // --- merge into global referencesIndex ---
+    // --- merge into global referencesIndex (dedup) ---
+    const seen = new Set<string>();
     for (const ref of localRefs) {
+        const key = `${ref.uri}:${ref.line}:${ref.start}:${ref.end}:${ref.name}`;
+        if (seen.has(key)) {continue;}
+        seen.add(key);
+
         const arr = referencesIndex.get(ref.name) || [];
         arr.push(ref);
         referencesIndex.set(ref.name, arr);
     }
 
-    aliasesByUri.set(uri, extractAliases(text));
+    aliasesByUri.set(normUri, extractAliases(text));
 
     for (const def of defs) {
         tablesByName.set(def.name, def);
     }
 }
-
 
 async function indexWorkspace(): Promise<void> {
     try {
@@ -596,17 +613,7 @@ connection.onDefinition((params: DefinitionParams): Location[] | null => {
 });
 
 
-// --- References ---
-connection.onReferences((params: ReferenceParams): Location[] => {
-    const doc = documents.get(params.textDocument.uri);
-    if (!doc) {return [];}
 
-    const range = getWordRangeAtPosition(doc, params.position);
-    if (!range) {return [];}
-
-    const rawWord = doc.getText(range);
-    return findReferencesForWord(rawWord, doc);
-});
 
 
 // --- Completion (unchanged) ---
@@ -703,6 +710,146 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
 
     return items;
 });
+
+// --- References ---
+connection.onReferences((params: ReferenceParams): Location[] => {
+    const doc = documents.get(params.textDocument.uri);
+    if (!doc) {return [];}
+
+    const range = getWordRangeAtPosition(doc, params.position);
+    if (!range) {return [];}
+
+    const rawWord = doc.getText(range);
+    return findReferencesForWord(rawWord, doc, params.position);
+});
+
+connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
+    const doc = documents.get(params.textDocument.uri);
+    if (!doc) {return null;}
+
+    const range = getWordRangeAtPosition(doc, params.position);
+    if (!range) {return null;}
+
+    const rawWord = doc.getText(range);
+    const newName = params.newName;
+
+    const locations = findReferencesForWord(rawWord, doc, params.position);
+    if (!locations || locations.length === 0) {return null;}
+
+    const editsByUri: { [uri: string]: TextEdit[] } = {};
+    const seen = new Set<string>();
+
+    for (const loc of locations) {
+        const key = `${loc.uri}:${loc.range.start.line}:${loc.range.start.character}:${loc.range.end.line}:${loc.range.end.character}`;
+        if (seen.has(key)) {continue;}
+        seen.add(key);
+
+        // ensure valid file:// URI
+        const uri = loc.uri.startsWith("file://") ? loc.uri : url.pathToFileURL(loc.uri).toString();
+
+        if (!editsByUri[uri]) {editsByUri[uri] = [];}
+        editsByUri[uri].push({ range: loc.range, newText: newName });
+    }
+
+    return { changes: editsByUri };
+});
+
+
+connection.onHover((params): Hover | null => {
+    const doc = documents.get(params.textDocument.uri);
+    if (!doc) {return null;}
+
+    const range = getWordRangeAtPosition(doc, params.position);
+    if (!range) {return null;}
+
+    const rawWord = doc.getText(range);
+    const word = normalizeName(rawWord);
+
+    const aliasInfo = resolveAlias(rawWord, doc, params.position);
+
+    // --- alias.column ---
+    if (aliasInfo.table && aliasInfo.column) {
+        for (const defs of definitions.values()) {
+            for (const def of defs) {
+                if (normalizeName(def.name) === aliasInfo.table && def.columns) {
+                    for (const c of def.columns) {
+                        if (c.name === aliasInfo.column) {
+                            return {
+                                contents: {
+                                    kind: MarkupKind.Markdown,
+                                    value: `**Column** \`${c.rawName}\`${c.type ? ` (${c.type})` : ""} in table \`${def.rawName}\``
+                                }
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- alias only ---
+    if (aliasInfo.table && !aliasInfo.column) {
+        return {
+            contents: {
+                kind: MarkupKind.Markdown,
+                value: `**Alias** \`${rawWord}\` for table \`${aliasInfo.table}\``
+            }
+        };
+    }
+
+    // --- table / column scoped ---
+    const statementText = getCurrentStatement(doc, params.position);
+    const candidateTables = new Set<string>();
+    const fromJoinRegex = /\b(from|join)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
+    let m: RegExpExecArray | null;
+    while ((m = fromJoinRegex.exec(statementText))) {
+        const table = normalizeName(m[2].replace(/^dbo\./i, ""));
+        candidateTables.add(table);
+    }
+
+    const matches: string[] = [];
+    for (const defs of definitions.values()) {
+        for (const def of defs) {
+            if (candidateTables.has(normalizeName(def.name)) && def.columns) {
+                for (const col of def.columns) {
+                    if (col.name === word) {
+                        matches.push(`${col.rawName}${col.type ? ` (${col.type})` : ""} in table ${def.rawName}`);
+                    }
+                }
+            }
+        }
+    }
+
+    if (matches.length === 1) {
+        return { contents: { kind: MarkupKind.Markdown, value: `**Column** ${matches[0]}` } };
+    } else if (matches.length > 1) {
+        return { contents: { kind: MarkupKind.Markdown, value: `**Column** \`${rawWord}\` (ambiguous, found in: ${matches.join(", ")})` } };
+    }
+
+    // --- global fallback ---
+    for (const defs of definitions.values()) {
+        for (const def of defs) {
+            if (normalizeName(def.name) === word) {
+                return { contents: { kind: MarkupKind.Markdown, value: `**Table** \`${def.rawName}\`` } };
+            }
+            if (def.columns) {
+                for (const col of def.columns) {
+                    if (col.name === word) {
+                        return {
+                            contents: {
+                                kind: MarkupKind.Markdown,
+                                value: `**Column** \`${col.rawName}\`${col.type ? ` (${col.type})` : ""} in table \`${def.rawName}\``
+                            }
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    return null;
+});
+
 
 async function validateTextDocument(doc: TextDocument): Promise<void> {
     if (!isIndexReady) {
@@ -803,158 +950,6 @@ async function validateTextDocument(doc: TextDocument): Promise<void> {
     connection.sendDiagnostics({ uri: doc.uri, diagnostics });
 }
 
-connection.onHover((params): Hover | null => {
-    const doc = documents.get(params.textDocument.uri);
-    if (!doc) {return null;}
-
-    const range = getWordRangeAtPosition(doc, params.position);
-    if (!range) {return null;}
-
-    const rawWord = doc.getText(range);
-    const word = normalizeName(rawWord);
-    const fullText = doc.getText();
-    const aliases = extractAliases(fullText);
-
-    // --- helper: get current statement text ---
-    function getCurrentStatement(): string {
-        const lines = fullText.split(/\r?\n/);
-        const currentLine = params.position.line;
-        let start = currentLine;
-        let end = currentLine;
-
-        // look upward until BEGIN/; or top
-        for (let i = currentLine; i >= 0; i--) {
-            if (/^\s*begin\b/i.test(lines[i]) || /;\s*$/.test(lines[i])) {
-                start = i + 1;
-                break;
-            }
-            if (i === 0) {start = 0;}
-        }
-
-        // look downward until END/; or bottom
-        for (let i = currentLine; i < lines.length; i++) {
-            if (/^\s*end\b/i.test(lines[i]) || /;\s*$/.test(lines[i])) {
-                end = i;
-                break;
-            }
-            if (i === lines.length - 1) {end = lines.length - 1;}
-        }
-
-        return lines.slice(start, end + 1).join("\n");
-    }
-
-    const statementText = getCurrentStatement();
-
-    // --- 1) Handle alias.column ---
-    if (rawWord.includes(".")) {
-        const [aliasRaw, colRaw] = rawWord.split(".");
-        if (aliasRaw && colRaw) {
-            const alias = aliasRaw.toLowerCase();
-            const col = normalizeName(colRaw);
-            const table = aliases.get(alias);
-            if (table) {
-                const normTable = normalizeName(table);
-                for (const defs of definitions.values()) {
-                    for (const def of defs) {
-                        if (normalizeName(def.name) === normTable && def.columns) {
-                            for (const c of def.columns) {
-                                if (c.name === col) {
-                                    return {
-                                        contents: {
-                                            kind: MarkupKind.Markdown,
-                                            value: `**Column** \`${c.rawName}\`${c.type ? ` (${c.type})` : ""} in table \`${def.rawName}\``
-                                        }
-                                    };
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // --- 2) Handle table alias directly ---
-    if (aliases.has(word)) {
-        const table = aliases.get(word);
-        return {
-            contents: {
-                kind: MarkupKind.Markdown,
-                value: `**Alias** \`${rawWord}\` for table \`${table}\``
-            }
-        };
-    }
-
-    // --- 3) Handle plain column (scoped to current statement) ---
-    const candidateTables = new Set<string>();
-    const fromJoinRegex = /\b(from|join)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
-    let m: RegExpExecArray | null;
-    while ((m = fromJoinRegex.exec(statementText))) {
-        const table = normalizeName(m[2].replace(/^dbo\./i, ""));
-        candidateTables.add(table);
-    }
-
-    const matches: { table: string; col: string; type?: string }[] = [];
-    for (const defs of definitions.values()) {
-        for (const def of defs) {
-            if (candidateTables.has(normalizeName(def.name)) && def.columns) {
-                for (const col of def.columns) {
-                    if (col.name === word) {
-                        matches.push({ table: def.rawName, col: col.rawName, type: col.type });
-                    }
-                }
-            }
-        }
-    }
-
-    if (matches.length === 1) {
-        const m = matches[0];
-        return {
-            contents: {
-                kind: MarkupKind.Markdown,
-                value: `**Column** \`${m.col}\`${m.type ? ` (${m.type})` : ""} in table \`${m.table}\``
-            }
-        };
-    } else if (matches.length > 1) {
-        return {
-            contents: {
-                kind: MarkupKind.Markdown,
-                value: `**Column** \`${rawWord}\` (ambiguous, found in: ${matches.map(x => x.table).join(", ")})`
-            }
-        };
-    }
-
-    // --- 4) Fallback: plain table or global column ---
-    for (const defs of definitions.values()) {
-        for (const def of defs) {
-            if (normalizeName(def.name) === word) {
-                return {
-                    contents: {
-                        kind: MarkupKind.Markdown,
-                        value: `**Table** \`${def.rawName}\``
-                    }
-                };
-            }
-            if (def.columns) {
-                for (const col of def.columns) {
-                    if (col.name === word) {
-                        return {
-                            contents: {
-                                kind: MarkupKind.Markdown,
-                                value: `**Column** \`${col.rawName}\`${col.type ? ` (${col.type})` : ""} in table \`${def.rawName}\``
-                            }
-                        };
-                    }
-                }
-            }
-        }
-    }
-
-    return null;
-});
-
-
-
 connection.onDocumentSymbol((params): DocumentSymbol[] => {
     const uri = params.textDocument.uri;
     const defs = definitions.get(uri) || [];
@@ -983,32 +978,6 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
     }
 
     return symbols;
-});
-
-
-connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
-    const doc = documents.get(params.textDocument.uri);
-    if (!doc) {return null;}
-
-    const range = getWordRangeAtPosition(doc, params.position);
-    if (!range) {return null;}
-
-    const rawWord = doc.getText(range);
-    const newName = params.newName;
-
-    const locations = findReferencesForWord(rawWord, doc);
-    if (!locations || locations.length === 0) {return null;}
-
-    const editsByUri: { [uri: string]: TextEdit[] } = {};
-    for (const loc of locations) {
-        if (!editsByUri[loc.uri]) {editsByUri[loc.uri] = [];}
-        editsByUri[loc.uri].push({
-            range: loc.range,
-            newText: newName
-        });
-    }
-
-    return { changes: editsByUri };
 });
 
 // ---------- Helpers ----------
@@ -1148,6 +1117,61 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
     }
 
     return results;
+}
+
+function getCurrentStatement(doc: TextDocument, position: Position): string {
+    const fullText = doc.getText();
+    const lines = fullText.split(/\r?\n/);
+    const currentLine = position.line;
+    let start = currentLine;
+    let end = currentLine;
+
+    // look upward until BEGIN/; or top
+    for (let i = currentLine; i >= 0; i--) {
+        if (/^\s*begin\b/i.test(lines[i]) || /;\s*$/.test(lines[i])) {
+            start = i + 1;
+            break;
+        }
+        if (i === 0) {start = 0;}
+    }
+
+    // look downward until END/; or bottom
+    for (let i = currentLine; i < lines.length; i++) {
+        if (/^\s*end\b/i.test(lines[i]) || /;\s*$/.test(lines[i])) {
+            end = i;
+            break;
+        }
+        if (i === lines.length - 1) {end = lines.length - 1;}
+    }
+
+    return lines.slice(start, end + 1).join("\n");
+}
+
+
+function resolveAlias(rawWord: string, doc: TextDocument, position: Position): { table?: string; column?: string } {
+    const statementText = getCurrentStatement(doc, position);
+    const aliases = extractAliases(statementText);
+
+    // alias.column → split and resolve
+    if (rawWord.includes(".")) {
+        const [aliasRaw, colRaw] = rawWord.split(".");
+        if (aliasRaw && colRaw) {
+            const alias = aliasRaw.toLowerCase();
+            const col = normalizeName(colRaw);
+            const table = aliases.get(alias);
+            if (table) {
+                return { table: normalizeName(table), column: col };
+            }
+        }
+    }
+
+    // alias only → resolve to table
+    const aliasTable = aliases.get(normalizeName(rawWord));
+    if (aliasTable) {
+        return { table: normalizeName(aliasTable) };
+    }
+
+    return {};
 }
 
 // ---------- Startup ----------
