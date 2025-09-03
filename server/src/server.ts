@@ -231,66 +231,29 @@ documents.onDidClose((e) => {
     definitions.delete(e.document.uri);
 });
 
-// --- Definition ---
-connection.onDefinition((params: DefinitionParams): Location[] | null => {
-    const doc = documents.get(params.textDocument.uri);
-    if (!doc) { return null; }
-
-    const wordRange = getWordRangeAtPosition(doc, params.position);
-    if (!wordRange) { return null; }
-
-    const rawWord = doc.getText(wordRange);
-    let word = normalizeName(rawWord);
-
-    // If it's alias.column, keep only the column part
-    if (rawWord.includes(".")) {
-        const parts = rawWord.split(".");
-        if (parts.length === 2) {
-            word = normalizeName(parts[1]);
-        }
-    }
-
-    // Full line text where cursor is
-    const lineText = doc.getText({
-        start: { line: params.position.line, character: 0 },
-        end: { line: params.position.line, character: Number.MAX_VALUE }
-    });
-
-   
-    // 1) --- Alias.column case ---
-    const aliasRegex = /([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)/g;
-    let match: RegExpExecArray | null;
-    while ((match = aliasRegex.exec(lineText))) {
-        const alias = match[1].toLowerCase();
-        const colName = normalizeName(match[2]);
-
-        if (colName === word) {
-            const aliases = extractAliases(doc.getText());
-            const tableName = aliases.get(alias);
-
-            if (tableName) {
-                for (const defs of definitions.values()) {
-                    for (const def of defs) {
-                       if (normalizeName(def.name) === normalizeName(tableName) && def.columns) {
-                            for (const col of def.columns) {
-                                if (col.name === colName) {
-                                    return [{
-                                        uri: def.uri,
-                                        range: {
-                                            start: { line: col.line, character: 0 },
-                                            end: { line: col.line, character: 200 }
-                                        }
-                                    }];
-                                }
+function findColumnInTable(tableName: string, colName: string): Location[] {
+    const results: Location[] = [];
+    for (const defs of definitions.values()) {
+        for (const def of defs) {
+            if (normalizeName(def.name) === normalizeName(tableName) && def.columns) {
+                for (const col of def.columns) {
+                    if (col.name === colName) {
+                        results.push({
+                            uri: def.uri,
+                            range: {
+                                start: { line: col.line, character: 0 },
+                                end: { line: col.line, character: 200 }
                             }
-                        }
+                        });
                     }
                 }
             }
         }
     }
+    return results;
+}
 
-    // 2) --- Bare word case (table or column) ---
+function findTableOrColumn(word: string): Location[] {
     const results: Location[] = [];
     for (const defs of definitions.values()) {
         for (const def of defs) {
@@ -306,7 +269,7 @@ connection.onDefinition((params: DefinitionParams): Location[] | null => {
             if (def.columns) {
                 for (const col of def.columns) {
                     if (col.name === word) {
-                       results.push({
+                        results.push({
                             uri: def.uri,
                             range: {
                                 start: { line: col.line, character: 0 },
@@ -318,14 +281,86 @@ connection.onDefinition((params: DefinitionParams): Location[] | null => {
             }
         }
     }
+    return results;
+}
 
-    if (results.length === 0) {
+// --- Definitions ---
+connection.onDefinition((params: DefinitionParams): Location[] | null => {
+    const doc = documents.get(params.textDocument.uri);
+    if (!doc) { return null; }
+
+    const wordRange = getWordRangeAtPosition(doc, params.position);
+    if (!wordRange) { return null; }
+
+    const rawWord = doc.getText(wordRange);
+    let word = normalizeName(rawWord);
+
+    // Handle alias.column → strip alias
+    if (rawWord.includes(".")) {
+        const parts = rawWord.split(".");
+        if (parts.length === 2) {
+            word = normalizeName(parts[1]);
+        }
     }
 
-    return results.length > 0 ? results : null;
+    const fullText = doc.getText();
+    const lineText = doc.getText({
+        start: { line: params.position.line, character: 0 },
+        end: { line: params.position.line, character: Number.MAX_VALUE }
+    });
+
+    // --- 1) Alias.column case ---
+    const aliasRegex = /([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)/g;
+    let match: RegExpExecArray | null;
+    while ((match = aliasRegex.exec(lineText))) {
+        const alias = match[1].toLowerCase();
+        const colName = normalizeName(match[2]);
+        if (colName === word) {
+            const aliases = extractAliases(fullText);
+            const tableName = aliases.get(alias);
+            if (tableName) {
+                const res = findColumnInTable(tableName, colName);
+                if (res.length > 0) { return res; }
+            }
+        }
+    }
+
+    // --- 2) INSERT INTO case ---
+    const insertMatch = /insert\s+into\s+([a-zA-Z0-9_\[\]\.]+)/i.exec(fullText);
+    if (insertMatch) {
+        const res = findColumnInTable(insertMatch[1], word);
+        if (res.length > 0) { return res; }
+    }
+
+    // --- 3) FROM (no alias) case ---
+    const fromMatch = /\bfrom\s+([a-zA-Z0-9_\[\]\.]+)(?!\s+[a-zA-Z0-9_]+)/i.exec(fullText);
+    if (fromMatch) {
+        const res = findColumnInTable(fromMatch[1], word);
+        if (res.length > 0) { return res; }
+    }
+
+    // --- 4) JOIN (no alias) case ---
+    const joinRegex = /\bjoin\s+([a-zA-Z0-9_\[\]\.]+)(?!\s+[a-zA-Z0-9_]+)/gi;
+    let joinMatch: RegExpExecArray | null;
+    while ((joinMatch = joinRegex.exec(fullText))) {
+        const res = findColumnInTable(joinMatch[1], word);
+        if (res.length > 0) { return res; }
+    }
+
+    // --- 5) UPDATE case ---
+    const updateMatch = /\bupdate\s+([a-zA-Z0-9_\[\]\.]+)/i.exec(fullText);
+    if (updateMatch) {
+        const res = findColumnInTable(updateMatch[1], word);
+        if (res.length > 0) { return res; }
+    }
+
+    // --- 6) Fallback global ---
+    const fallback = findTableOrColumn(word);
+    return fallback.length > 0 ? fallback : null;
 });
 
-// --- References (unchanged from last version, context-aware) ---
+
+// --- References ---
 connection.onReferences((params: ReferenceParams): Location[] => {
     const doc = documents.get(params.textDocument.uri);
     if (!doc) {
