@@ -37,7 +37,17 @@ interface SymbolDef {
     columns?: ColumnDef[];
 }
 
+interface ReferenceDef {
+    name: string; // normalized table or column name
+    uri: string;
+    line: number;
+    start: number;
+    end: number;
+    kind: "table" | "column";
+}
+
 const definitions = new Map<string, SymbolDef[]>();
+const referencesIndex = new Map<string, ReferenceDef[]>();
 
 // ---------- Helpers ----------
 function normalizeName(name: string): string {
@@ -148,12 +158,13 @@ function parseColumnsFromCreate(sql: string, startLine: number): ColumnDef[] {
     return cols;
 }
 
-
 // ---------- Indexing ----------
 function indexText(uri: string, text: string): void {
     const defs: SymbolDef[] = [];
     const lines = text.split(/\r?\n/);
+    const localRefs: ReferenceDef[] = [];
 
+    // scan for definitions
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         const match = /^\s*CREATE\s+(PROCEDURE|FUNCTION|VIEW|TABLE|TYPE)\s+([a-zA-Z0-9_\[\]\.]+)/i.exec(line);
@@ -173,10 +184,75 @@ function indexText(uri: string, text: string): void {
             }
 
             defs.push(sym);
+
+            // add definition reference
+            localRefs.push({
+                name: norm,
+                uri,
+                line: i,
+                start: 0,
+                end: line.length,
+                kind: "table"
+            });
+        }
+    }
+
+    // scan for usage references
+    const aliases = extractAliases(text);
+    for (let i = 0; i < lines.length; i++) {
+        const clean = stripComments(lines[i]);
+        const normLine = clean.toLowerCase();
+
+        // table usages
+        const tableRegex = /\b(from|join|update|into)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
+        let m: RegExpExecArray | null;
+        while ((m = tableRegex.exec(clean))) {  // use clean, not normLine
+            const keyword = m[1];
+            const raw = m[2];
+            const norm = normalizeName(raw);
+
+            const keywordIndex = m.index;
+            const tableIndex = keywordIndex + m[0].indexOf(raw);
+
+            localRefs.push({
+                name: norm,
+                uri,
+                line: i,
+                start: tableIndex,
+                end: tableIndex + raw.length,
+                kind: "table"
+            });
+        }
+
+
+        // column usages via alias
+        const colRegex = /([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)/g;
+        while ((m = colRegex.exec(clean))) {
+            const alias = m[1].toLowerCase();
+            const col = normalizeName(m[2]);
+            const table = aliases.get(alias);
+            if (table) {
+                const key = `${normalizeName(table)}.${col}`;
+                localRefs.push({
+                    name: key,
+                    uri,
+                    line: i,
+                    start: m.index,
+                    end: m.index + m[0].length,
+                    kind: "column"
+                });
+            }
         }
     }
 
     definitions.set(uri, defs);
+
+    // merge into global referencesIndex
+    for (const ref of localRefs) {
+        const arr = referencesIndex.get(ref.name) || [];
+        arr.push(ref);
+        referencesIndex.set(ref.name, arr);
+    }
 }
 
 async function indexWorkspace(): Promise<void> {
@@ -227,10 +303,9 @@ documents.onDidOpen((e) => {
 documents.onDidChangeContent((e) => {
     indexText(e.document.uri, e.document.getText());
 });
-documents.onDidClose((e) => {
-    definitions.delete(e.document.uri);
-});
 
+
+// --- Definitions (unchanged) ---
 function findColumnInTable(tableName: string, colName: string): Location[] {
     const results: Location[] = [];
     for (const defs of definitions.values()) {
@@ -284,7 +359,6 @@ function findTableOrColumn(word: string): Location[] {
     return results;
 }
 
-// --- Definitions ---
 connection.onDefinition((params: DefinitionParams): Location[] | null => {
     const doc = documents.get(params.textDocument.uri);
     if (!doc) { return null; }
@@ -359,106 +433,83 @@ connection.onDefinition((params: DefinitionParams): Location[] | null => {
     return fallback.length > 0 ? fallback : null;
 });
 
-
 // --- References ---
 connection.onReferences((params: ReferenceParams): Location[] => {
     const doc = documents.get(params.textDocument.uri);
-    if (!doc) {
-        return [];
-    }
+    if (!doc) { return []; }
 
     const wordRange = getWordRangeAtPosition(doc, params.position);
-    if (!wordRange) {
-        return [];
-    }
+    if (!wordRange) { return []; }
+
     const rawWord = doc.getText(wordRange);
-    const word = normalizeName(rawWord);
+    let word = normalizeName(rawWord);
 
-    // Determine context: is it a table or a column?
-    let isTable = false;
-    let isColumn = false;
+    const fullText = doc.getText();
+    const lineText = doc.getText({
+        start: { line: params.position.line, character: 0 },
+        end: { line: params.position.line, character: Number.MAX_VALUE }
+    });
 
-    for (const defs of definitions.values()) {
-        for (const def of defs) {
-            if (def.name === word) {
-                isTable = true;
-            }
-            if (def.columns?.some((c) => c.name === word)) {
-                isColumn = true;
-            }
-        }
-    }
+    const results: Location[] = [];
 
-    const aliases = [word, `dbo.${word}`];
-    const locations: Location[] = [];
-    const seen = new Set<string>();
-
-    for (const [uri] of definitions.entries()) {
-        try {
-            const fileDoc = documents.get(uri);
-            const text = fileDoc ? fileDoc.getText() : fs.readFileSync(url.fileURLToPath(uri), "utf8");
-            const lines = text.split(/\r?\n/);
-
-            for (let i = 0; i < lines.length; i++) {
-                const line = lines[i];
-                const clean = stripComments(line);
-                const normLine = clean.toLowerCase();
-
-                for (const candidate of aliases) {
-                    // Only check table refs if the symbol is a table
-                    if (isTable) {
-                        const tableRefRegex = new RegExp(`\\b(from|join)\\s+${candidate}\\b`, "i");
-                        if (tableRefRegex.test(normLine)) {
-                            const start = normLine.indexOf(candidate);
-                            if (start >= 0) {
-                                const key = `${uri}:${i}:${start}:${candidate}`;
-                                if (!seen.has(key)) {
-                                    seen.add(key);
-                                    locations.push({
-                                        uri,
-                                        range: {
-                                            start: { line: i, character: start },
-                                            end: { line: i, character: start + candidate.length }
-                                        }
-                                    });
-                                }
-                            }
+    // --- 1) Handle alias.column explicitly ---
+    if (rawWord.includes(".")) {
+        const parts = rawWord.split(".");
+        if (parts.length === 2) {
+            const alias = parts[0].toLowerCase();
+            const colName = normalizeName(parts[1]);
+            const aliases = extractAliases(fullText);
+            const table = aliases.get(alias);
+            if (table) {
+                const key = `${normalizeName(table)}.${colName}`;
+                const refs = referencesIndex.get(key) || [];
+                for (const r of refs) {
+                    results.push({
+                        uri: r.uri,
+                        range: {
+                            start: { line: r.line, character: r.start },
+                            end: { line: r.line, character: r.end }
                         }
-                    }
-
-                    // Only check column refs if the symbol is a column
-                    if (isColumn) {
-                        const colAliasRegex = new RegExp(`\\.${candidate}\\b`, "i"); // e.EmployeeId
-                        const colBareRegex = new RegExp(`\\b${candidate}\\b`, "i");  // EmployeeId
-
-                        if (colAliasRegex.test(normLine) || colBareRegex.test(normLine)) {
-                            const start = normLine.indexOf(candidate);
-                            if (start >= 0) {
-                                const key = `${uri}:${i}:${start}:${candidate}`;
-                                if (!seen.has(key)) {
-                                    seen.add(key);
-                                    locations.push({
-                                        uri,
-                                        range: {
-                                            start: { line: i, character: start },
-                                            end: { line: i, character: start + candidate.length }
-                                        }
-                                    });
-                                }
-                            }
-                        }
-                    }
+                    });
                 }
+                return results;
             }
-        } catch (err) {
-            safeError(`Failed to read ${uri}`, err);
         }
     }
 
-    return locations;
+    // --- 2) Table match (definition + usages) ---
+    const tableRefs = referencesIndex.get(word) || [];
+    for (const r of tableRefs) {
+        results.push({
+            uri: r.uri,
+            range: {
+                start: { line: r.line, character: r.start },
+                end: { line: r.line, character: r.end }
+            }
+        });
+    }
+
+    // --- 3) Column match across tables (fallback) ---
+    for (const [key, refs] of referencesIndex.entries()) {
+        if (key.endsWith(`.${word}`)) {
+            for (const r of refs) {
+                results.push({
+                    uri: r.uri,
+                    range: {
+                        start: { line: r.line, character: r.start },
+                        end: { line: r.line, character: r.end }
+                    }
+                });
+            }
+        }
+    }
+
+    return results;
 });
 
-// --- Completion ---
+
+
+// --- Completion (unchanged) ---
 connection.onCompletion((params: CompletionParams): CompletionItem[] => {
     const doc = documents.get(params.textDocument.uri);
     if (!doc) {
