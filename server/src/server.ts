@@ -38,6 +38,7 @@ const referencesIndex = new Map<string, ReferenceDef[]>();
 const tablesByName = new Map<string, SymbolDef>();
 
 let isIndexReady = false;
+let enableValidation = false;
 
 // Call this after building the definitions index
 function markIndexReady() {
@@ -83,19 +84,24 @@ interface ReferenceDef {
 
 // ---------- Helpers ----------
 function normalizeName(name: string): string {
-    let n = name.toLowerCase();
-    n = n.replace(/[\[\]]/g, "");
+    if (!name) {return "";}
+
+    // remove square brackets and lowercase
+    let n = name.replace(/[\[\]]/g, "").toLowerCase().trim();
 
     const parts = n.split(".");
     if (parts.length === 2) {
         const [schema, object] = parts;
         if (schema === "dbo") {
-            return object;
+            return object; // strip dbo
         }
         return `${schema}.${object}`;
     }
     return n;
 }
+
+
+
 
 function safeLog(msg: string): void {
     if (process.env.SARALSQL_DEBUG) {
@@ -116,17 +122,18 @@ function stripComments(sql: string): string {
 function extractAliases(text: string): Map<string, string> {
     const aliases = new Map<string, string>();
 
-    // 1) Table aliases: FROM Employee e, JOIN ProjectEmployee pe
-    const tableAliasRegex = /\b(from|join)\s+([a-zA-Z0-9_\[\]\.]+)\s+([a-zA-Z0-9_]+)/gi;
+    // Table aliases: supports [dbo].[X] [a], dbo.[X] a, schema.X AS alias
+    const tableAliasRegex =
+        /\b(from|join)\s+((?:\[?[a-zA-Z0-9_]+\]?)(?:\.\[?[a-zA-Z0-9_]+\]?)?)\s+(?:as\s+)?(\[?[a-zA-Z0-9_]+\]?)/gi;
     let m: RegExpExecArray | null;
     while ((m = tableAliasRegex.exec(text))) {
         const rawTable = m[2];
-        const alias = m[3].toLowerCase();
+        const alias = m[3].replace(/[\[\]]/g, "").toLowerCase(); // strip brackets
         aliases.set(alias, normalizeName(rawTable));
     }
 
-    // 2) Subquery aliases: FROM (SELECT ...) e
-    const subqueryAliasRegex = /\)\s+([a-zA-Z0-9_]+)/gi;
+    // Subquery aliases: FROM (SELECT ...) x or FROM (SELECT ...) AS x
+    const subqueryAliasRegex = /\)\s+(?:as\s+)?([a-zA-Z0-9_]+)/gi;
     let sm: RegExpExecArray | null;
     while ((sm = subqueryAliasRegex.exec(text))) {
         const alias = sm[1].toLowerCase();
@@ -135,6 +142,8 @@ function extractAliases(text: string): Map<string, string> {
 
     return aliases;
 }
+
+
 
 // ---------- Column Parser ----------
 function parseColumnsFromCreate(sql: string, startLine: number): ColumnDef[] {
@@ -240,7 +249,7 @@ function indexText(uri: string, text: string): void {
 
                 // update fast lookup map
                 const set = new Set<string>();
-                for (const c of cols) set.add(c.name);
+                for (const c of cols) {set.add(c.name);}
                 columnsByTable.set(norm, set);
 
                 // also index each column definition as a reference
@@ -337,10 +346,10 @@ function indexText(uri: string, text: string): void {
             if ([
                 "from","join","on","where","and","or","select","insert","update","delete",
                 "into","as","count","group","by","order"
-            ].includes(col)) continue;
+            ].includes(col)) {continue;}
 
             // already handled as alias.column
-            if (clean.includes(".")) continue;
+            if (clean.includes(".")) {continue;}
 
             const tablesInScope: string[] = [];
             const fromJoinRegex = /\b(from|join)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
@@ -457,11 +466,11 @@ connection.onInitialized(async () => {
 
 documents.onDidOpen((e) => {
     indexText(e.document.uri, e.document.getText());
-    validateTextDocument(e.document);
+    if (enableValidation) {validateTextDocument(e.document);}
 });
 documents.onDidChangeContent((e) => {
     indexText(e.document.uri, e.document.getText());
-    validateTextDocument(e.document);
+    if (enableValidation) {validateTextDocument(e.document);}
 });
 
 
@@ -852,7 +861,7 @@ connection.onHover((params): Hover | null => {
 
 
 async function validateTextDocument(doc: TextDocument): Promise<void> {
-    if (!isIndexReady) {
+    if (!isIndexReady || !enableValidation) {
         connection.sendDiagnostics({ uri: doc.uri, diagnostics: [] });
         return;
     }
@@ -1118,6 +1127,25 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
 
     return results;
 }
+
+connection.onDidChangeConfiguration(change => {
+    const settings = (change.settings || {}) as any;
+    // expect setting under "saralsql.enableValidation"
+    enableValidation = !!settings.saralsql?.enableValidation;
+    safeLog(`Validation ${enableValidation ? "enabled" : "disabled"}`);
+    
+    // re-run validation if it just got enabled
+    if (enableValidation) {
+        for (const doc of documents.all()) {
+            validateTextDocument(doc);
+        }
+    } else {
+        // clear diagnostics if disabled
+        for (const doc of documents.all()) {
+            connection.sendDiagnostics({ uri: doc.uri, diagnostics: [] });
+        }
+    }
+});
 
 function getCurrentStatement(doc: TextDocument, position: Position): string {
     const fullText = doc.getText();

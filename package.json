@@ -2,14 +2,14 @@
   "name": "saralsql",
   "displayName": "SaralSQL : Initial Preview",
   "description": "Language Server for SQL (SSDT Projects in VS Code)",
-  "publisher":"SaralStalin"
-  ,"keywords": [
+  "publisher": "SaralStalin",
+  "keywords": [
     "SQL",
     "language server",
     "VS Code"
   ],
   "license": "MIT",
-  "version": "0.0.4",
+  "version": "0.0.7",
   "engines": {
     "vscode": "^1.103.0"
   },
@@ -32,7 +32,17 @@
           ".sql"
         ]
       }
-    ]
+    ],
+    "configuration": {
+      "title": "SaralSQL",
+      "properties": {
+        "saralsql.enableValidation": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable lightweight SQL validation (experimental). Disabled by default."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
@@ -66,6 +76,8 @@
     "vscode-languageserver": "^9.0.1",
     "vscode-languageserver-textdocument": "^1.0.12"
   },
-  "repository": {"type": "git",
-    "url": "https://github.com/saralstalin/SaralSQL.git"}
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/saralstalin/SaralSQL.git"
+  }
 }
