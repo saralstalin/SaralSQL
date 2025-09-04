@@ -34,7 +34,26 @@ const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
 const columnsByTable = new Map<string, Set<string>>();
 const aliasesByUri = new Map<string, Map<string, string>>();
 const definitions = new Map<string, SymbolDef[]>();
-const referencesIndex = new Map<string, ReferenceDef[]>();
+const referencesIndex = new Map<string, Map<string, ReferenceDef[]>>();
+function setRefsForFile(name: string, uri: string, refs: ReferenceDef[]) {
+    let byUri = referencesIndex.get(name);
+    if (!byUri) { byUri = new Map(); referencesIndex.set(name, byUri); }
+    byUri.set(uri, refs);
+}
+function deleteRefsForFile(uri: string) {
+    for (const [, byUri] of referencesIndex) { byUri.delete(uri); }
+    for (const [name, byUri] of Array.from(referencesIndex.entries())) {
+        if (byUri.size === 0) { referencesIndex.delete(name); }
+    }
+}
+function getRefs(name: string): ReferenceDef[] {
+    const byUri = referencesIndex.get(name);
+    if (!byUri) { return []; }
+    const out: ReferenceDef[] = [];
+    for (const arr of byUri.values()) { out.push(...arr); }
+    return out;
+}
+
 const tablesByName = new Map<string, SymbolDef>();
 
 let isIndexReady = false;
@@ -346,13 +365,11 @@ function parseColumnsFromCreateBlock(
 function indexText(uri: string, text: string): void {
     const normUri = uri.startsWith("file://") ? uri : url.pathToFileURL(uri).toString();
 
-    // Reset any old defs/refs for this file
+    // Reset any old defs/refs for this file (purge stale def caches too)
+    const oldDefs = definitions.get(normUri) || [];
+    for (const d of oldDefs) { tablesByName.delete(d.name); columnsByTable.delete(d.name); }
     definitions.delete(normUri);
-    for (const [key, refs] of referencesIndex.entries()) {
-        const filtered = refs.filter(r => r.uri !== normUri);
-        if (filtered.length > 0) { referencesIndex.set(key, filtered); }
-        else { referencesIndex.delete(key); }
-    }
+    deleteRefsForFile(normUri);
 
     const defs: SymbolDef[] = [];
     const lines = text.split(/\r?\n/);
@@ -554,16 +571,13 @@ function indexText(uri: string, text: string): void {
     // Save definitions
     definitions.set(normUri, defs);
 
-    // De-dupe local refs and merge into global index
-    const seen = new Set<string>();
-    for (const ref of localRefs) {
-        const key = `${ref.uri}:${ref.line}:${ref.start}:${ref.end}:${ref.name}`;
-        if (seen.has(key)) { continue; }
-        seen.add(key);
-
-        const arr = referencesIndex.get(ref.name) || [];
-        arr.push(ref);
-        referencesIndex.set(ref.name, arr);
+    // De-dupe local refs and persist per-file by name
+    const byName = new Map<string, ReferenceDef[]>();
+    for (const ref of localRefs) { const arr = byName.get(ref.name) || []; arr.push(ref); byName.set(ref.name, arr); }
+    for (const [name, arr] of byName) {
+        const seen = new Set<string>();
+        const dedup = arr.filter(r => { const k = `${r.line}:${r.start}:${r.end}`; if (seen.has(k)) { return false; } seen.add(k); return true; });
+        setRefsForFile(name, normUri, dedup);
     }
 
     // Save aliases (reuse the map we already computed)
@@ -571,6 +585,10 @@ function indexText(uri: string, text: string): void {
 
     // Index tables by name for quick definition lookup
     for (const def of defs) { tablesByName.set(def.name, def); }
+
+    safeLog(
+        `[indexText] indexed uri=${normUri}, defs=${defs.length}, tablesByName=${tablesByName.size}, aliases=${(aliasesByUri.get(normUri)?.size) || 0}`
+    );
 }
 
 
@@ -631,9 +649,26 @@ documents.onDidOpen((e) => {
     indexText(e.document.uri, e.document.getText());
     if (enableValidation) { validateTextDocument(e.document); }
 });
+
+documents.onDidClose((e) => {
+    const uri = e.document.uri.startsWith("file://") ? e.document.uri : url.pathToFileURL(e.document.uri).toString();
+    const oldDefs = definitions.get(uri) || [];
+    for (const d of oldDefs) { tablesByName.delete(d.name); columnsByTable.delete(d.name); }
+    definitions.delete(uri);
+    aliasesByUri.delete(uri);
+    deleteRefsForFile(uri);
+    connection.sendDiagnostics({ uri, diagnostics: [] });
+});
+
+const pending = new Map<string, NodeJS.Timeout>();
 documents.onDidChangeContent((e) => {
-    indexText(e.document.uri, e.document.getText());
-    if (enableValidation) { validateTextDocument(e.document); }
+    const uri = e.document.uri;
+    const tmr = pending.get(uri); if (tmr) { clearTimeout(tmr); }
+    pending.set(uri, setTimeout(() => {
+        indexText(uri, e.document.getText());
+        if (enableValidation) { validateTextDocument(e.document); }
+        pending.delete(uri);
+    }, 200));
 });
 
 
@@ -787,74 +822,90 @@ connection.onDefinition((params: DefinitionParams): Location[] | null => {
     return fallback.length > 0 ? fallback : null;
 });
 
-
-
-
-
-// --- Completion (unchanged) ---
+// --- Completion (robust) ---
 connection.onCompletion((params: CompletionParams): CompletionItem[] => {
-    const uri = params.textDocument.uri;
-    const doc = documents.get(uri);
-    if (!doc) { return []; }
+    try {
+        const rawUri = params.textDocument.uri;
+        const normUri = rawUri.startsWith("file://") ? rawUri : url.pathToFileURL(rawUri).toString();
 
-    const position = params.position;
-    const lineText = doc.getText({
-        start: { line: position.line, character: 0 },
-        end: { line: position.line, character: position.character }
-    }).trim();
-
-    const items: CompletionItem[] = [];
-
-    // --- Case 1: Column completions after alias dot (e.) ---
-    const aliasMatch = /([a-zA-Z0-9_]+)\.$/.exec(lineText);
-    if (aliasMatch) {
-        const alias = aliasMatch[1].toLowerCase();
-        const aliases = aliasesByUri.get(uri) || new Map();
-        const tableName = aliases.get(alias);
-
-        if (tableName) {
-            const def = tablesByName.get(tableName);
-            if (def?.columns) {
-                return def.columns.map(col => ({
-                    label: col.rawName,
-                    kind: CompletionItemKind.Field,
-                    detail: col.type
-                        ? `Column in ${def.rawName} (${col.type})`
-                        : `Column in ${def.rawName}`
-                }));
-            }
+        // try both raw and normalized lookups for maximum robustness
+        const doc = documents.get(rawUri) || documents.get(normUri);
+        if (!doc) {
+            safeLog(`[completion] no document found for ${rawUri}`);
+            return [];
         }
-    }
 
-    // --- Case 2: Table completions after FROM / JOIN ---
-    if (/\b(from|join)\s+[a-zA-Z0-9_\[\]]*$/i.test(lineText)) {
-        for (const def of tablesByName.values()) {
-            items.push({
-                label: def.rawName,
-                kind: CompletionItemKind.Class,
-                detail: `Table defined in ${def.uri.split("/").pop()}:${def.line + 1}`
-            });
-        }
-        return items;
-    }
+        const position = params.position;
+        // get the text of the current line up to cursor — do NOT trim (we need trailing '.' context)
+        const linePrefix = doc.getText({
+            start: { line: position.line, character: 0 },
+            end: { line: position.line, character: position.character }
+        });
 
-    // --- Case 3: SELECT clause → suggest tables + columns ---
-    if (/\bselect\s+.*$/i.test(lineText)) {
-        // add columns from all known tables
-        for (const def of tablesByName.values()) {
-            if (def.columns) {
-                for (const col of def.columns) {
-                    items.push({
+        const items: CompletionItem[] = [];
+
+        // ---------- Case A: alias-dot completions, e.g. "t." or "[t]." ----------
+        // allow bracketed alias like [t]
+        const aliasMatch = /([a-zA-Z0-9_\[\]]+)\.$/.exec(linePrefix);
+        if (aliasMatch) {
+            let aliasRaw = aliasMatch[1].replace(/^\[|\]$/g, "");
+            const alias = aliasRaw.toLowerCase();
+            const aliasesMap = aliasesByUri.get(normUri) || aliasesByUri.get(rawUri) || new Map<string, string>();
+            const tableName = aliasesMap.get(alias);
+            if (tableName) {
+                const def = tablesByName.get(tableName);
+                if (def?.columns) {
+                    return (def.columns as any[]).map(col => ({
                         label: col.rawName,
                         kind: CompletionItemKind.Field,
-                        detail: col.type
-                            ? `Column in ${def.rawName} (${col.type})`
-                            : `Column in ${def.rawName}`
-                    });
+                        detail: col.type ? `Column in ${def.rawName} (${col.type})` : `Column in ${def.rawName}`,
+                        insertText: col.rawName
+                    }));
                 }
             }
         }
-        // also add tables
+
+        // ---------- Case B: after FROM / JOIN -> suggest table names ----------
+        if (/\b(from|join)\s+[a-zA-Z0-9_\[\]]*$/i.test(linePrefix)) {
+            for (const def of tablesByName.values()) {
+                items.push({
+                    label: def.rawName,
+                    kind: CompletionItemKind.Class,
+                    detail: `Table defined in ${def.uri.split("/").pop()}:${def.line + 1}`
+                });
+            }
+            return items;
+        }
+
+        // ---------- Case C: inside SELECT -> suggest columns & tables (bounded) ----------
+        if (/\bselect\s+.*$/i.test(linePrefix)) {
+            let colCount = 0;
+            const COL_LIMIT = 500; // safety cap
+            for (const def of tablesByName.values()) {
+                if ((def as any).columns) {
+                    for (const col of (def as any).columns) {
+                        if (colCount++ > COL_LIMIT) {break;}
+                        items.push({
+                            label: col.rawName,
+                            kind: CompletionItemKind.Field,
+                            detail: col.type ? `Column in ${def.rawName} (${col.type})` : `Column in ${def.rawName}`,
+                            insertText: col.rawName
+                        });
+                    }
+                }
+                if (colCount > COL_LIMIT) {break;}
+            }
+            for (const def of tablesByName.values()) {
+                items.push({
+                    label: def.rawName,
+                    kind: CompletionItemKind.Class,
+                    detail: `Table defined in ${def.uri.split("/").pop()}:${def.line + 1}`
+                });
+            }
+            return items;
+        }
+
+        // ---------- Fallback: table names + SQL keywords ----------
         for (const def of tablesByName.values()) {
             items.push({
                 label: def.rawName,
@@ -862,29 +913,21 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
                 detail: `Table defined in ${def.uri.split("/").pop()}:${def.line + 1}`
             });
         }
+
+        const keywords = [
+            "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER",
+            "JOIN", "WHERE", "GROUP BY", "ORDER BY", "FROM", "AS"
+        ];
+        for (const kw of keywords) {items.push({ label: kw, kind: CompletionItemKind.Keyword });}
+
         return items;
+    } catch (err) {
+        safeError("[completion] handler error", err);
+        return [];
     }
-
-    // --- Case 4: Fallback → all tables + SQL keywords ---
-    for (const def of tablesByName.values()) {
-        items.push({
-            label: def.rawName,
-            kind: CompletionItemKind.Class,
-            detail: `Table defined in ${def.uri.split("/").pop()}:${def.line + 1}`
-        });
-    }
-
-    const keywords = [
-        "SELECT", "INSERT", "UPDATE", "DELETE",
-        "CREATE", "DROP", "ALTER", "JOIN",
-        "WHERE", "GROUP BY", "ORDER BY"
-    ];
-    for (const kw of keywords) {
-        items.push({ label: kw, kind: CompletionItemKind.Keyword });
-    }
-
-    return items;
 });
+
+
 
 // --- References ---
 connection.onReferences((params: ReferenceParams): Location[] => {
@@ -1306,13 +1349,13 @@ function getWordRangeAtPosition(doc: TextDocument, pos: { line: number; characte
 }
 
 function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Position): Location[] {
-    let word = normalizeName(rawWord);
+    const word = normalizeName(rawWord);
     const fullText = doc.getText();
     const lines = fullText.split(/\r?\n/);
     const results: Location[] = [];
 
-    // --- helper: get current statement text ---
-    function getCurrentStatement(): string {
+    // --- helper: get current statement text (works with optional `position`) ---
+    function _getCurrentStatementLocal(): string {
         if (!position) { return fullText; }
 
         const currentLine = position.line;
@@ -1340,7 +1383,8 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
         return lines.slice(start, end + 1).join("\n");
     }
 
-    const statementText = getCurrentStatement();
+    // Use the local helper (safe for optional `position`)
+    const statementText = _getCurrentStatementLocal();
 
     // --- 1) Handle alias.column explicitly ---
     if (rawWord.includes(".")) {
@@ -1352,7 +1396,7 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
             const table = aliases.get(alias);
             if (table) {
                 const key = `${normalizeName(table)}.${colName}`;
-                const refs = referencesIndex.get(key) || [];
+                const refs = getRefs(key);
                 for (const r of refs) {
                     results.push({
                         uri: r.uri,
@@ -1368,7 +1412,7 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
     }
 
     // --- 2) Table match ---
-    const tableRefs = referencesIndex.get(word) || [];
+    const tableRefs = getRefs(word);
     for (const r of tableRefs) {
         results.push({
             uri: r.uri,
@@ -1393,7 +1437,7 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
         // scoped lookup
         for (const table of candidateTables) {
             const key = `${table}.${word}`;
-            const refs = referencesIndex.get(key) || [];
+            const refs = getRefs(key);
             for (const r of refs) {
                 results.push({
                     uri: r.uri,
@@ -1405,18 +1449,20 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
             }
         }
 
-        // fallback to global if none
+        // fallback to global if none — updated for the Map<string, Map<string, ReferenceDef[]>> shape
         if (results.length === 0) {
-            for (const [key, refs] of referencesIndex.entries()) {
+            for (const [key, byUri] of referencesIndex.entries()) {
                 if (key.endsWith(`.${word}`)) {
-                    for (const r of refs) {
-                        results.push({
-                            uri: r.uri,
-                            range: {
-                                start: { line: r.line, character: r.start },
-                                end: { line: r.line, character: r.end }
-                            }
-                        });
+                    for (const arr of byUri.values()) {
+                        for (const r of arr) {
+                            results.push({
+                                uri: r.uri,
+                                range: {
+                                    start: { line: r.line, character: r.start },
+                                    end: { line: r.line, character: r.end }
+                                }
+                            });
+                        }
                     }
                 }
             }
@@ -1425,6 +1471,7 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
 
     return results;
 }
+
 
 connection.onDidChangeConfiguration(change => {
     const settings = (change.settings || {}) as any;
