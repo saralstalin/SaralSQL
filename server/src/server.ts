@@ -53,7 +53,8 @@ const SQL_KEYWORDS = new Set([
     "select", "from", "join", "on", "where", "and", "or", "insert", "update", "delete", "into", "as",
     "count", "group", "by", "order", "create", "procedure", "function", "view", "table", "begin", "end",
     "if", "else", "while", "case", "when", "then", "declare", "set", "values", "fetch", "next", "rows", "only",
-    "distinct", "union", "all", "outer", "inner", "left", "right", "full", "top", "limit", "offset", "having"
+    "distinct", "union", "all", "outer", "inner", "left", "right", "full", "top", "limit", "offset",
+    "having", "over", "newid", "row_number", "desc", "asc", "sum", "min", "max", "null", "is", "exec"
 ]);
 
 // ---------- Index structures ----------
@@ -62,6 +63,8 @@ interface ColumnDef {
     rawName: string;
     type?: string;
     line: number;
+    start?: number; // ← add
+    end?: number;   // ← add
 }
 
 interface SymbolDef {
@@ -83,8 +86,19 @@ interface ReferenceDef {
 
 
 // ---------- Helpers ----------
+
+function isSqlKeyword(token: string): boolean {
+    return SQL_KEYWORDS.has(token.toLowerCase());
+}
+
+
+function stripStrings(s: string): string {
+    // Replace T-SQL string literals (including N'...') with spaces to preserve indices
+    return s.replace(/N?'(?:''|[^'])*'/g, (m) => " ".repeat(m.length));
+}
+
 function normalizeName(name: string): string {
-    if (!name) {return "";}
+    if (!name) { return ""; }
 
     // remove square brackets and lowercase
     let n = name.replace(/[\[\]]/g, "").toLowerCase().trim();
@@ -145,87 +159,193 @@ function extractAliases(text: string): Map<string, string> {
 
 
 
-// ---------- Column Parser ----------
-function parseColumnsFromCreate(sql: string, startLine: number): ColumnDef[] {
-    const m = /CREATE\s+(?:TABLE|TYPE)\s+[A-Za-z0-9_\[\]\.]+\s*(?:AS\s+TABLE)?\s*\(([\s\S]*?)\)\s*;/i.exec(sql);
-    if (!m) {
-        return [];
-    }
-
-    const body = stripComments(m[1]);
-    const lines = body.split(/\r?\n/);
-
-    const cols: ColumnDef[] = [];
-    const constraintKeywords = ["primary key", "foreign key", "constraint", "index", "check", "unique"];
-
-    for (let offset = 0; offset < lines.length; offset++) {
-        const line = lines[offset];
-        if (!line.trim()) {
+// --- helpers for CREATE TABLE parsing ---
+function splitByCommasRespectingParens(s: string): string[] {
+    const parts: string[] = [];
+    let start = 0, depth = 0, inQuote: string | null = null;
+    for (let i = 0; i < s.length; i++) {
+        const ch = s[i];
+        if (inQuote) {
+            if (ch === inQuote) { inQuote = null; }
             continue;
         }
-
-        // --- split this line into column parts by commas not in parentheses ---
-        let parts: string[] = [];
-        let current = "";
-        let depth = 0;
-        for (const ch of line) {
-            if (ch === "(") { depth++; }
-            else if (ch === ")") { depth--; }
-            if (ch === "," && depth === 0) {
-                parts.push(current);
-                current = "";
-            } else {
-                current += ch;
-            }
-        }
-        if (current.trim()) {
-            parts.push(current);
-        }
-
-        for (const part of parts) {
-            const trimmed = part.trim();
-            if (!trimmed) {
-                continue;
-            }
-            const lowered = trimmed.toLowerCase();
-            if (constraintKeywords.some((k) => lowered.startsWith(k))) {
-                continue;
-            }
-
-            // Column name + type
-            const match = /^\s*([A-Za-z_][A-Za-z0-9_\[\]]*)\s+(.+)/.exec(trimmed);
-            if (match) {
-                const rawCol = match[1].replace(/[\[\]]/g, "");
-                const type = match[2].split(/\s+/)[0];
-                if (!cols.some((c) => c.rawName === rawCol)) {
-                    cols.push({
-                        name: rawCol.toLowerCase(),
-                        rawName: rawCol,
-                        type,
-                        line: startLine + offset  // correct file line
-                    });
-                }
-            }
+        if (ch === "'" || ch === '"') { inQuote = ch; continue; }
+        if (ch === "(") { depth++; }
+        else if (ch === ")") { depth = Math.max(0, depth - 1); }
+        else if (ch === "," && depth === 0) {
+            parts.push(s.slice(start, i));
+            start = i + 1;
         }
     }
-
-    return cols;
+    parts.push(s.slice(start));
+    return parts.map(p => p.trim()).filter(Boolean);
 }
 
+function isTableConstraintRow(s: string): boolean {
+    const head = s.trim().toLowerCase();
+    return head.startsWith("constraint")
+        || head.startsWith("primary key")
+        || head.startsWith("foreign key")
+        || head.startsWith("unique")
+        || head.startsWith("check");
+}
+
+function parseColumnsFromCreateWithPos(
+  srcText: string,
+  startLine: number
+): Array<{ name: string; rawName: string; line: number; start: number; end: number }> {
+  const srcLines = srcText.split(/\r?\n/);
+
+  // Extract CREATE ... ( ... ) ; body like your old function did
+  const m = /CREATE\s+(?:TABLE|TYPE)\s+[A-Za-z0-9_\[\]\.]+\s*(?:AS\s+TABLE)?\s*\(([\s\S]*?)\)\s*;/i.exec(srcText);
+  if (!m) {return [];}
+
+  const body = stripComments(m[1]); // keep parity with old behavior
+  const lines = body.split(/\r?\n/);
+  const constraintKeywords = ["primary key", "foreign key", "constraint", "index", "check", "unique"];
+
+  const cols: Array<{ name: string; rawName: string; line: number; start: number; end: number }> = [];
+
+  for (let offset = 0; offset < lines.length; offset++) {
+    const line = lines[offset];
+    if (!line.trim()) {continue;}
+
+    // Split this line into parts by commas not inside parentheses
+    const parts: string[] = [];
+    let current = "";
+    let depth = 0;
+    for (const ch of line) {
+      if (ch === "(") {depth++;}
+      else if (ch === ")") {depth = Math.max(0, depth - 1);}
+      if (ch === "," && depth === 0) {
+        parts.push(current);
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
+    if (current.trim()) {parts.push(current);}
+
+    for (const part of parts) {
+      const trimmed = part.trim();
+      if (!trimmed) {continue;}
+
+      const lowered = trimmed.toLowerCase();
+      if (constraintKeywords.some(k => lowered.startsWith(k))) {continue;}
+
+      // First identifier: [Name] or Name
+      const mm = /^\s*(\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_]*))\b/.exec(trimmed);
+      if (!mm) {continue;}
+
+      const rawToken = mm[1];               // includes brackets if present, e.g. "[GoodieName]" or "GoodieName"
+      const nameOnly = (mm[2] ?? mm[3] ?? "").trim();
+      const normName = normalizeName(nameOnly);
+
+      // Absolute line in original file
+      const absLine = startLine + offset;
+      if (absLine < 0 || absLine >= srcLines.length) {continue;}
+
+      const originalLine = srcLines[absLine];
+
+      // Find start col on original line: try the exact token (with brackets if any), else bare
+      let startCol = originalLine.indexOf(rawToken);
+      if (startCol < 0) {
+        startCol = originalLine.indexOf(nameOnly);
+      }
+      if (startCol < 0) {
+        // Fallback: use first non-space position of the line segment (keeps navigation usable)
+        startCol = Math.max(0, originalLine.search(/\S/));
+      }
+      const endCol = startCol + rawToken.length;
+
+      // Deduplicate by normalized name (like your old function)
+      if (!cols.some(c => c.name === normName && c.line === absLine && c.start === startCol)) {
+        cols.push({
+          name: normName,
+          rawName: rawToken,   // keep the exact token for nicer symbols (e.g., "[GoodieName]")
+          line: absLine,
+          start: startCol,
+          end: endCol
+        });
+      }
+    }
+  }
+
+  return cols;
+}
+
+
+
+
+function splitCreateBodyIntoRowsWithPositions(text: string, defLineIndex: number): Array<{ text: string; line: number; col: number }> {
+    const lines = text.split(/\r?\n/);
+
+    // find first '(' from the definition line onwards
+    let startLine = defLineIndex, parenIdx = -1;
+    for (let i = defLineIndex; i < lines.length; i++) {
+        const j = lines[i].indexOf("(");
+        if (j >= 0) { startLine = i; parenIdx = j; break; }
+    }
+    if (parenIdx < 0) { return []; }
+
+    const rows: Array<{ text: string; line: number; col: number }> = [];
+    let buf = "";
+    let depth = 0;
+    let curLine = startLine;
+    let curCol = parenIdx + 1; // start right after '('
+    let rowStartLine = startLine;
+    let rowStartCol = parenIdx + 1;
+    let inQuote: string | null = null;
+
+    // walk char-by-char until we close the outermost '('
+    for (let i = startLine; i < lines.length; i++) {
+        const line = lines[i];
+        const kStart = (i === startLine ? parenIdx + 1 : 0);
+        for (let k = kStart; k < line.length; k++) {
+            const ch = line[k];
+
+            if (inQuote) {
+                buf += ch;
+                if (ch === inQuote) { inQuote = null; }
+                continue;
+            }
+            if (ch === "'" || ch === '"') { inQuote = ch; buf += ch; continue; }
+
+            if (ch === "(") { depth++; buf += ch; continue; }
+            if (ch === ")") {
+                if (depth === 0) {
+                    // end of the column list
+                    const trimmed = buf.trim();
+                    if (trimmed) { rows.push({ text: trimmed, line: rowStartLine, col: rowStartCol }); }
+                    return rows;
+                }
+                depth--; buf += ch; continue;
+            }
+
+            if (ch === "," && depth === 0) {
+                const trimmed = buf.trim();
+                if (trimmed) { rows.push({ text: trimmed, line: rowStartLine, col: rowStartCol }); }
+                buf = "";
+                rowStartLine = i;
+                rowStartCol = k + 1;
+                continue;
+            }
+
+            buf += ch;
+        }
+        buf += "\n";
+    }
+    return rows;
+}
 // ---------- Indexing ----------
 function indexText(uri: string, text: string): void {
-    // --- normalize URI ---
     const normUri = uri.startsWith("file://") ? uri : url.pathToFileURL(uri).toString();
 
-    // --- cleanup old entries for this file ---
     definitions.delete(normUri);
     for (const [key, refs] of referencesIndex.entries()) {
         const filtered = refs.filter(r => r.uri !== normUri);
-        if (filtered.length > 0) {
-            referencesIndex.set(key, filtered);
-        } else {
-            referencesIndex.delete(key);
-        }
+        if (filtered.length > 0) { referencesIndex.set(key, filtered); }
+        else { referencesIndex.delete(key); }
     }
 
     const defs: SymbolDef[] = [];
@@ -244,41 +364,37 @@ function indexText(uri: string, text: string): void {
             const sym: SymbolDef = { name: norm, rawName, uri: normUri, line: i };
 
             if (kind === "TABLE" || (kind === "TYPE" && /\bAS\s+TABLE\b/i.test(line))) {
-                const cols = parseColumnsFromCreate(text, i);
-                sym.columns = cols;
+                const cols = parseColumnsFromCreateWithPos(text, i);
 
-                // update fast lookup map
+                // Keep columnsByTable in sync (store normalized names)
                 const set = new Set<string>();
-                for (const c of cols) {set.add(c.name);}
+                for (const c of cols) { set.add(c.name); }
                 columnsByTable.set(norm, set);
 
-                // also index each column definition as a reference
-                for (const c of cols) {
-                    const colIdx = lines[i].toLowerCase().indexOf(c.rawName.toLowerCase());
-                    if (colIdx >= 0) {
-                        localRefs.push({
-                            name: `${norm}.${c.name}`,
-                            uri: normUri,
-                            line: i,
-                            start: colIdx,
-                            end: colIdx + c.rawName.length,
-                            kind: "column"
-                        });
-                    }
-                }
+                // Satisfy ColumnDef[] (requires at least { name, rawName, line })
+                (sym as any).columns = cols.map(c => ({
+                    name: c.name,
+                    rawName: c.rawName,
+                    line: c.line,
+                    start: c.start,
+                    end: c.end
+                })) as any;
 
-                if (cols.length > 0) {
-                    safeLog(
-                        `Indexed ${rawName} with ${cols.length} cols: ${cols
-                            .map(c => c.rawName + (c.type ? ":" + c.type : ""))
-                            .join(", ")}`
-                    );
+                // Create local column refs using real positions
+                for (const c of cols) {
+                    localRefs.push({
+                        name: `${norm}.${c.name}`,
+                        uri: normUri,
+                        line: c.line,
+                        start: c.start,
+                        end: c.end,
+                        kind: "column"
+                    });
                 }
             }
 
             defs.push(sym);
 
-            // add definition reference (table name itself at correct span)
             const idx = line.toLowerCase().indexOf(rawName.toLowerCase());
             if (idx >= 0) {
                 localRefs.push({
@@ -293,7 +409,6 @@ function indexText(uri: string, text: string): void {
         }
     }
 
-    // --- scan for usage references ---
     const aliases = extractAliases(text);
     for (let i = 0; i < lines.length; i++) {
         const clean = stripComments(lines[i]);
@@ -319,10 +434,10 @@ function indexText(uri: string, text: string): void {
         }
 
         // --- alias.column usages ---
-        const colRegex = /([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)/g;
+        const colRegex = /([a-zA-Z0-9_]+)\.(\[[^\]]+\]|[a-zA-Z_][a-zA-Z0-9_]*)/g;
         while ((m = colRegex.exec(clean))) {
             const alias = m[1].toLowerCase();
-            const col = normalizeName(m[2]);
+            const col = normalizeName(m[2].replace(/[\[\]]/g, ""));
             const table = aliases.get(alias);
             if (table) {
                 const key = `${normalizeName(table)}.${col}`;
@@ -337,53 +452,58 @@ function indexText(uri: string, text: string): void {
             }
         }
 
-        // --- unaliased column usages ---
-        const bareColRegex = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+        // --- unaliased column usages (allow [Column]) ---
+        const bareColRegex = /\[([a-zA-Z0-9_ ]+)\]|([a-zA-Z_][a-zA-Z0-9_]*)/g;
         while ((m = bareColRegex.exec(clean))) {
-            const col = normalizeName(m[1]);
+            const tokenRaw = (m[1] || m[2] || "");
+            const col = normalizeName(tokenRaw.replace(/[\[\]]/g, ""));
 
-            // skip obvious SQL keywords
-            if ([
-                "from","join","on","where","and","or","select","insert","update","delete",
-                "into","as","count","group","by","order"
-            ].includes(col)) {continue;}
+            if (isSqlKeyword(col)) { continue; }
 
-            // already handled as alias.column
-            if (clean.includes(".")) {continue;}
+            const leftSlice = clean.slice(0, m.index).toLowerCase();
+            if (/\bas\s*$/.test(leftSlice)) { continue; }
 
+            // Use FULL MATCH SPAN to detect alias.column adjacency
+            const tokenStart = m.index;
+            const tokenEnd = m.index + (m[0] ? m[0].length : tokenRaw.length);
+            const beforeChar = clean.charAt(Math.max(0, tokenStart - 1));
+            const afterChar = clean.charAt(tokenEnd);
+            if (beforeChar === "." || afterChar === ".") { continue; }
+
+            // use statement-scoped FROM/JOIN
+            const statementText = getCurrentStatement(
+                documents.get(normUri as any) ?? { getText: () => text } as any,
+                { line: i, character: 0 }
+            );
             const tablesInScope: string[] = [];
             const fromJoinRegex = /\b(from|join)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
             let fm: RegExpExecArray | null;
-            while ((fm = fromJoinRegex.exec(clean))) {
+            while ((fm = fromJoinRegex.exec(statementText))) {
                 tablesInScope.push(normalizeName(fm[2]));
             }
 
             const candidateTables: string[] = [];
             for (const t of tablesInScope) {
-                if (columnsByTable.get(t)?.has(col)) {
-                    candidateTables.push(t);
-                }
+                if (columnsByTable.get(t)?.has(col)) { candidateTables.push(t); }
             }
 
             if (candidateTables.length === 1) {
-                const key = `${candidateTables[0]}.${col}`;
                 localRefs.push({
-                    name: key,
+                    name: `${candidateTables[0]}.${col}`,
                     uri: normUri,
                     line: i,
                     start: m.index,
-                    end: m.index + m[1].length,
+                    end: m.index + tokenRaw.length,
                     kind: "column"
                 });
             } else if (candidateTables.length > 1) {
                 for (const t of candidateTables) {
-                    const key = `${t}.${col}`;
                     localRefs.push({
-                        name: key,
+                        name: `${t}.${col}`,
                         uri: normUri,
                         line: i,
                         start: m.index,
-                        end: m.index + m[1].length,
+                        end: m.index + tokenRaw.length,
                         kind: "column"
                     });
                 }
@@ -393,11 +513,10 @@ function indexText(uri: string, text: string): void {
 
     definitions.set(normUri, defs);
 
-    // --- merge into global referencesIndex (dedup) ---
     const seen = new Set<string>();
     for (const ref of localRefs) {
         const key = `${ref.uri}:${ref.line}:${ref.start}:${ref.end}:${ref.name}`;
-        if (seen.has(key)) {continue;}
+        if (seen.has(key)) { continue; }
         seen.add(key);
 
         const arr = referencesIndex.get(ref.name) || [];
@@ -406,11 +525,9 @@ function indexText(uri: string, text: string): void {
     }
 
     aliasesByUri.set(normUri, extractAliases(text));
-
-    for (const def of defs) {
-        tablesByName.set(def.name, def);
-    }
+    for (const def of defs) { tablesByName.set(def.name, def); }
 }
+
 
 async function indexWorkspace(): Promise<void> {
     try {
@@ -466,11 +583,11 @@ connection.onInitialized(async () => {
 
 documents.onDidOpen((e) => {
     indexText(e.document.uri, e.document.getText());
-    if (enableValidation) {validateTextDocument(e.document);}
+    if (enableValidation) { validateTextDocument(e.document); }
 });
 documents.onDidChangeContent((e) => {
     indexText(e.document.uri, e.document.getText());
-    if (enableValidation) {validateTextDocument(e.document);}
+    if (enableValidation) { validateTextDocument(e.document); }
 });
 
 
@@ -482,11 +599,13 @@ function findColumnInTable(tableName: string, colName: string): Location[] {
             if (normalizeName(def.name) === normalizeName(tableName) && def.columns) {
                 for (const col of def.columns) {
                     if (col.name === colName) {
+                        const startChar = typeof (col as any).start === "number" ? (col as any).start : 0;
+                        const endChar = typeof (col as any).end === "number" ? (col as any).end : 200;
                         results.push({
                             uri: def.uri,
                             range: {
-                                start: { line: col.line, character: 0 },
-                                end: { line: col.line, character: 200 }
+                                start: { line: col.line, character: startChar },
+                                end: { line: col.line, character: endChar }
                             }
                         });
                     }
@@ -496,6 +615,7 @@ function findColumnInTable(tableName: string, colName: string): Location[] {
     }
     return results;
 }
+
 
 function findTableOrColumn(word: string): Location[] {
     const results: Location[] = [];
@@ -629,7 +749,7 @@ connection.onDefinition((params: DefinitionParams): Location[] | null => {
 connection.onCompletion((params: CompletionParams): CompletionItem[] => {
     const uri = params.textDocument.uri;
     const doc = documents.get(uri);
-    if (!doc) {return [];}
+    if (!doc) { return []; }
 
     const position = params.position;
     const lineText = doc.getText({
@@ -723,10 +843,10 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
 // --- References ---
 connection.onReferences((params: ReferenceParams): Location[] => {
     const doc = documents.get(params.textDocument.uri);
-    if (!doc) {return [];}
+    if (!doc) { return []; }
 
     const range = getWordRangeAtPosition(doc, params.position);
-    if (!range) {return [];}
+    if (!range) { return []; }
 
     const rawWord = doc.getText(range);
     return findReferencesForWord(rawWord, doc, params.position);
@@ -734,29 +854,29 @@ connection.onReferences((params: ReferenceParams): Location[] => {
 
 connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
     const doc = documents.get(params.textDocument.uri);
-    if (!doc) {return null;}
+    if (!doc) { return null; }
 
     const range = getWordRangeAtPosition(doc, params.position);
-    if (!range) {return null;}
+    if (!range) { return null; }
 
     const rawWord = doc.getText(range);
     const newName = params.newName;
 
     const locations = findReferencesForWord(rawWord, doc, params.position);
-    if (!locations || locations.length === 0) {return null;}
+    if (!locations || locations.length === 0) { return null; }
 
     const editsByUri: { [uri: string]: TextEdit[] } = {};
     const seen = new Set<string>();
 
     for (const loc of locations) {
         const key = `${loc.uri}:${loc.range.start.line}:${loc.range.start.character}:${loc.range.end.line}:${loc.range.end.character}`;
-        if (seen.has(key)) {continue;}
+        if (seen.has(key)) { continue; }
         seen.add(key);
 
         // ensure valid file:// URI
         const uri = loc.uri.startsWith("file://") ? loc.uri : url.pathToFileURL(loc.uri).toString();
 
-        if (!editsByUri[uri]) {editsByUri[uri] = [];}
+        if (!editsByUri[uri]) { editsByUri[uri] = []; }
         editsByUri[uri].push({ range: loc.range, newText: newName });
     }
 
@@ -766,10 +886,10 @@ connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
 
 connection.onHover((params): Hover | null => {
     const doc = documents.get(params.textDocument.uri);
-    if (!doc) {return null;}
+    if (!doc) { return null; }
 
     const range = getWordRangeAtPosition(doc, params.position);
-    if (!range) {return null;}
+    if (!range) { return null; }
 
     const rawWord = doc.getText(range);
     const word = normalizeName(rawWord);
@@ -860,104 +980,232 @@ connection.onHover((params): Hover | null => {
 });
 
 
+// Full validator with @-skip and SELECT-alias skip
 async function validateTextDocument(doc: TextDocument): Promise<void> {
-    if (!isIndexReady || !enableValidation) {
+    if (!enableValidation || !isIndexReady) {
         connection.sendDiagnostics({ uri: doc.uri, diagnostics: [] });
         return;
     }
+
     const diagnostics: Diagnostic[] = [];
     const text = doc.getText();
     const lines = text.split(/\r?\n/);
 
-    // --- Collect aliases (tables + subqueries) ---
     const aliases = extractAliases(text);
 
-    // --- Collect declared cursors ---
+    // Declared cursors
     const cursorRegex = /\bdeclare\s+([a-zA-Z0-9_]+)\s+cursor/gi;
     const cursors = new Set<string>();
-    let cm: RegExpExecArray | null;
-    while ((cm = cursorRegex.exec(text))) {
-        cursors.add(cm[1].toLowerCase());
+    {
+        let cm: RegExpExecArray | null;
+        while ((cm = cursorRegex.exec(text))) { cursors.add(cm[1].toLowerCase()); }
     }
 
     for (let i = 0; i < lines.length; i++) {
-        const clean = stripComments(lines[i]);
+        const noComments = stripComments(lines[i]);
+        const clean = noComments; // keep original for ranges
+        const cleanNoStr = stripStrings(noComments); // ✅ ignore strings while preserving indexes
+        const trimmedLc = cleanNoStr.trim().toLowerCase();
 
-        // --- Table checks (support schema + stripped forms) ---
-        const tableRegex = /\b(from|join|update|into)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
-        let m: RegExpExecArray | null;
-        while ((m = tableRegex.exec(clean))) {
-            const rawTable = m[2];
-            const normRaw = normalizeName(rawTable); // dbo.employee
-            const normStripped = normalizeName(rawTable.replace(/^[a-z0-9_]+\./i, "")); // employee
+        // ---------- Table checks ----------
+        const tableRegex = /\b(from|join|update|into)\s+([a-zA-Z0-9_\[\]\.#@]+)/gi; // ✅ allow # and @ in token
+        {
+            let m: RegExpExecArray | null;
+            while ((m = tableRegex.exec(cleanNoStr))) {
+                const rawTable = m[2];
 
-            // 🚫 Skip if this is a declared cursor
-            if (cursors.has(rawTable.toLowerCase())) {
-                continue;
-            }
+                // ✅ Skip declared cursor names, temp tables (#, ##), and table variables (@T)
+                if (cursors.has(rawTable.toLowerCase())) { continue; }
+                if (rawTable.startsWith("#") || rawTable.startsWith("@")) { continue; }
 
-            if (!columnsByTable.has(normRaw) && !columnsByTable.has(normStripped)) {
-                diagnostics.push({
-                    severity: DiagnosticSeverity.Error,
-                    range: {
-                        start: { line: i, character: m.index },
-                        end: { line: i, character: m.index + rawTable.length }
-                    },
-                    message: `Unknown table '${rawTable}'`,
-                    source: "SaralSQL"
-                });
+                const normRaw = normalizeName(rawTable);
+                if (!columnsByTable.has(normRaw)) {
+                    diagnostics.push({
+                        severity: DiagnosticSeverity.Error,
+                        range: {
+                            start: { line: i, character: m.index },
+                            end: { line: i, character: m.index + rawTable.length }
+                        },
+                        message: `Unknown table '${rawTable}'`,
+                        source: "SaralSQL"
+                    });
+                }
             }
         }
 
-        // --- Alias.column checks (skip schema-qualified tables) ---
-        const colRegex = /([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)/g;
-        while ((m = colRegex.exec(clean))) {
-            const left = m[1];
-            const right = m[2];
-            const combined = normalizeName(`${left}.${right}`);
+        // ---------- Alias.column checks ----------
+        const looksLikeColumnContext =
+            /(^|\b)(select|where|having|on|group\s+by|order\s+by)\b/.test(trimmedLc);
 
-            // 🚫 Skip if "left.right" is a known table
-            if (columnsByTable.has(combined)) {
-                continue;
+        if (looksLikeColumnContext) {
+            const colRegex = /([a-zA-Z0-9_]+)\.(\[[^\]]+\]|[a-zA-Z_][a-zA-Z0-9_]*)/g;
+            let m: RegExpExecArray | null;
+            while ((m = colRegex.exec(cleanNoStr))) {
+                const alias = m[1].toLowerCase();
+                const rightRaw = m[2];
+
+                // Skip variables on either side (rare but safe)
+                if (alias.startsWith("@")) { continue; }
+                if (rightRaw.startsWith("@")) { continue; }
+
+                // Treat common schemas as schemas, not aliases
+                if (/^(dbo|sys|information_schema|pg_catalog|public)$/.test(alias)) {
+                    continue;
+                }
+
+                const col = normalizeName(rightRaw.replace(/[\[\]]/g, ""));
+                const table = aliases.get(alias);
+
+                if (!table) {
+                    diagnostics.push({
+                        severity: DiagnosticSeverity.Error,
+                        range: {
+                            start: { line: i, character: m.index },
+                            end: { line: i, character: m.index + m[0].length }
+                        },
+                        message: `Unknown alias '${alias}'`,
+                        source: "SaralSQL"
+                    });
+                } else if (table !== "__subquery__" &&
+                    !columnsByTable.get(normalizeName(table))?.has(col)) {
+                    diagnostics.push({
+                        severity: DiagnosticSeverity.Error,
+                        range: {
+                            start: { line: i, character: m.index },
+                            end: { line: i, character: m.index + m[0].length }
+                        },
+                        message: `Column '${col}' not found in table '${table}'`,
+                        source: "SaralSQL"
+                    });
+                }
             }
+        }
 
-            const alias = left.toLowerCase();
-            const col = normalizeName(right);
-            const table = aliases.get(alias);
+        // ---------- Bare column checks ----------
+        const isStructuralLine =
+            /^((left|right|full|inner|cross)\s+join|join|from|update|insert|into|merge|apply|cross\s+apply|outer\s+apply)\b/
+                .test(trimmedLc);
+        if (isStructuralLine) { continue; }
 
-            if (!table) {
-                // Unknown alias
-                diagnostics.push({
-                    severity: DiagnosticSeverity.Error,
-                    range: {
-                        start: { line: i, character: m.index },
-                        end: { line: i, character: m.index + m[0].length }
-                    },
-                    message: `Unknown alias '${alias}'`,
-                    source: "SaralSQL"
-                });
-            } else if (table === "__subquery__") {
-                // ✅ Subquery alias → accept without column validation
-                continue;
-            } else if (
-                !columnsByTable.get(normalizeName(table))?.has(col) &&
-                !columnsByTable.get(normalizeName(table.replace(/^[a-z0-9_]+\./i, "")))?.has(col)
-            ) {
-                diagnostics.push({
-                    severity: DiagnosticSeverity.Error,
-                    range: {
-                        start: { line: i, character: m.index },
-                        end: { line: i, character: m.index + m[0].length }
-                    },
-                    message: `Column '${col}' not found in table '${table}'`,
-                    source: "SaralSQL"
-                });
+        const looksLikeColumnContext2 =
+            /(^|\b)(select|where|having|on|group\s+by|order\s+by)\b/.test(trimmedLc);
+        if (!looksLikeColumnContext2) { continue; }
+
+        // Build tables-in-scope from the WHOLE STATEMENT (not just this line)
+        const statementText = getCurrentStatement(doc, { line: i, character: 0 });
+        const tablesInScope: string[] = [];
+        {
+            const fromJoinRegex = /\b(from|join)\s+([a-zA-Z0-9_\[\]\.#@]+)/gi; // ✅ include # and @
+            let fm: RegExpExecArray | null;
+            while ((fm = fromJoinRegex.exec(statementText))) {
+                const tk = fm[2];
+                if (tk.startsWith("#") || tk.startsWith("@")) { continue; } // ✅ temp/table var not indexed
+                tablesInScope.push(normalizeName(tk));
+            }
+        }
+
+        // ✅ Robust SELECT-alias extraction for the current statement
+        const selectAliases = extractSelectAliasesFromStatement(statementText);
+
+        // Bracketed or bare identifiers; strip [] before normalizing
+        const bareColRegex = /\[([a-zA-Z0-9_ ]+)\]|([a-zA-Z_][a-zA-Z0-9_]*)/g;
+        {
+            let m: RegExpExecArray | null;
+            while ((m = bareColRegex.exec(cleanNoStr))) {
+                const rawToken = (m[1] || m[2] || "");
+                const tokenStart = m.index;
+
+                // ✅ Skip SQL variables like @var — the '@' is just before the match
+                const beforeChar = cleanNoStr.charAt(Math.max(0, tokenStart - 1));
+                if (beforeChar === "@") { continue; }
+
+                const tokenEnd = tokenStart + (m[0] ? m[0].length : rawToken.length);
+                const afterChar = cleanNoStr.charAt(tokenEnd);
+
+                const col = normalizeName(rawToken.replace(/[\[\]]/g, ""));
+
+                // Skip SQL keywords
+                if (isSqlKeyword(col)) { continue; }
+
+                // Skip "... AS <token>"
+                const leftSlice = cleanNoStr.slice(0, m.index).toLowerCase();
+                if (/\bas\s*$/.test(leftSlice)) { continue; }
+
+                // Skip alias.column adjacency
+                if (beforeChar === "." || afterChar === ".") { continue; }
+
+                // ✅ Skip if this token is a SELECT-list alias
+                if (selectAliases.has(col)) { continue; }
+
+                // Check if any in-scope table contains this column
+                let found = false;
+                for (const t of tablesInScope) {
+                    if (columnsByTable.get(t)?.has(col)) { found = true; break; }
+                }
+
+                if (!found && tablesInScope.length > 0) {
+                    diagnostics.push({
+                        severity: DiagnosticSeverity.Error,
+                        range: {
+                            start: { line: i, character: m.index },
+                            end: { line: i, character: m.index + rawToken.length }
+                        },
+                        message: `Column '${col}' not found in any table in scope`,
+                        source: "SaralSQL"
+                    });
+                }
             }
         }
     }
 
     connection.sendDiagnostics({ uri: doc.uri, diagnostics });
 }
+
+
+
+
+function extractSelectAliasesFromStatement(statementText: string): Set<string> {
+    const out = new Set<string>();
+
+    // Get text after SELECT, before FROM (or end of statement if no FROM)
+    const m = /select\b([\s\S]*?)(\bfrom\b|$)/i.exec(statementText);
+    if (!m) return out;
+    const selectList = m[1];
+
+    // Split the SELECT list by top-level commas (handles functions, CASE, windows, etc.)
+    const items = splitByCommasRespectingParens(selectList);
+
+    for (const rawItem of items) {
+        const item = rawItem.trim();
+        if (!item || item === "*") continue;
+
+        // 1) AS alias   e.g.,  SUM(x) AS Total  or  [Full Name] AS EmpName
+        let asMatch = /\bas\s+(\[?[A-Za-z_][A-Za-z0-9_ ]*\]?)/i.exec(item);
+        if (asMatch) {
+            const aliasRaw = asMatch[1].replace(/[\[\]]/g, "");
+            out.add(normalizeName(aliasRaw));
+            continue;
+        }
+
+        // 2) trailing alias (no AS)   e.g.,  SUM(x) Total    or  (expr) Alias
+        //    heuristic: take last identifier-looking token not part of a dotted path
+        const tail = /(\[?[A-Za-z_][A-Za-z0-9_ ]*\]?)\s*$/i.exec(item);
+        if (tail) {
+            const candidate = tail[1];
+            // Avoid catching dotted names or simple column references as aliases
+            // (we only accept if there's actually an expression before the alias)
+            const before = item.slice(0, item.length - candidate.length).trim();
+            const looksLikeExpr = /[\(\)\+\-\*\/%]|case\b|over\b|\brow_number\b|\bsum\b|\bcount\b|\bmin\b|\bmax\b|\bconvert\b|\bcast\b|\bcoalesce\b/i.test(before);
+            if (looksLikeExpr) {
+                const norm = normalizeName(candidate.replace(/[\[\]]/g, ""));
+                if (norm) out.add(norm);
+            }
+        }
+    }
+    return out;
+}
+
+
 
 connection.onDocumentSymbol((params): DocumentSymbol[] => {
     const uri = params.textDocument.uri;
@@ -974,13 +1222,17 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
         };
 
         if (def.columns) {
-            tableSymbol.children = def.columns.map((col) => ({
-                name: col.rawName,
-                kind: SymbolKind.Field,
-                range: Range.create(col.line, 0, col.line, 200),
-                selectionRange: Range.create(col.line, 0, col.line, 200),
-                detail: col.type || undefined
-            }));
+            tableSymbol.children = def.columns.map((col) => {
+                const startChar = typeof (col as any).start === "number" ? (col as any).start : 0;
+                const endChar = typeof (col as any).end === "number" ? (col as any).end : 200;
+                return {
+                    name: col.rawName,
+                    kind: SymbolKind.Field,
+                    range: Range.create(col.line, startChar, col.line, endChar),
+                    selectionRange: Range.create(col.line, startChar, col.line, endChar),
+                    detail: col.type || undefined
+                };
+            });
         }
 
         symbols.push(tableSymbol);
@@ -1015,7 +1267,7 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
 
     // --- helper: get current statement text ---
     function getCurrentStatement(): string {
-        if (!position) {return fullText;}
+        if (!position) { return fullText; }
 
         const currentLine = position.line;
         let start = currentLine;
@@ -1027,7 +1279,7 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
                 start = i + 1;
                 break;
             }
-            if (i === 0) {start = 0;}
+            if (i === 0) { start = 0; }
         }
 
         // look downward until END or ; or bottom
@@ -1036,7 +1288,7 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
                 end = i;
                 break;
             }
-            if (i === lines.length - 1) {end = lines.length - 1;}
+            if (i === lines.length - 1) { end = lines.length - 1; }
         }
 
         return lines.slice(start, end + 1).join("\n");
@@ -1133,7 +1385,7 @@ connection.onDidChangeConfiguration(change => {
     // expect setting under "saralsql.enableValidation"
     enableValidation = !!settings.saralsql?.enableValidation;
     safeLog(`Validation ${enableValidation ? "enabled" : "disabled"}`);
-    
+
     // re-run validation if it just got enabled
     if (enableValidation) {
         for (const doc of documents.all()) {
@@ -1160,7 +1412,7 @@ function getCurrentStatement(doc: TextDocument, position: Position): string {
             start = i + 1;
             break;
         }
-        if (i === 0) {start = 0;}
+        if (i === 0) { start = 0; }
     }
 
     // look downward until END/; or bottom
@@ -1169,7 +1421,7 @@ function getCurrentStatement(doc: TextDocument, position: Position): string {
             end = i;
             break;
         }
-        if (i === lines.length - 1) {end = lines.length - 1;}
+        if (i === lines.length - 1) { end = lines.length - 1; }
     }
 
     return lines.slice(start, end + 1).join("\n");
