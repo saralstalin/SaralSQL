@@ -190,94 +190,10 @@ function isTableConstraintRow(s: string): boolean {
         || head.startsWith("check");
 }
 
-function parseColumnsFromCreateWithPos(
-  srcText: string,
-  startLine: number
-): Array<{ name: string; rawName: string; line: number; start: number; end: number }> {
-  const srcLines = srcText.split(/\r?\n/);
-
-  // Extract CREATE ... ( ... ) ; body like your old function did
-  const m = /CREATE\s+(?:TABLE|TYPE)\s+[A-Za-z0-9_\[\]\.]+\s*(?:AS\s+TABLE)?\s*\(([\s\S]*?)\)\s*;/i.exec(srcText);
-  if (!m) {return [];}
-
-  const body = stripComments(m[1]); // keep parity with old behavior
-  const lines = body.split(/\r?\n/);
-  const constraintKeywords = ["primary key", "foreign key", "constraint", "index", "check", "unique"];
-
-  const cols: Array<{ name: string; rawName: string; line: number; start: number; end: number }> = [];
-
-  for (let offset = 0; offset < lines.length; offset++) {
-    const line = lines[offset];
-    if (!line.trim()) {continue;}
-
-    // Split this line into parts by commas not inside parentheses
-    const parts: string[] = [];
-    let current = "";
-    let depth = 0;
-    for (const ch of line) {
-      if (ch === "(") {depth++;}
-      else if (ch === ")") {depth = Math.max(0, depth - 1);}
-      if (ch === "," && depth === 0) {
-        parts.push(current);
-        current = "";
-      } else {
-        current += ch;
-      }
-    }
-    if (current.trim()) {parts.push(current);}
-
-    for (const part of parts) {
-      const trimmed = part.trim();
-      if (!trimmed) {continue;}
-
-      const lowered = trimmed.toLowerCase();
-      if (constraintKeywords.some(k => lowered.startsWith(k))) {continue;}
-
-      // First identifier: [Name] or Name
-      const mm = /^\s*(\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_]*))\b/.exec(trimmed);
-      if (!mm) {continue;}
-
-      const rawToken = mm[1];               // includes brackets if present, e.g. "[GoodieName]" or "GoodieName"
-      const nameOnly = (mm[2] ?? mm[3] ?? "").trim();
-      const normName = normalizeName(nameOnly);
-
-      // Absolute line in original file
-      const absLine = startLine + offset;
-      if (absLine < 0 || absLine >= srcLines.length) {continue;}
-
-      const originalLine = srcLines[absLine];
-
-      // Find start col on original line: try the exact token (with brackets if any), else bare
-      let startCol = originalLine.indexOf(rawToken);
-      if (startCol < 0) {
-        startCol = originalLine.indexOf(nameOnly);
-      }
-      if (startCol < 0) {
-        // Fallback: use first non-space position of the line segment (keeps navigation usable)
-        startCol = Math.max(0, originalLine.search(/\S/));
-      }
-      const endCol = startCol + rawToken.length;
-
-      // Deduplicate by normalized name (like your old function)
-      if (!cols.some(c => c.name === normName && c.line === absLine && c.start === startCol)) {
-        cols.push({
-          name: normName,
-          rawName: rawToken,   // keep the exact token for nicer symbols (e.g., "[GoodieName]")
-          line: absLine,
-          start: startCol,
-          end: endCol
-        });
-      }
-    }
-  }
-
-  return cols;
-}
-
-
-
-
-function splitCreateBodyIntoRowsWithPositions(text: string, defLineIndex: number): Array<{ text: string; line: number; col: number }> {
+function splitCreateBodyIntoRowsWithPositions(
+    text: string,
+    defLineIndex: number
+): Array<{ text: string; line: number; col: number }> {
     const lines = text.split(/\r?\n/);
 
     // find first '(' from the definition line onwards
@@ -291,56 +207,146 @@ function splitCreateBodyIntoRowsWithPositions(text: string, defLineIndex: number
     const rows: Array<{ text: string; line: number; col: number }> = [];
     let buf = "";
     let depth = 0;
-    let curLine = startLine;
-    let curCol = parenIdx + 1; // start right after '('
+    let inQuote: '"' | "'" | null = null;
+
+    // The start position of the *current* row we are building:
     let rowStartLine = startLine;
     let rowStartCol = parenIdx + 1;
-    let inQuote: string | null = null;
 
-    // walk char-by-char until we close the outermost '('
+    const flushRow = () => {
+        const trimmed = buf.trim();
+        if (trimmed) { rows.push({ text: trimmed, line: rowStartLine, col: rowStartCol }); }
+        buf = "";
+    };
+
     for (let i = startLine; i < lines.length; i++) {
         const line = lines[i];
         const kStart = (i === startLine ? parenIdx + 1 : 0);
+
+        // If we are at a new physical line and buffer is empty, reset the row start to here.
+        if (kStart === 0 && buf.length === 0) {
+            rowStartLine = i;
+            rowStartCol = 0;
+        }
+
         for (let k = kStart; k < line.length; k++) {
             const ch = line[k];
+            const next = k + 1 < line.length ? line[k + 1] : "";
+
+            // line comment
+            if (!inQuote && ch === "-" && next === "-") {
+                break; // ignore the rest of the line
+            }
 
             if (inQuote) {
                 buf += ch;
                 if (ch === inQuote) { inQuote = null; }
                 continue;
             }
-            if (ch === "'" || ch === '"') { inQuote = ch; buf += ch; continue; }
+
+            if (ch === "'" || ch === '"') {
+                inQuote = ch as '"' | "'";
+                buf += ch;
+                continue;
+            }
 
             if (ch === "(") { depth++; buf += ch; continue; }
             if (ch === ")") {
                 if (depth === 0) {
-                    // end of the column list
-                    const trimmed = buf.trim();
-                    if (trimmed) { rows.push({ text: trimmed, line: rowStartLine, col: rowStartCol }); }
+                    flushRow();
                     return rows;
                 }
                 depth--; buf += ch; continue;
             }
 
             if (ch === "," && depth === 0) {
-                const trimmed = buf.trim();
-                if (trimmed) { rows.push({ text: trimmed, line: rowStartLine, col: rowStartCol }); }
-                buf = "";
+                // current row ends before this comma
+                flushRow();
+
+                // next row starts after this comma (possibly same line)
                 rowStartLine = i;
-                rowStartCol = k + 1;
-                continue;
+
+                // Find the first non-space after the comma to set a precise col
+                let nextCol = k + 1;
+                while (nextCol < line.length && /\s/.test(line[nextCol])) { nextCol++; }
+                rowStartCol = nextCol;
+
+                continue; // do not include comma in buf
+            }
+
+            // If buf is empty and we just hit the first non-space char, lock start col precisely
+            if (buf.length === 0 && !/\s/.test(ch)) {
+                rowStartLine = i;
+                rowStartCol = k;
             }
 
             buf += ch;
         }
+
+        // keep line separation (helps when rows span multiple lines)
         buf += "\n";
     }
+
+    // Fallback: if closing ')' not seen, flush what we collected
+    const trimmed = buf.trim();
+    if (trimmed) { rows.push({ text: trimmed, line: rowStartLine, col: rowStartCol }); }
     return rows;
 }
+
+
+
+// NEW: linear parser (block-scoped, no whole-file rescans, safer constraint handling)
+function parseColumnsFromCreateBlock(
+    blockText: string,
+    startLine: number
+): Array<{ name: string; rawName: string; line: number; start: number; end: number }> {
+    const rows = splitCreateBodyIntoRowsWithPositions(blockText, startLine);
+    const out: Array<{ name: string; rawName: string; line: number; start: number; end: number }> = [];
+
+    const allLines = blockText.split(/\r?\n/);
+
+    for (const r of rows) {
+        const m = /^\s*(\[([^\]]+)\]|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))/.exec(r.text);
+        if (!m) { continue; }
+
+        const raw = m[1]; // preserves brackets/quotes
+        const tokenName = (m[2] ?? m[3] ?? m[4] ?? "").trim();
+
+        // Only skip if the *first* token is an unquoted/unbracketed constraint keyword
+        const isConstraint =
+            !m[2] && !m[3] && /^(?:constraint|primary|foreign|check|unique|index)$/i.test(tokenName);
+        if (isConstraint) { continue; }
+
+        const name = normalizeName(tokenName);
+
+        // Compute true start column by searching this raw token on the actual source line.
+        // If not found (rare formatting), fall back to r.col.
+        const sourceLine = allLines[r.line] ?? "";
+        let startCol = sourceLine.indexOf(raw);
+        if (startCol < 0) {
+            // try bare token
+            startCol = sourceLine.search(new RegExp(`\\b${tokenName.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}\\b`));
+        }
+        if (startCol < 0) { startCol = r.col; }
+
+        out.push({
+            name,
+            rawName: raw,
+            line: r.line,
+            start: startCol,
+            end: startCol + raw.length
+        });
+    }
+
+    return out;
+}
+
+
 // ---------- Indexing ----------
 function indexText(uri: string, text: string): void {
     const normUri = uri.startsWith("file://") ? uri : url.pathToFileURL(uri).toString();
 
+    // Reset any old defs/refs for this file
     definitions.delete(normUri);
     for (const [key, refs] of referencesIndex.entries()) {
         const filtered = refs.filter(r => r.uri !== normUri);
@@ -350,81 +356,112 @@ function indexText(uri: string, text: string): void {
 
     const defs: SymbolDef[] = [];
     const lines = text.split(/\r?\n/);
+    const cleanLines = lines.map(stripComments); // <-- compute once
     const localRefs: ReferenceDef[] = [];
+
+    // Precompile regexes once (reset lastIndex before each use)
+    const tableRegexG = /\b(from|join|update|into)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
+    const aliasColRegexG = /([a-zA-Z0-9_]+)\.(\[[^\]]+\]|[a-zA-Z_][a-zA-Z0-9_]*)/g;
+    const bareColRegexG = /\[([a-zA-Z0-9_ ]+)\]|([a-zA-Z_][a-zA-Z0-9_]*)/g;
+    const fromJoinRegexG = /\b(from|join)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
+
+    // Cache for statement scopes per line (avoids O(N²))
+    const stmtScopeByLine = new Map<number, { text: string; tablesInScope: string[] }>();
 
     // --- scan for definitions ---
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         const match = /^\s*CREATE\s+(PROCEDURE|FUNCTION|VIEW|TABLE|TYPE)\s+([a-zA-Z0-9_\[\]\.]+)/i.exec(line);
-        if (match) {
-            const kind = match[1].toUpperCase();
-            const rawName = match[2];
-            const norm = normalizeName(rawName);
+        if (!match) { continue; }
 
-            const sym: SymbolDef = { name: norm, rawName, uri: normUri, line: i };
+        const kind = match[1].toUpperCase();
+        const rawName = match[2];
+        const norm = normalizeName(rawName);
 
-            if (kind === "TABLE" || (kind === "TYPE" && /\bAS\s+TABLE\b/i.test(line))) {
-                const cols = parseColumnsFromCreateWithPos(text, i);
+        const sym: SymbolDef = { name: norm, rawName, uri: normUri, line: i };
 
-                // Keep columnsByTable in sync (store normalized names)
-                const set = new Set<string>();
-                for (const c of cols) { set.add(c.name); }
-                columnsByTable.set(norm, set);
+        if (kind === "TABLE" || (kind === "TYPE" && /\bAS\s+TABLE\b/i.test(line))) {
+            // Build block from current line and parse columns (linear helper)
+            const createBlock = lines.slice(i).join("\n");
+            const cols = parseColumnsFromCreateBlock(createBlock, 0);
 
-                // Satisfy ColumnDef[] (requires at least { name, rawName, line })
-                (sym as any).columns = cols.map(c => ({
+            // Keep columnsByTable in sync (normalized)
+            const set = new Set<string>();
+            for (const c of cols) { set.add(c.name); }
+            columnsByTable.set(norm, set);
+
+            // Definitions for columns with correct absolute positions
+            (sym as any).columns = cols.map(c => {
+                const fileLine = i + c.line + 1;   // correct offset: skip CREATE line
+                const sourceLineText = lines[fileLine] || "";
+
+                let startCol = sourceLineText.indexOf(c.rawName);
+                if (startCol < 0) { startCol = sourceLineText.indexOf(c.name); }
+                if (startCol < 0) { startCol = Math.max(0, sourceLineText.search(/\S/)); }
+
+                return {
                     name: c.name,
                     rawName: c.rawName,
-                    line: c.line,
-                    start: c.start,
-                    end: c.end
-                })) as any;
+                    line: fileLine,
+                    start: startCol,
+                    end: startCol + c.rawName.length
+                };
+            }) as any;
 
-                // Create local column refs using real positions
-                for (const c of cols) {
-                    localRefs.push({
-                        name: `${norm}.${c.name}`,
-                        uri: normUri,
-                        line: c.line,
-                        start: c.start,
-                        end: c.end,
-                        kind: "column"
-                    });
-                }
-            }
+            // Local column refs (definition locations)
+            for (const c of cols) {
+                const fileLine = i + c.line + 1;
+                const sourceLineText = lines[fileLine] || "";
 
-            defs.push(sym);
+                let startCol = sourceLineText.indexOf(c.rawName);
+                if (startCol < 0) { startCol = sourceLineText.indexOf(c.name); }
+                if (startCol < 0) { startCol = Math.max(0, sourceLineText.search(/\S/)); }
 
-            const idx = line.toLowerCase().indexOf(rawName.toLowerCase());
-            if (idx >= 0) {
                 localRefs.push({
-                    name: norm,
+                    name: `${norm}.${c.name}`,
                     uri: normUri,
-                    line: i,
-                    start: idx,
-                    end: idx + rawName.length,
-                    kind: "table"
+                    line: fileLine,
+                    start: startCol,
+                    end: startCol + c.rawName.length,
+                    kind: "column"
                 });
             }
         }
+
+        defs.push(sym);
+
+        // Definition ref for the object name on its CREATE line
+        const idx = line.toLowerCase().indexOf(rawName.toLowerCase());
+        if (idx >= 0) {
+            localRefs.push({
+                name: norm,
+                uri: normUri,
+                line: i,
+                start: idx,
+                end: idx + rawName.length,
+                kind: "table"
+            });
+        }
     }
 
+    // Aliases computed once and reused
     const aliases = extractAliases(text);
-    for (let i = 0; i < lines.length; i++) {
-        const clean = stripComments(lines[i]);
 
-        // --- table usages ---
-        const tableRegex = /\b(from|join|update|into)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
-        let m: RegExpExecArray | null;
-        while ((m = tableRegex.exec(clean))) {
+    // --- scan for usages (tables, alias columns, bare columns) ---
+    for (let i = 0; i < lines.length; i++) {
+        const clean = cleanLines[i];
+
+        // table usages
+        tableRegexG.lastIndex = 0;
+        for (let m = tableRegexG.exec(clean); m; m = tableRegexG.exec(clean)) {
             const raw = m[2];
-            const norm = normalizeName(raw);
+            const tnorm = normalizeName(raw);
 
             const keywordIndex = m.index;
             const tableIndex = keywordIndex + m[0].indexOf(raw);
 
             localRefs.push({
-                name: norm,
+                name: tnorm,
                 uri: normUri,
                 line: i,
                 start: tableIndex,
@@ -433,54 +470,57 @@ function indexText(uri: string, text: string): void {
             });
         }
 
-        // --- alias.column usages ---
-        const colRegex = /([a-zA-Z0-9_]+)\.(\[[^\]]+\]|[a-zA-Z_][a-zA-Z0-9_]*)/g;
-        while ((m = colRegex.exec(clean))) {
-            const alias = m[1].toLowerCase();
-            const col = normalizeName(m[2].replace(/[\[\]]/g, ""));
+        // alias.column usages
+        aliasColRegexG.lastIndex = 0;
+        for (let m2 = aliasColRegexG.exec(clean); m2; m2 = aliasColRegexG.exec(clean)) {
+            const alias = m2[1].toLowerCase();
+            const col = normalizeName(m2[2].replace(/[\[\]]/g, ""));
             const table = aliases.get(alias);
-            if (table) {
-                const key = `${normalizeName(table)}.${col}`;
-                localRefs.push({
-                    name: key,
-                    uri: normUri,
-                    line: i,
-                    start: m.index,
-                    end: m.index + m[0].length,
-                    kind: "column"
-                });
-            }
+            if (!table) { continue; }
+
+            const key = `${normalizeName(table)}.${col}`;
+            localRefs.push({
+                name: key,
+                uri: normUri,
+                line: i,
+                start: m2.index,
+                end: m2.index + m2[0].length,
+                kind: "column"
+            });
         }
 
-        // --- unaliased column usages (allow [Column]) ---
-        const bareColRegex = /\[([a-zA-Z0-9_ ]+)\]|([a-zA-Z_][a-zA-Z0-9_]*)/g;
-        while ((m = bareColRegex.exec(clean))) {
-            const tokenRaw = (m[1] || m[2] || "");
+        // unaliased column usages (allow [Column])
+        bareColRegexG.lastIndex = 0;
+        for (let m3 = bareColRegexG.exec(clean); m3; m3 = bareColRegexG.exec(clean)) {
+            const tokenRaw = (m3[1] || m3[2] || "");
             const col = normalizeName(tokenRaw.replace(/[\[\]]/g, ""));
-
             if (isSqlKeyword(col)) { continue; }
 
-            const leftSlice = clean.slice(0, m.index).toLowerCase();
-            if (/\bas\s*$/.test(leftSlice)) { continue; }
-
-            // Use FULL MATCH SPAN to detect alias.column adjacency
-            const tokenStart = m.index;
-            const tokenEnd = m.index + (m[0] ? m[0].length : tokenRaw.length);
+            // skip if part of alias.column
+            const tokenStart = m3.index;
+            const tokenEnd = m3.index + (m3[0] ? m3[0].length : tokenRaw.length);
             const beforeChar = clean.charAt(Math.max(0, tokenStart - 1));
             const afterChar = clean.charAt(tokenEnd);
             if (beforeChar === "." || afterChar === ".") { continue; }
 
-            // use statement-scoped FROM/JOIN
-            const statementText = getCurrentStatement(
-                documents.get(normUri as any) ?? { getText: () => text } as any,
-                { line: i, character: 0 }
-            );
-            const tablesInScope: string[] = [];
-            const fromJoinRegex = /\b(from|join)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
-            let fm: RegExpExecArray | null;
-            while ((fm = fromJoinRegex.exec(statementText))) {
-                tablesInScope.push(normalizeName(fm[2]));
+            // Get (cached) statement text and tables-in-scope for this line
+            let scope = stmtScopeByLine.get(i);
+            if (!scope) {
+                const stmtText = getCurrentStatement(
+                    documents.get(normUri as any) ?? { getText: () => text } as any,
+                    { line: i, character: 0 }
+                );
+                const tablesInScope: string[] = [];
+                fromJoinRegexG.lastIndex = 0;
+                for (let fm = fromJoinRegexG.exec(stmtText); fm; fm = fromJoinRegexG.exec(stmtText)) {
+                    tablesInScope.push(normalizeName(fm[2]));
+                }
+                scope = { text: stmtText, tablesInScope };
+                stmtScopeByLine.set(i, scope);
             }
+
+            const { tablesInScope } = scope;
+            if (tablesInScope.length === 0) { continue; } // fast skip
 
             const candidateTables: string[] = [];
             for (const t of tablesInScope) {
@@ -492,8 +532,8 @@ function indexText(uri: string, text: string): void {
                     name: `${candidateTables[0]}.${col}`,
                     uri: normUri,
                     line: i,
-                    start: m.index,
-                    end: m.index + tokenRaw.length,
+                    start: m3.index,
+                    end: m3.index + tokenRaw.length,
                     kind: "column"
                 });
             } else if (candidateTables.length > 1) {
@@ -502,8 +542,8 @@ function indexText(uri: string, text: string): void {
                         name: `${t}.${col}`,
                         uri: normUri,
                         line: i,
-                        start: m.index,
-                        end: m.index + tokenRaw.length,
+                        start: m3.index,
+                        end: m3.index + tokenRaw.length,
                         kind: "column"
                     });
                 }
@@ -511,8 +551,10 @@ function indexText(uri: string, text: string): void {
         }
     }
 
+    // Save definitions
     definitions.set(normUri, defs);
 
+    // De-dupe local refs and merge into global index
     const seen = new Set<string>();
     for (const ref of localRefs) {
         const key = `${ref.uri}:${ref.line}:${ref.start}:${ref.end}:${ref.name}`;
@@ -524,9 +566,13 @@ function indexText(uri: string, text: string): void {
         referencesIndex.set(ref.name, arr);
     }
 
-    aliasesByUri.set(normUri, extractAliases(text));
+    // Save aliases (reuse the map we already computed)
+    aliasesByUri.set(normUri, aliases);
+
+    // Index tables by name for quick definition lookup
     for (const def of defs) { tablesByName.set(def.name, def); }
 }
+
 
 
 async function indexWorkspace(): Promise<void> {
@@ -1169,7 +1215,7 @@ function extractSelectAliasesFromStatement(statementText: string): Set<string> {
 
     // Get text after SELECT, before FROM (or end of statement if no FROM)
     const m = /select\b([\s\S]*?)(\bfrom\b|$)/i.exec(statementText);
-    if (!m) return out;
+    if (!m) { return out; }
     const selectList = m[1];
 
     // Split the SELECT list by top-level commas (handles functions, CASE, windows, etc.)
@@ -1177,7 +1223,7 @@ function extractSelectAliasesFromStatement(statementText: string): Set<string> {
 
     for (const rawItem of items) {
         const item = rawItem.trim();
-        if (!item || item === "*") continue;
+        if (!item || item === "*") { continue; }
 
         // 1) AS alias   e.g.,  SUM(x) AS Total  or  [Full Name] AS EmpName
         let asMatch = /\bas\s+(\[?[A-Za-z_][A-Za-z0-9_ ]*\]?)/i.exec(item);
@@ -1198,7 +1244,7 @@ function extractSelectAliasesFromStatement(statementText: string): Set<string> {
             const looksLikeExpr = /[\(\)\+\-\*\/%]|case\b|over\b|\brow_number\b|\bsum\b|\bcount\b|\bmin\b|\bmax\b|\bconvert\b|\bcast\b|\bcoalesce\b/i.test(before);
             if (looksLikeExpr) {
                 const norm = normalizeName(candidate.replace(/[\[\]]/g, ""));
-                if (norm) out.add(norm);
+                if (norm) { out.add(norm); }
             }
         }
     }
