@@ -9,7 +9,7 @@
     "VS Code"
   ],
   "license": "MIT",
-  "version": "0.0.9",
+  "version": "0.1.1",
   "engines": {
     "vscode": "^1.103.0"
   },
@@ -40,6 +40,15 @@
           "type": "boolean",
           "default": false,
           "description": "Enable lightweight SQL validation (experimental). Disabled by default."
+        },
+        "saralsql.exclude": {
+          "type": "array",
+          "default": [
+            "**/pre-deployment/**",
+            "**/post-deployment/**",
+            "**/deploy/**"
+          ],
+          "description": "Glob patterns to exclude from indexing"
         }
       }
     }

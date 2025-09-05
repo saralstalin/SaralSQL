@@ -35,6 +35,8 @@ const columnsByTable = new Map<string, Set<string>>();
 const aliasesByUri = new Map<string, Map<string, string>>();
 const definitions = new Map<string, SymbolDef[]>();
 const referencesIndex = new Map<string, Map<string, ReferenceDef[]>>();
+
+
 function setRefsForFile(name: string, uri: string, refs: ReferenceDef[]) {
     let byUri = referencesIndex.get(name);
     if (!byUri) { byUri = new Map(); referencesIndex.set(name, byUri); }
@@ -134,7 +136,14 @@ function normalizeName(name: string): string {
 }
 
 
+// Safety caps 
+const MAX_FILE_SIZE_BYTES = 8 * 1024;   // 8 KB (skip larger files)
+const MAX_REFS_PER_FILE = 5000;         // cap number of reference objects created per file
+const DEPLOY_BLOCK_SUBSTRING = "deploy"; // block any path that contains this substring
 
+function toNormUri(rawUri: string): string {
+    return rawUri.startsWith("file://") ? rawUri : url.pathToFileURL(rawUri).toString();
+}
 
 function safeLog(msg: string): void {
     if (process.env.SARALSQL_DEBUG) {
@@ -214,6 +223,8 @@ function splitCreateBodyIntoRowsWithPositions(
     defLineIndex: number
 ): Array<{ text: string; line: number; col: number }> {
     const lines = text.split(/\r?\n/);
+
+
 
     // find first '(' from the definition line onwards
     let startLine = defLineIndex, parenIdx = -1;
@@ -364,6 +375,24 @@ function parseColumnsFromCreateBlock(
 // ---------- Indexing ----------
 function indexText(uri: string, text: string): void {
     const normUri = uri.startsWith("file://") ? uri : url.pathToFileURL(uri).toString();
+
+
+    if (normUri.toLowerCase().includes(`/${DEPLOY_BLOCK_SUBSTRING}`) || normUri.toLowerCase().includes(`\\${DEPLOY_BLOCK_SUBSTRING}`)) {
+        safeLog(`[indexText] skipping due to deploy folder match: ${normUri}`);
+        return;
+    }
+
+    if (!normUri.toLowerCase().endsWith(".sql")) {
+        safeLog(`[indexText] skipped non-sql file: ${normUri}`);
+        return;
+    }
+
+    // 2) Skip files that are larger than the configured threshold (avoid heavy files)
+    const byteLen = Buffer.byteLength(text || "", "utf8");
+    if (byteLen > MAX_FILE_SIZE_BYTES) {
+        safeLog(`[indexText] skipping large file (${byteLen} bytes) ${normUri}`);
+        return;
+    }
 
     // Reset any old defs/refs for this file (purge stale def caches too)
     const oldDefs = definitions.get(normUri) || [];
@@ -846,22 +875,54 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
 
         // ---------- Case A: alias-dot completions, e.g. "t." or "[t]." ----------
         // allow bracketed alias like [t]
-        const aliasMatch = /([a-zA-Z0-9_\[\]]+)\.$/.exec(linePrefix);
-        if (aliasMatch) {
-            let aliasRaw = aliasMatch[1].replace(/^\[|\]$/g, "");
-            const alias = aliasRaw.toLowerCase();
-            const aliasesMap = aliasesByUri.get(normUri) || aliasesByUri.get(rawUri) || new Map<string, string>();
-            const tableName = aliasesMap.get(alias);
+        const aliasDotMatch = /([a-zA-Z0-9_\[\]]+)\.$/.exec(linePrefix);
+        if (aliasDotMatch) {
+            // alias token typed (may be bracketed like [lw])
+            let aliasRaw = aliasDotMatch[1].replace(/^\[|\]$/g, "");
+            const aliasLower = aliasRaw.toLowerCase();
+
+            // 1) First try statement-scoped aliases (closest match)
+            let aliasesMap = new Map<string, string>();
+            try {
+                const stmtText = getCurrentStatement(doc, position);
+                aliasesMap = extractAliases(stmtText); // returns Map<alias, tableName>
+            } catch (e) {
+                // fall through to file-level alias map if something goes wrong
+                safeLog("[completion] extractAliases(statement) failed: " + String(e));
+            }
+
+            // 2) If alias not found in statement scope, fall back to file-level alias table
+            if (!aliasesMap.has(aliasLower)) {
+                const fileAliases = aliasesByUri.get(normUri) || aliasesByUri.get(rawUri) || new Map<string, string>();
+                // merge fileAliases into aliasesMap but keep statement-scoped precedence
+                for (const [k, v] of fileAliases.entries()) {
+                    if (!aliasesMap.has(k)) {aliasesMap.set(k, v);}
+                }
+            }
+
+            const tableName = aliasesMap.get(aliasLower);
             if (tableName) {
                 const def = tablesByName.get(tableName);
                 if (def?.columns) {
-                    return (def.columns as any[]).map(col => ({
-                        label: col.rawName,
-                        kind: CompletionItemKind.Field,
-                        detail: col.type ? `Column in ${def.rawName} (${col.type})` : `Column in ${def.rawName}`,
-                        insertText: col.rawName
-                    }));
+                    // Deduplicate columns by normalized name to handle [Col] vs Col
+                    const seenCols = new Set<string>();
+                    const cols: CompletionItem[] = [];
+                    for (const col of (def.columns as any[])) {
+                        const normCol = (col.rawName || col.name || "").replace(/^\[|\]$/g, "").toLowerCase();
+                        if (seenCols.has(normCol)) {continue;}
+                        seenCols.add(normCol);
+                        cols.push({
+                            label: col.rawName,
+                            kind: CompletionItemKind.Field,
+                            detail: col.type ? `Column in ${def.rawName} (${col.type})` : `Column in ${def.rawName}`,
+                            insertText: col.rawName
+                        });
+                    }
+                    return cols;
                 }
+            } else {
+                // helpful debug log so we can see unresolved aliases in enterprise runs
+                safeLog(`[completion] alias '${aliasRaw}' not found in statement or file aliases for ${normUri}. linePrefix='${linePrefix.slice(-80)}'`);
             }
         }
 
@@ -884,7 +945,7 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
             for (const def of tablesByName.values()) {
                 if ((def as any).columns) {
                     for (const col of (def as any).columns) {
-                        if (colCount++ > COL_LIMIT) {break;}
+                        if (colCount++ > COL_LIMIT) { break; }
                         items.push({
                             label: col.rawName,
                             kind: CompletionItemKind.Field,
@@ -893,7 +954,7 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
                         });
                     }
                 }
-                if (colCount > COL_LIMIT) {break;}
+                if (colCount > COL_LIMIT) { break; }
             }
             for (const def of tablesByName.values()) {
                 items.push({
@@ -918,7 +979,7 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
             "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER",
             "JOIN", "WHERE", "GROUP BY", "ORDER BY", "FROM", "AS"
         ];
-        for (const kw of keywords) {items.push({ label: kw, kind: CompletionItemKind.Keyword });}
+        for (const kw of keywords) { items.push({ label: kw, kind: CompletionItemKind.Keyword }); }
 
         return items;
     } catch (err) {
