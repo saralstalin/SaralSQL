@@ -1,9 +1,10 @@
 # SaralSQL : SQL Language Features (Preview)
 
-This VS Code extension adds basic **Language Server Protocol (LSP)** features for working with SQL code.  
+This VS Code extension adds **Language Server Protocol (LSP)** features for working with SQL code.  
 It is fast and lightweight, works on plain `.sql` files, and does **not** require a database connection.  
 
-It uses a regex-based indexer instead of a full SQL parser — so results won’t be perfect in every scenario, but it provides a solid, practical foundation for SQL development in VS Code.
+It combines a **regex-based indexer** (for speed and responsiveness) with a **lightweight SQL parser (node-sql-parser)** for more accurate context.  
+The goal is practical productivity — not perfect SQL understanding.
 
 ---
 
@@ -22,9 +23,16 @@ It uses a regex-based indexer instead of a full SQL parser — so results won’
   - After typing `alias.` or `TableName.`, column suggestions appear.  
   - Schema prefixes are handled (`dbo.TableName` is treated the same as `TableName`).  
 
+- **Hover Information**  
+  Hover over a table, alias, or column to see its definition and context.  
+
 - **Workspace Indexing**  
   - Automatically indexes all `.sql` files in the workspace.  
   - Updates instantly as you type or save.  
+
+- **Hybrid Resolution**  
+  - Regex-based indexing ensures fast responses.  
+  - Parser-based fallback improves accuracy in `FROM`/`JOIN` contexts and complex queries.  
 
 ---
 
@@ -32,7 +40,7 @@ It uses a regex-based indexer instead of a full SQL parser — so results won’
 
 1. Install the extension.  
 2. Open a folder or workspace containing `.sql` files.  
-3. Start editing — features like definitions, references, and completions activate automatically.  
+3. Start editing — features like definitions, references, completions, and hovers activate automatically.  
 
 > 💡 Works best when your schema objects (tables, types, procedures) are defined in `.sql` files within your workspace.  
 
@@ -44,6 +52,7 @@ This is a **Preview release**.
 - Optimized for **T-SQL / SQL Server** style DDL & DML.  
 - Dialects like Postgres or MySQL may partially work but are not fully supported yet.  
 - Column and reference detection is heuristic — complex scripts may produce misses or false positives.  
+- Certain constructs (e.g. `TOP(@Variable)`) may require sanitisation before parsing and are still being improved.  
 
 We’re releasing early to gather real-world feedback before expanding the feature set.  
 
@@ -51,11 +60,13 @@ We’re releasing early to gather real-world feedback before expanding the featu
 
 ## 🛠 Planned Improvements
 
-- Outline view for procedures, tables, and columns.  
-- Workspace symbol search (`Ctrl+T`).  
-- Diagnostics for undefined tables/columns.  
-- Hover information and quick documentation.  
-- Smarter reference resolution (scoped by `FROM` / `JOIN` context).  
+- **Outline view** for procedures, tables, and columns.  
+- **Workspace symbol search** (`Ctrl+T`) across SQL objects.  
+- **Diagnostics** for undefined tables/columns and duplicate definitions.  
+- **Smarter reference resolution** using parser context (`FROM` / `JOIN` scope).  
+- **Better handling of parameterised constructs** like `TOP(@var)` and `OUTPUT INTO`.  
+- **Schema-aware resolution** when multiple schemas contain the same table name.  
+- **Incremental indexing** for faster performance on very large workspaces.  
 
 ---
 
@@ -67,28 +78,35 @@ We welcome feedback and bug reports!
 
 ---
 
-## Known Limitations
+## ⚠️ Known Limitations
 
 This extension is intentionally lightweight and does **not** do full SQL parsing or semantic analysis.  
 Be aware of these trade-offs:
 
 - **Column References**  
-  Column references are matched globally by name.  
+  Column references are matched globally by name in regex fallback mode.  
   If multiple tables have the same column (e.g. `Id`), all may appear in references.  
-  (Teams using explicit naming standards like `EmployeeId`, `DepartmentId` will be less affected.)  
+  Teams using explicit naming standards like `EmployeeId`, `DepartmentId` will be less affected.  
 
 - **Bare Columns**  
-  Bare columns (`SELECT EmployeeId`) are treated as global — not resolved to a specific table.  
-  Aliased usage (`e.EmployeeId`) works better.  
+  Bare columns (`SELECT EmployeeId`) are usually resolved to their table if the statement parses successfully.  
+  In fallback (regex-only) mode, they are treated as global and may be ambiguous.  
+  Aliased usage (`e.EmployeeId`) is always more reliable.  
 
 - **Schemas**  
-  By default, `dbo.TableName` and `TableName` are treated as the same.  
+  `dbo.TableName` and `TableName` are treated as the same.  
   Multiple schemas with the same table name are not yet distinguished.  
 
 - **Cross-File Consistency**  
   Accuracy depends on having all schema files in your workspace.  
   Missing files = missing definitions.  
-  (For SSDT projects, this typically isn’t an issue since all objects are included.)  
+
+- **Parser Gaps**  
+  Some T-SQL constructs (e.g. `TOP(@var)`, `MERGE`, `OUTPUT INTO`) are not fully supported by the parser.  
+  Regex fallback ensures partial functionality, but AST-powered features may be incomplete.  
+
+- **Mid-Edit States**  
+  While typing (e.g. after `e.` without a column), some features may only partially work until the statement is complete.  
 
 ---
 

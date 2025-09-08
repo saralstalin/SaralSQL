@@ -27,6 +27,156 @@ import { TextDocument } from "vscode-languageserver-textdocument";
 import * as fs from "fs";
 import * as fg from "fast-glob";
 import * as url from "url";
+import { Worker } from 'worker_threads';
+import * as crypto from 'crypto';
+
+const WORKER_PATH = require.resolve("./sqlAstWorker.js");
+const MAX_WORKERS = 2;
+
+
+type Pending = { id: string, sql: string, opts: any, resolve: (v: any) => void, reject: (e: any) => void, deadline: number };
+
+class AstWorkerPool {
+    workers: Worker[] = [];
+    idle: Worker[] = [];
+    pending: Pending[] = [];
+
+    // --- minimal additions for backoff/retry ---
+    private spawnFailures = 0; // counts recent consecutive spawn failures
+    private readonly MAX_SPAWN_ATTEMPTS = 6;      // stop respawning after this many attempts
+    private readonly BASE_BACKOFF_MS = 200;       // base backoff (will expon. backoff)
+    // ------------------------------------------------
+
+    constructor() { for (let i = 0; i < MAX_WORKERS; i++) { this.spawnWorker(); } }
+
+    spawnWorker() {
+        // don't spawn indefinitely if workers keep crashing
+        if (this.spawnFailures >= this.MAX_SPAWN_ATTEMPTS) {
+            console.error('[AstWorkerPool] max spawn attempts reached, not spawning more workers');
+            return;
+        }
+
+        const w = new Worker(WORKER_PATH);
+
+        // when a real message comes back from worker, consider it a healthy sign:
+        // reduce the failure counter a bit (but keep it >= 0) and then forward to your handler.
+        w.on('message', (m: any) => {
+            // small stabilization: a successful message likely means the worker is healthy
+            this.spawnFailures = Math.max(0, this.spawnFailures - 1);
+            this.onMessage(w, m);
+        });
+
+        // on exit, remove worker and schedule a respawn using exponential backoff
+        w.on('exit', (code: number) => {
+            this.workers = this.workers.filter(x => x !== w);
+            this.idle = this.idle.filter(x => x !== w);
+
+            // increment failure count and schedule respawn with backoff
+            this.spawnFailures++;
+            const attempt = this.spawnFailures;
+            const delay = Math.min(30_000, this.BASE_BACKOFF_MS * Math.pow(2, Math.max(0, attempt - 1)));
+            console.warn(`[AstWorkerPool] worker exited (code=${code}); scheduling respawn in ${delay}ms (attempt ${attempt}/${this.MAX_SPAWN_ATTEMPTS})`);
+            setTimeout(() => {
+                // double-check the limit again before spawning
+                if (this.spawnFailures < this.MAX_SPAWN_ATTEMPTS) {
+                    this.spawnWorker();
+                } else {
+                    console.error('[AstWorkerPool] reached max spawn attempts; not respawning further.');
+                }
+            }, delay);
+        });
+
+        this.workers.push(w);
+        this.idle.push(w);
+    }
+
+    onMessage(worker: Worker, msg: any) {
+        const pIndex = this.pending.findIndex(p => p.id === msg.id);
+        if (pIndex === -1) { return; }
+        const p = this.pending.splice(pIndex, 1)[0];
+        if (msg.error) { p.resolve(null); }
+        else { p.resolve(msg.ast); }
+        this.idle.push(worker);
+        this.runQueue();
+    }
+
+    runQueue() {
+        while (this.idle.length && this.pending.length) {
+            const w = this.idle.shift()!;
+            const p = this.pending.shift()!;
+            try {
+                w.postMessage({ id: p.id, sql: p.sql, opts: p.opts });
+            } catch (e) {
+                // if postMessage fails, requeue pending and respawn worker
+                this.pending.unshift(p);
+                // use spawnWorker() — it now checks max attempts and won't spin forever
+                this.spawnWorker();
+            }
+        }
+    }
+
+    parse(sql: string, opts: any, timeout = 800) {
+        return new Promise((resolve, reject) => {
+            const id = Math.random().toString(36).slice(2);
+            this.pending.push({ id, sql, opts, resolve, reject, deadline: Date.now() + timeout });
+            // If an idle worker exists, post next pending
+            const w = this.idle.shift();
+            if (w) {
+                const p = this.pending[0];
+                w.postMessage({ id: p.id, sql: p.sql, opts: p.opts });
+            }
+            // simple timeout
+            setTimeout(() => {
+                const idx = this.pending.findIndex(p => p.id === id);
+                if (idx !== -1) { this.pending.splice(idx, 1); resolve(null); }
+            }, timeout + 50);
+        });
+    }
+}
+
+
+const astPool = new AstWorkerPool();
+
+
+class LruCache {
+    private map = new Map<string, { value: any; ts: number }>();
+    capacity = 2000;
+    ttlMs = 30 * 60 * 1000;
+
+    has(k: string): boolean {
+        const e = this.map.get(k);
+        if (!e) { return false; }
+        if (Date.now() - e.ts > this.ttlMs) {
+            this.map.delete(k);
+            return false;
+        }
+        return true;
+    }
+
+    get(k: string): any | null {
+        const e = this.map.get(k);
+        if (!e) { return null; }
+        if (Date.now() - e.ts > this.ttlMs) {
+            this.map.delete(k);
+            return null;
+        }
+        // refresh LRU position
+        this.map.delete(k);
+        this.map.set(k, e);
+        return e.value;
+    }
+
+    set(k: string, v: any) {
+        if (this.map.size >= this.capacity) {
+            const first = this.map.keys().next().value;
+            if (first !== undefined) {
+                this.map.delete(first);
+            }
+        }
+        this.map.set(k, { value: v, ts: Date.now() });
+    }
+}
+const astCache = new LruCache();
 
 // ---------- Connection + Documents ----------
 const connection = createConnection(ProposedFeatures.all);
@@ -36,6 +186,143 @@ const aliasesByUri = new Map<string, Map<string, string>>();
 const definitions = new Map<string, SymbolDef[]>();
 const referencesIndex = new Map<string, Map<string, ReferenceDef[]>>();
 
+
+// Helper: check if the pool has at least one worker available (simple readiness)
+function isAstPoolReady(): boolean {
+    try {
+        // astPool is constructed at module load; ensure at least one worker exists
+        return Array.isArray((astPool as any).workers) && (astPool as any).workers.length > 0;
+    } catch {
+        return false;
+    }
+}
+
+
+function contentHash(s: string) {
+    return crypto.createHash('sha1').update(s).digest('hex');
+}
+
+
+async function parseSqlWithWorker(sql: string, opts: any = {}, timeoutMs = 2000): Promise<any> {
+    try {
+        // cheap guard - avoid parsing huge statements
+        if (!sql || sql.length > 4 * 1024) { return null; }
+
+        const key = contentHash(sql);
+        const cached = astCache.get(key);
+        if (cached !== null && cached !== undefined) {
+            return cached;
+        }
+
+        if (!isAstPoolReady()) {
+            safeLog('[parseSqlWithWorker] ast pool not ready');
+            // cache null so we don't repeatedly try on hot paths
+            astCache.set(key, null);
+            return null;
+        }
+
+        // ask the pool (it returns null on failure/timeout)
+        const ast = await astPool.parse(sql, opts, timeoutMs);
+        // cache (including null)
+        astCache.set(key, ast ?? null);
+        return ast ?? null;
+    } catch (e) {
+        safeLog('[parseSqlWithWorker] unexpected error: ' + String(e));
+        return null;
+    }
+}
+
+
+// ---------- AST helpers (drop into server.ts) ----------
+function walkAst(node: any, fn: (n: any) => void) {
+    fn(node);
+    for (const key in node) {
+        const child = node[key];
+        if (Array.isArray(child)) {
+            child.forEach(c => typeof c === 'object' && walkAst(c, fn));
+        } else if (child && typeof child === 'object') {
+            walkAst(child, fn);
+        }
+    }
+}
+
+function normalizeAstTableName(raw: any): string | null {
+    if (!raw) { return null; }
+    if (typeof raw === "string") { return normalizeName(String(raw).replace(/^dbo\./i, "")); }
+    // sometimes table appears as object { table: 'X' } or { db: 'd', table: 't' }
+    if (raw.table) { return normalizeName(String(raw.table).replace(/^dbo\./i, "")); }
+    if (raw.name) { return normalizeName(String(raw.name).replace(/^dbo\./i, "")); }
+    return null;
+}
+
+/**
+ * Try to resolve which table provides `columnName` inside the given AST.
+ * Returns normalized table name (matching columnsByTable keys) or null.
+ */
+function resolveColumnFromAst(ast: any, columnName: string): string | null {
+    if (!ast) { return null; }
+    const nodes = Array.isArray(ast) ? ast : [ast];
+    columnName = normalizeName(columnName);
+
+    for (const root of nodes) {
+        let found: string | null = null;
+
+        // Walk AST; for each SELECT node, build alias->table map and search column_ref nodes
+        walkAst(root, (n) => {
+            if (!n || typeof n !== "object") { return; }
+            if (n.type === "select" || n.ast === "select") {
+                const aliasMap = new Map<string, string>(); // aliasLower -> tableNorm
+                const fromArr = Array.isArray(n.from) ? n.from : (n.from ? [n.from] : []);
+                for (const f of fromArr) {
+                    try {
+                        // alias may appear in multiple shapes: as / alias / as.value
+                        let alias: any = f.as || f.alias || (f.as && f.as.value) || (f.alias && f.alias.value);
+                        if (alias && typeof alias === "object") { alias = alias.value || alias.name; }
+                        if (typeof alias === "string") { alias = alias.replace(/[\[\]]/g, "").toLowerCase(); }
+
+                        // table may be f.table (string) or f.expr.table etc.
+                        let table = null;
+                        if (typeof f.table === "string") { table = f.table; }
+                        else if (f.table && f.table.value) { table = f.table.value; }
+                        else if (f.expr && (f.expr.table || f.expr.name)) { table = f.expr.table || f.expr.name; }
+
+                        if (table) {
+                            aliasMap.set((alias || String(table).toLowerCase()), normalizeName(String(table).replace(/^dbo\./i, "")));
+                        } else if (f.expr && f.expr.type === "select") {
+                            // subquery: preserve alias so column refs pointing to the alias can be detected,
+                            // but we can't map subquery -> real table here.
+                            if (alias) { aliasMap.set(alias, "__subquery__"); }
+                        }
+                    } catch (e) { /* ignore malformed from entries */ }
+                }
+
+                // find any column_ref matching the requested column
+                walkAst(n, (m) => {
+                    if (!m || typeof m !== "object") { return; }
+                    // typical node-sql-parser column node: { type: 'column_ref', table: 't', column: 'col' }
+                    if ((m.type === "column_ref" || m.ast === "column_ref") && m.column) {
+                        const col = normalizeName(String(m.column));
+                        if (col === columnName) {
+                            if (m.table) {
+                                const rawTable = String(m.table).replace(/[\[\]]/g, "").toLowerCase();
+                                const mapped = aliasMap.get(rawTable) || normalizeName(rawTable.replace(/^dbo\./i, ""));
+                                if (mapped) { found = mapped; }
+                            } else {
+                                // unqualified column_ref — if only one table in aliasMap, attribute to it
+                                if (aliasMap.size === 1) {
+                                    found = Array.from(aliasMap.values())[0];
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        if (found) { return found; }
+    }
+    return null;
+}
 
 function setRefsForFile(name: string, uri: string, refs: ReferenceDef[]) {
     let byUri = referencesIndex.get(name);
@@ -52,7 +339,9 @@ function getRefs(name: string): ReferenceDef[] {
     const byUri = referencesIndex.get(name);
     if (!byUri) { return []; }
     const out: ReferenceDef[] = [];
-    for (const arr of byUri.values()) { out.push(...arr); }
+    for (const arr of byUri.values()) {
+        out.push(...arr);
+    }
     return out;
 }
 
@@ -134,7 +423,6 @@ function normalizeName(name: string): string {
     }
     return n;
 }
-
 
 // Safety caps 
 const MAX_FILE_SIZE_BYTES = 8 * 1024;   // 8 KB (skip larger files)
@@ -329,9 +617,9 @@ function splitCreateBodyIntoRowsWithPositions(
 function parseColumnsFromCreateBlock(
     blockText: string,
     startLine: number
-): Array<{ name: string; rawName: string; line: number; start: number; end: number }> {
+): Array<{ name: string; rawName: string; type?: string; line: number; start: number; end: number }> {
     const rows = splitCreateBodyIntoRowsWithPositions(blockText, startLine);
-    const out: Array<{ name: string; rawName: string; line: number; start: number; end: number }> = [];
+    const out: Array<{ name: string; rawName: string; type?: string; line: number; start: number; end: number }> = [];
 
     const allLines = blockText.split(/\r?\n/);
 
@@ -349,12 +637,19 @@ function parseColumnsFromCreateBlock(
 
         const name = normalizeName(tokenName);
 
+        // Try to grab the data type: the word(s) immediately after the column name
+        // Example: "Salary INT NOT NULL" → colType = "INT"
+        let colType: string | undefined;
+        const afterName = r.text.slice(m[0].length).trim();
+        const typeMatch = /^([A-Za-z0-9_]+(?:\s*\([^)]*\))?)/.exec(afterName);
+        if (typeMatch) {
+            colType = typeMatch[1].trim();
+        }
+
         // Compute true start column by searching this raw token on the actual source line.
-        // If not found (rare formatting), fall back to r.col.
         const sourceLine = allLines[r.line] ?? "";
         let startCol = sourceLine.indexOf(raw);
         if (startCol < 0) {
-            // try bare token
             startCol = sourceLine.search(new RegExp(`\\b${tokenName.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}\\b`));
         }
         if (startCol < 0) { startCol = r.col; }
@@ -362,6 +657,7 @@ function parseColumnsFromCreateBlock(
         out.push({
             name,
             rawName: raw,
+            type: colType,
             line: r.line,
             start: startCol,
             end: startCol + raw.length
@@ -372,10 +668,10 @@ function parseColumnsFromCreateBlock(
 }
 
 
+
 // ---------- Indexing ----------
 function indexText(uri: string, text: string): void {
     const normUri = uri.startsWith("file://") ? uri : url.pathToFileURL(uri).toString();
-
 
     if (normUri.toLowerCase().includes(`/${DEPLOY_BLOCK_SUBSTRING}`) || normUri.toLowerCase().includes(`\\${DEPLOY_BLOCK_SUBSTRING}`)) {
         safeLog(`[indexText] skipping due to deploy folder match: ${normUri}`);
@@ -431,9 +727,113 @@ function indexText(uri: string, text: string): void {
             const createBlock = lines.slice(i).join("\n");
             const cols = parseColumnsFromCreateBlock(createBlock, 0);
 
+            // Attempt optional AST parse for this CREATE block to discover any additional columns (pool-only)
+            try {
+                if (!isAstPoolReady()) {
+                    safeLog('[indexText][AST] pool not ready — skipping AST parse for CREATE block');
+                } else {
+                    // Fire-and-forget parse with short timeout so we don't block indexing
+                    parseSqlWithWorker(createBlock, { database: "mssql" }, 800)
+                        .then((ast) => {
+                            try {
+                                if (!ast) { return; }
+                                const astColsRaw: string[] = [];
+                                if (ast && (ast.type === "create" || (Array.isArray(ast) && ast.length && ast[0].type === "create"))) {
+                                    const node = Array.isArray(ast) ? ast[0] : ast;
+                                    const defs = node.create_definitions || node.createDefinitions || [];
+                                    for (const d of defs) {
+                                        try {
+                                            const cname = (d.column && (d.column.column || d.column.name)) || d.name || d.field;
+                                            if (cname) { astColsRaw.push(String(cname).trim()); }
+                                        } catch { /* ignore per-column errors */ }
+                                    }
+                                }
+
+                                if (astColsRaw.length) {
+                                    // prepare sets for dedupe
+                                    const existingCols = new Set<string>(cols.map(c => normalizeName(c.name)));
+                                    const existingSymCols = new Set<string>((sym.columns || []).map((c: any) => normalizeName((c.rawName || c.name || "").replace(/^\[|\]$/g, ""))));
+                                    const set = columnsByTable.get(norm) || new Set<string>();
+
+                                    // collect new local refs that we will add (deduped by pos)
+                                    const newLocalRefs: ReferenceDef[] = [];
+
+                                    for (const rawAc of astColsRaw) {
+                                        const acNorm = normalizeName(rawAc);
+                                        if (existingCols.has(acNorm) || existingSymCols.has(acNorm) || set.has(acNorm)) {
+                                            continue;
+                                        }
+
+                                        // Add to cols list (keeps downstream logic compatible)
+                                        cols.push({ name: acNorm, rawName: rawAc, line: 0, start: 0, end: rawAc.length });
+
+                                        // Add to per-table set
+                                        set.add(acNorm);
+
+                                        // Add to sym.columns, avoiding duplicates
+                                        if (!sym.columns) { sym.columns = []; }
+                                        const alreadyInSym = (sym.columns as any[]).some((c: any) => normalizeName((c.rawName || c.name || "").replace(/^\[|\]$/g, "")) === acNorm);
+                                        if (!alreadyInSym) {
+                                            (sym.columns as any[]).push({
+                                                name: acNorm,
+                                                rawName: rawAc,
+                                                line: i + 1,
+                                                start: 0,
+                                                end: rawAc.length
+                                            });
+                                        }
+
+                                        // prepare local ref
+                                        const newRef: ReferenceDef = {
+                                            name: `${norm}.${acNorm}`,
+                                            uri: normUri,
+                                            line: i + 1,
+                                            start: 0,
+                                            end: rawAc.length,
+                                            kind: "column"
+                                        };
+                                        const posKey = `${newRef.line}:${newRef.start}:${newRef.end}`;
+                                        if (!newLocalRefs.some(r => `${r.line}:${r.start}:${r.end}` === posKey)) {
+                                            newLocalRefs.push(newRef);
+                                        }
+
+                                        safeLog(`[indexText][AST worker] discovered column '${rawAc}' for ${norm}`);
+                                    }
+
+                                    // persist set back
+                                    columnsByTable.set(norm, set);
+
+                                    // merge newLocalRefs into the per-file references (dedupe by position)
+                                    for (const ref of newLocalRefs) {
+                                        const key = ref.name;
+                                        const existingForKey = getRefs(key).filter(r => r.uri === normUri);
+
+                                        // mergedByPos will dedupe by line:start:end
+                                        const mergedByPos = new Map<string, ReferenceDef>();
+                                        for (const r of existingForKey) {
+                                            mergedByPos.set(`${r.line}:${r.start}:${r.end}`, r);
+                                        }
+                                        mergedByPos.set(`${ref.line}:${ref.start}:${ref.end}`, ref);
+
+                                        const merged = Array.from(mergedByPos.values());
+                                        setRefsForFile(key, normUri, merged);
+                                    }
+                                }
+                            } catch (mergeErr) {
+                                safeLog('[indexText][AST worker] merge failed: ' + String(mergeErr));
+                            }
+                        })
+                        .catch((pErr) => {
+                            safeLog('[indexText][AST worker] parse failed: ' + String(pErr));
+                        });
+                }
+            } catch (e) {
+                safeLog('[indexText][AST worker] unexpected error: ' + String(e));
+            }
+
             // Keep columnsByTable in sync (normalized)
             const set = new Set<string>();
-            for (const c of cols) { set.add(c.name); }
+            for (const c of cols) { set.add(normalizeName(c.name)); }
             columnsByTable.set(norm, set);
 
             // Definitions for columns with correct absolute positions
@@ -448,6 +848,7 @@ function indexText(uri: string, text: string): void {
                 return {
                     name: c.name,
                     rawName: c.rawName,
+                    type: c.type,
                     line: fileLine,
                     start: startCol,
                     end: startCol + c.rawName.length
@@ -583,6 +984,7 @@ function indexText(uri: string, text: string): void {
                     kind: "column"
                 });
             } else if (candidateTables.length > 1) {
+                // keep current immediate behavior (add multiple candidate refs)
                 for (const t of candidateTables) {
                     localRefs.push({
                         name: `${t}.${col}`,
@@ -592,6 +994,72 @@ function indexText(uri: string, text: string): void {
                         end: m3.index + tokenRaw.length,
                         kind: "column"
                     });
+                }
+
+                // capture values for the async closure
+                const stmtText = scope.text;
+                const tokenStart = m3.index;
+                const tokenEnd = m3.index + tokenRaw.length;
+                const localCandidateTables = [...candidateTables];
+
+                // Attempt AST-based disambiguation asynchronously (pool-only)
+                try {
+                    if (!isAstPoolReady()) {
+                        safeLog('[indexText][AST disambiguation] pool not ready — skipping parse for stmt');
+                    } else {
+                        parseSqlWithWorker(stmtText, { database: "mssql" }, 700)
+                            .then((ast) => {
+                                try {
+                                    const resolved = resolveColumnFromAst(ast, col);
+                                    if (!resolved) { return; }
+
+                                    let resolvedNorm = normalizeName(resolved);
+
+                                    // resolved might be an alias name; map via statement aliases if needed
+                                    const stmtAliases = extractAliases(stmtText);
+                                    const mapped = stmtAliases.get(resolved.toLowerCase());
+                                    if (mapped) { resolvedNorm = normalizeName(mapped); }
+
+                                    // only act if AST resolved to one of our candidate tables
+                                    if (!localCandidateTables.includes(resolvedNorm)) { return; }
+
+                                    const resolvedKey = `${resolvedNorm}.${col}`;
+
+                                    // ensure resolved key has a ref for this file/position
+                                    const existingForResolved = (referencesIndex.get(resolvedKey)?.get(normUri)) || [];
+                                    const hasRef = existingForResolved.some(r => r.line === i && r.start === tokenStart && r.end === tokenEnd);
+                                    if (!hasRef) {
+                                        const newRef = { name: resolvedKey, uri: normUri, line: i, start: tokenStart, end: tokenEnd, kind: "column" } as ReferenceDef;
+                                        // merge with any other refs for this uri (preserve others) and dedupe by pos
+                                        const mergedByPos = new Map<string, ReferenceDef>();
+                                        for (const r of existingForResolved) {
+                                            mergedByPos.set(`${r.line}:${r.start}:${r.end}`, r);
+                                        }
+                                        mergedByPos.set(`${newRef.line}:${newRef.start}:${newRef.end}`, newRef);
+                                        setRefsForFile(resolvedKey, normUri, Array.from(mergedByPos.values()));
+                                    }
+
+                                    // remove the previously-added refs for other candidate tables at this exact position
+                                    for (const t of localCandidateTables) {
+                                        if (t === resolvedNorm) { continue; }
+                                        const key = `${t}.${col}`;
+                                        const byUri = referencesIndex.get(key);
+                                        const arrForThis = byUri?.get(normUri) || [];
+                                        const filtered = arrForThis.filter(r => !(r.line === i && r.start === tokenStart && r.end === tokenEnd));
+                                        setRefsForFile(key, normUri, filtered);
+                                    }
+
+                                    safeLog(`[AST disambiguation] ${col} → ${resolvedNorm} in ${normUri}`);
+                                } catch (e) {
+                                    safeLog('[AST disambiguation] merge failed: ' + String(e));
+                                }
+                            })
+                            .catch((pErr) => {
+                                safeLog('[AST disambiguation] parse failed: ' + String(pErr));
+                            });
+                    }
+                } catch (e) {
+                    safeLog('[indexText][AST disambiguation] unexpected: ' + String(e));
                 }
             }
         }
@@ -758,7 +1226,7 @@ function findTableOrColumn(word: string): Location[] {
     return results;
 }
 
-connection.onDefinition((params: DefinitionParams): Location[] | null => {
+connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | null> => {
     const doc = documents.get(params.textDocument.uri);
     if (!doc) { return null; }
 
@@ -766,7 +1234,7 @@ connection.onDefinition((params: DefinitionParams): Location[] | null => {
     if (!wordRange) { return null; }
 
     const rawWord = doc.getText(wordRange);
-    let word = normalizeName(rawWord);
+    const word = normalizeName(rawWord);
 
     const fullText = doc.getText();
     const lineText = doc.getText({
@@ -788,17 +1256,18 @@ connection.onDefinition((params: DefinitionParams): Location[] | null => {
         }
     }
 
-    // --- 2) Bare column semantic resolution ---
+    // --- 2) Bare column semantic resolution (with optional AST disambiguation) ---
     const bareColRegex = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
     let m: RegExpExecArray | null;
     while ((m = bareColRegex.exec(lineText))) {
         const col = normalizeName(m[1]);
         if (col === word) {
-            // gather tables in scope from FROM/JOIN in fullText
+            // gather tables in scope from FROM/JOIN in the current statement (safer than whole file)
+            const stmt = getCurrentStatement(doc, params.position) || fullText;
             const tablesInScope: string[] = [];
             const fromJoinRegex = /\b(from|join)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
             let fm: RegExpExecArray | null;
-            while ((fm = fromJoinRegex.exec(fullText))) {
+            while ((fm = fromJoinRegex.exec(stmt))) {
                 tablesInScope.push(normalizeName(fm[2]));
             }
 
@@ -810,6 +1279,33 @@ connection.onDefinition((params: DefinitionParams): Location[] | null => {
                 }
             }
 
+            // If multiple candidates, attempt AST-based disambiguation (short timeout)
+            if (candidateTables.length > 1) {
+                try {
+                    const ast = await parseSqlWithWorker(stmt, { database: "mssql" }, 500);
+                    const resolved = resolveColumnFromAst(ast, col); // may return normalized table/alias or null
+                    if (resolved) {
+                        // resolved could be an alias name — map via statement/global aliases if possible
+                        const aliases = extractAliases(fullText);
+                        const mappedTable = aliases.get(resolved.toLowerCase());
+                        const resolvedTable = mappedTable ? mappedTable : resolved;
+
+                        // Only accept the resolution if it matches one of the candidate tables
+                        const resolvedNorm = normalizeName(resolvedTable);
+                        if (candidateTables.includes(resolvedNorm)) {
+                            const found = findColumnInTable(resolvedNorm, col);
+                            if (found && found.length > 0) {
+                                return found;
+                            }
+                        }
+                    }
+                } catch (e) {
+                    safeLog('[onDefinition][AST] parse failed or timed out: ' + String(e));
+                    // fall through to returning multiple candidates (existing behavior)
+                }
+            }
+
+            // fallback: return all candidate locations (current behavior)
             const results: Location[] = [];
             for (const t of candidateTables) {
                 results.push(...findColumnInTable(t, col));
@@ -850,6 +1346,7 @@ connection.onDefinition((params: DefinitionParams): Location[] | null => {
     const fallback = findTableOrColumn(word);
     return fallback.length > 0 ? fallback : null;
 });
+
 
 // --- Completion (robust) ---
 connection.onCompletion((params: CompletionParams): CompletionItem[] => {
@@ -896,7 +1393,7 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
                 const fileAliases = aliasesByUri.get(normUri) || aliasesByUri.get(rawUri) || new Map<string, string>();
                 // merge fileAliases into aliasesMap but keep statement-scoped precedence
                 for (const [k, v] of fileAliases.entries()) {
-                    if (!aliasesMap.has(k)) {aliasesMap.set(k, v);}
+                    if (!aliasesMap.has(k)) { aliasesMap.set(k, v); }
                 }
             }
 
@@ -909,7 +1406,7 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
                     const cols: CompletionItem[] = [];
                     for (const col of (def.columns as any[])) {
                         const normCol = (col.rawName || col.name || "").replace(/^\[|\]$/g, "").toLowerCase();
-                        if (seenCols.has(normCol)) {continue;}
+                        if (seenCols.has(normCol)) { continue; }
                         seenCols.add(normCol);
                         cols.push({
                             label: col.rawName,
@@ -1034,7 +1531,7 @@ connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
 });
 
 
-connection.onHover((params): Hover | null => {
+connection.onHover(async (params): Promise<Hover | null> => {
     const doc = documents.get(params.textDocument.uri);
     if (!doc) { return null; }
 
@@ -1044,9 +1541,54 @@ connection.onHover((params): Hover | null => {
     const rawWord = doc.getText(range);
     const word = normalizeName(rawWord);
 
-    const aliasInfo = resolveAlias(rawWord, doc, params.position);
+    // --- AST-based resolution ---
+    const statementText = getCurrentStatement(doc, params.position);
+    if (statementText) {
+        try {
+            const ast = await astPool.parse(statementText, { dialect: 'tsql' });
+            if (ast) {
+                const offset = offsetAt(doc, params.position) -
+                    offsetAt(doc, { line: range.start.line, character: 0 });
+                let tableName: string | null = null;
 
-    // --- alias.column ---
+                walkAst(ast, (node: any) => {
+                    if (node.type === 'column_ref' &&
+                        normalizeName(node.column) === word &&
+                        node.location &&
+                        offset >= node.location.start &&
+                        offset <= node.location.end) {
+                        if (node.table) {
+                            tableName = resolveAliasFromAst(node.table, ast) ?? normalizeName(node.table);
+                        }
+                    }
+                });
+
+                if (tableName) {
+                    const defs = definitions.get(tableName);
+                    if (defs) {
+                        for (const def of defs) {
+                            if (def.columns) {
+                                const col = def.columns.find(c => normalizeName(c.name) === word);
+                                if (col) {
+                                    return {
+                                        contents: {
+                                            kind: MarkupKind.Markdown,
+                                            value: `**Column** \`${col.rawName}\`${col.type ? ` ${col.type}` : ""} in table \`${def.rawName}\``
+                                        }
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            console.error('[hover] AST parse failed', e);
+        }
+    }
+
+    // --- Fallback: alias.column handling ---
+    const aliasInfo = resolveAlias(rawWord, doc, params.position);
     if (aliasInfo.table && aliasInfo.column) {
         for (const defs of definitions.values()) {
             for (const def of defs) {
@@ -1056,7 +1598,7 @@ connection.onHover((params): Hover | null => {
                             return {
                                 contents: {
                                     kind: MarkupKind.Markdown,
-                                    value: `**Column** \`${c.rawName}\`${c.type ? ` (${c.type})` : ""} in table \`${def.rawName}\``
+                                    value: `**Column** \`${c.rawName}\`${c.type ? ` ${c.type}` : ""} in table \`${def.rawName}\``
                                 }
                             };
                         }
@@ -1066,7 +1608,6 @@ connection.onHover((params): Hover | null => {
         }
     }
 
-    // --- alias only ---
     if (aliasInfo.table && !aliasInfo.column) {
         return {
             contents: {
@@ -1076,8 +1617,7 @@ connection.onHover((params): Hover | null => {
         };
     }
 
-    // --- table / column scoped ---
-    const statementText = getCurrentStatement(doc, params.position);
+    // --- Regex FROM/JOIN context ---
     const candidateTables = new Set<string>();
     const fromJoinRegex = /\b(from|join)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
     let m: RegExpExecArray | null;
@@ -1092,7 +1632,7 @@ connection.onHover((params): Hover | null => {
             if (candidateTables.has(normalizeName(def.name)) && def.columns) {
                 for (const col of def.columns) {
                     if (col.name === word) {
-                        matches.push(`${col.rawName}${col.type ? ` (${col.type})` : ""} in table ${def.rawName}`);
+                        matches.push(`${col.rawName}${col.type ? ` ${col.type}` : ""} in table ${def.rawName}`);
                     }
                 }
             }
@@ -1105,7 +1645,7 @@ connection.onHover((params): Hover | null => {
         return { contents: { kind: MarkupKind.Markdown, value: `**Column** \`${rawWord}\` (ambiguous, found in: ${matches.join(", ")})` } };
     }
 
-    // --- global fallback ---
+    // --- Global fallback ---
     for (const defs of definitions.values()) {
         for (const def of defs) {
             if (normalizeName(def.name) === word) {
@@ -1117,7 +1657,7 @@ connection.onHover((params): Hover | null => {
                         return {
                             contents: {
                                 kind: MarkupKind.Markdown,
-                                value: `**Column** \`${col.rawName}\`${col.type ? ` (${col.type})` : ""} in table \`${def.rawName}\``
+                                value: `**Column** \`${col.rawName}\`${col.type ? ` ${col.type}` : ""} in table \`${def.rawName}\``
                             }
                         };
                     }
@@ -1129,6 +1669,14 @@ connection.onHover((params): Hover | null => {
     return null;
 });
 
+
+function offsetAt(doc: TextDocument, pos: Position) {
+    const text = doc.getText();
+    const lines = text.split(/\r?\n/);
+    let off = 0;
+    for (let i = 0; i < pos.line; i++) { off += lines[i].length + 1; }
+    return off + pos.character;
+}
 
 // Full validator with @-skip and SELECT-alias skip
 async function validateTextDocument(doc: TextDocument): Promise<void> {
@@ -1553,33 +2101,170 @@ connection.onDidChangeConfiguration(change => {
     }
 });
 
-function getCurrentStatement(doc: TextDocument, position: Position): string {
-    const fullText = doc.getText();
-    const lines = fullText.split(/\r?\n/);
-    const currentLine = position.line;
-    let start = currentLine;
-    let end = currentLine;
+function getCurrentStatement(doc: { getText: (range?: any) => string }, position: { line: number; character: number }): string {
+    try {
+        const full = doc.getText();
+        if (!full) { return ""; }
 
-    // look upward until BEGIN/; or top
-    for (let i = currentLine; i >= 0; i--) {
-        if (/^\s*begin\b/i.test(lines[i]) || /;\s*$/.test(lines[i])) {
-            start = i + 1;
-            break;
+        // Build lines & compute absolute offset of position
+        const lines = full.split(/\r?\n/);
+        const lineIdx = Math.max(0, Math.min(position.line, lines.length - 1));
+        let offset = 0;
+        for (let i = 0; i < lineIdx; i++) { offset += lines[i].length + 1; } // +1 newline
+        offset += Math.max(0, Math.min(position.character, lines[lineIdx].length));
+
+        // Scanner that walks forward and records semicolons and WITH positions that are outside strings/comments.
+        let inSingle = false;
+        let inDouble = false;
+        let inBracket = false; // [ ... ]
+        let inLineComment = false;
+        let inBlockComment = false;
+
+        let lastStmtSep = -1;     // last semicolon index (outside quotes/comments) before offset
+        let lastWithIndex = -1;   // last 'WITH' (word) index before offset (outside quotes/comments)
+
+        // Helper to check word boundaries for "WITH"
+        function isWordBoundaryChar(ch: string | undefined) {
+            if (!ch) { return true; }
+            return !(/[A-Za-z0-9_]/.test(ch));
         }
-        if (i === 0) { start = 0; }
-    }
 
-    // look downward until END/; or bottom
-    for (let i = currentLine; i < lines.length; i++) {
-        if (/^\s*end\b/i.test(lines[i]) || /;\s*$/.test(lines[i])) {
-            end = i;
-            break;
+        // forward scan up to offset to record last semicolon and WITH occurrences
+        for (let i = 0; i < offset; i++) {
+            const ch = full[i];
+            const chNext = full[i + 1];
+
+            // handle line comment start --
+            if (!inSingle && !inDouble && !inBlockComment && !inLineComment && ch === "-" && chNext === "-") {
+                inLineComment = true;
+                i++; // skip second '-'
+                continue;
+            }
+            // handle block comment start /*
+            if (!inSingle && !inDouble && !inLineComment && !inBlockComment && ch === "/" && chNext === "*") {
+                inBlockComment = true;
+                i++;
+                continue;
+            }
+            // handle block comment end */
+            if (inBlockComment && ch === "*" && chNext === "/") {
+                inBlockComment = false;
+                i++;
+                continue;
+            }
+            // end of line ends line comment
+            if (inLineComment && ch === "\n") {
+                inLineComment = false;
+                continue;
+            }
+            if (inLineComment || inBlockComment) {
+                continue;
+            }
+
+            // bracketed identifier [ ... ]
+            if (!inSingle && !inDouble && ch === "[") { inBracket = true; continue; }
+            if (inBracket) {
+                if (ch === "]") { inBracket = false; }
+                continue;
+            }
+
+            // single-quote string
+            if (!inDouble && ch === "'") {
+                // if starting or ending single quote
+                if (!inSingle) { inSingle = true; continue; }
+                // if inSingle and next is also single => SQL escaped quote '', consume one and stay in string
+                if (inSingle && full[i + 1] === "'") { i++; continue; }
+                // closing quote
+                inSingle = false;
+                continue;
+            }
+            if (inSingle) { continue; }
+
+            // double-quote string (identifiers or strings)
+            if (!inSingle && ch === '"') {
+                if (!inDouble) { inDouble = true; continue; }
+                if (inDouble && full[i + 1] === '"') { i++; continue; }
+                inDouble = false;
+                continue;
+            }
+            if (inDouble) { continue; }
+
+            // semicolon outside quotes/comments => statement separator
+            if (ch === ";") {
+                lastStmtSep = i;
+                continue;
+            }
+
+            // check for 'WITH' token (case-insensitive) - ensure word boundaries
+            const rem = full.length - i;
+            if (rem >= 4) {
+                const slice4 = full.substr(i, 4);
+                if (/^with$/i.test(slice4)) {
+                    const prev = full[i - 1];
+                    const next = full[i + 4];
+                    if (isWordBoundaryChar(prev) && isWordBoundaryChar(next)) {
+                        lastWithIndex = i;
+                    }
+                }
+            }
+        } // end forward scan to offset
+
+        // Determine start: prefer lastStmtSep+1, but if there is a WITH after that, include it
+        let start = lastStmtSep + 1;
+        if (lastWithIndex > lastStmtSep) {
+            // include leading whitespace/newlines before WITH
+            let wstart = lastWithIndex;
+            while (wstart > 0 && /\s/.test(full[wstart - 1])) { wstart--; }
+            start = wstart;
         }
-        if (i === lines.length - 1) { end = lines.length - 1; }
-    }
+        if (start < 0) { start = 0; }
 
-    return lines.slice(start, end + 1).join("\n");
+        // Find next semicolon after offset (end boundary)
+        let end = full.length;
+        // resume state for scanning from offset to EOF to find the first semicolon outside strings/comments
+        inSingle = false; inDouble = false; inBracket = false; inLineComment = false; inBlockComment = false;
+        for (let i = offset; i < full.length; i++) {
+            const ch = full[i];
+            const chNext = full[i + 1];
+
+            if (!inSingle && !inDouble && !inBlockComment && !inLineComment && ch === "-" && chNext === "-") {
+                inLineComment = true; i++; continue;
+            }
+            if (!inSingle && !inDouble && !inLineComment && !inBlockComment && ch === "/" && chNext === "*") {
+                inBlockComment = true; i++; continue;
+            }
+            if (inBlockComment && ch === "*" && chNext === "/") { inBlockComment = false; i++; continue; }
+            if (inLineComment && ch === "\n") { inLineComment = false; continue; }
+            if (inLineComment || inBlockComment) { continue; }
+
+            if (!inSingle && !inDouble && ch === "[") { inBracket = true; continue; }
+            if (inBracket) { if (ch === "]") { inBracket = false; } continue; }
+
+            if (!inDouble && ch === "'") {
+                if (!inSingle) { inSingle = true; continue; }
+                if (inSingle && full[i + 1] === "'") { i++; continue; }
+                inSingle = false; continue;
+            }
+            if (inSingle) { continue; }
+
+            if (!inSingle && ch === '"') {
+                if (!inDouble) { inDouble = true; continue; }
+                if (inDouble && full[i + 1] === '"') { i++; continue; }
+                inDouble = false; continue;
+            }
+            if (inDouble) { continue; }
+
+            if (ch === ";") { end = i; break; }
+        }
+
+        const stmt = full.slice(start, end).trim();
+        return stmt;
+    } catch (e) {
+        safeLog('[getCurrentStatement] error: ' + String(e));
+        return "";
+    }
 }
+
 
 
 function resolveAlias(rawWord: string, doc: TextDocument, position: Position): { table?: string; column?: string } {
@@ -1607,6 +2292,51 @@ function resolveAlias(rawWord: string, doc: TextDocument, position: Position): {
 
     return {};
 }
+
+function resolveAliasFromAst(alias: string, ast: any): string | null {
+  const aliasNorm = normalizeName(alias);
+
+  function searchFrom(fromArr: any[]): string | null {
+    for (const f of fromArr) {
+      // FROM Employee e
+      if (f.as && normalizeName(f.as) === aliasNorm && f.table) {
+        return normalizeName(f.table);
+      }
+
+      // FROM Employee (no alias)
+      if (!f.as && f.table && normalizeName(f.table) === aliasNorm) {
+        return normalizeName(f.table);
+      }
+
+      // FROM (SELECT ...) AS picks
+      if (f.subquery) {
+        // alias refers to the subquery itself
+        if (f.as && normalizeName(f.as) === aliasNorm) {
+          return "__subquery__";
+        }
+        // recurse into the inner FROMs
+        const innerFrom = Array.isArray(f.subquery.from)
+          ? f.subquery.from
+          : (f.subquery.from ? [f.subquery.from] : []);
+        const found = searchFrom(innerFrom);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  const roots = Array.isArray(ast) ? ast : [ast];
+  for (const root of roots) {
+    if (root.from) {
+      const res = searchFrom(Array.isArray(root.from) ? root.from : [root.from]);
+      if (res) return res;
+    }
+  }
+  return null;
+}
+
+
+
 
 // ---------- Startup ----------
 documents.listen(connection);

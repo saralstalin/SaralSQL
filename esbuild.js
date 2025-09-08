@@ -48,8 +48,8 @@ async function main() {
 	// Server build (language server entrypoint)
 	const serverConfig = {
 		...common,
-		entryPoints: ['server/src/server.ts'],
-		outfile: 'dist/server.js',
+		entryPoints: ['server/src/server.ts', 'server/src/sqlAstWorker.js'],
+		outdir: 'dist',
 	};
 
 	// Contexts for watch mode
