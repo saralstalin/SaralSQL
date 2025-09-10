@@ -1,0 +1,618 @@
+
+import { Location } from "vscode-languageserver/node";
+import {
+    normalizeName
+    , stripComments
+    , getLineStarts
+    , offsetToPosition
+    , parseColumnsFromCreateBlock
+    , extractAliases
+    , isSqlKeyword
+    , getCurrentStatement
+} from "./text-utils";
+import * as url from "url";
+import { isAstPoolReady, parseSqlWithWorker } from "./parser-pool";
+import { resolveColumnFromAst } from "./ast-utils";
+
+export interface ColumnDef {
+    name: string;
+    rawName: string;
+    type?: string;
+    line: number;
+    start?: number; // ← add
+    end?: number;   // ← add
+}
+
+export interface SymbolDef {
+    name: string;
+    rawName: string;
+    uri: string;
+    line: number;
+    columns?: ColumnDef[];
+}
+
+export interface ReferenceDef {
+    name: string; // normalized table or column name
+    uri: string;
+    line: number;
+    start: number;
+    end: number;
+    kind: "table" | "column" | "parameter";
+}
+
+export const columnsByTable = new Map<string, Set<string>>();
+export const aliasesByUri = new Map<string, Map<string, string>>();
+export const definitions = new Map<string, SymbolDef[]>();
+export const referencesIndex = new Map<string, Map<string, ReferenceDef[]>>();
+export const tablesByName = new Map<string, SymbolDef>();
+
+const MAX_FILE_SIZE_BYTES = 12 * 1024;   // 12 KB (skip larger files)
+const MAX_REFS_PER_FILE = 5000;         // cap number of reference objects created per file
+const DEPLOY_BLOCK_SUBSTRING = "deploy"; // block any path that contains this substring
+
+let isIndexReady = false;
+
+export function setIndexReady() {
+    isIndexReady = true;
+}
+
+export function getIndexReady(): boolean {
+    return isIndexReady;
+}
+
+export function setRefsForFile(name: string, uri: string, refs: ReferenceDef[]) {
+    let byUri = referencesIndex.get(name);
+    if (!byUri) { byUri = new Map(); referencesIndex.set(name, byUri); }
+    byUri.set(uri, refs);
+}
+
+export function deleteRefsForFile(uri: string) {
+    for (const [, byUri] of referencesIndex) { byUri.delete(uri); }
+    for (const [name, byUri] of Array.from(referencesIndex.entries())) {
+        if (byUri.size === 0) { referencesIndex.delete(name); }
+    }
+}
+
+export function getRefs(name: string): ReferenceDef[] {
+    const byUri = referencesIndex.get(name);
+    if (!byUri) { return []; }
+    const out: ReferenceDef[] = [];
+    for (const arr of byUri.values()) {
+        out.push(...arr);
+    }
+    return out;
+}
+
+export function findColumnInTable(tableName: string, colName: string): Location[] {
+    const results: Location[] = [];
+    for (const defs of definitions.values()) {
+        for (const def of defs) {
+            if (normalizeName(def.name) === normalizeName(tableName) && def.columns) {
+                for (const col of def.columns) {
+                    if (col.name === colName) {
+                        const startChar = typeof (col as any).start === "number" ? (col as any).start : 0;
+                        const endChar = typeof (col as any).end === "number" ? (col as any).end : 200;
+                        results.push({
+                            uri: def.uri,
+                            range: {
+                                start: { line: col.line, character: startChar },
+                                end: { line: col.line, character: endChar }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+    return results;
+}
+
+export function findTableOrColumn(word: string): Location[] {
+    const results: Location[] = [];
+    for (const defs of definitions.values()) {
+        for (const def of defs) {
+            if (normalizeName(def.name) === word) {
+                results.push({
+                    uri: def.uri,
+                    range: {
+                        start: { line: def.line, character: 0 },
+                        end: { line: def.line, character: 200 }
+                    }
+                });
+            }
+            if (def.columns) {
+                for (const col of def.columns) {
+                    if (col.name === word) {
+                        results.push({
+                            uri: def.uri,
+                            range: {
+                                start: { line: col.line, character: 0 },
+                                end: { line: col.line, character: 200 }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+    return results;
+}
+
+// ---------- Indexing ----------
+export function indexText(uri: string, text: string): void {
+    const normUri = uri.startsWith("file://") ? uri : url.pathToFileURL(uri).toString();
+
+    if (normUri.toLowerCase().includes(`/${DEPLOY_BLOCK_SUBSTRING}`) || normUri.toLowerCase().includes(`\\${DEPLOY_BLOCK_SUBSTRING}`)) {
+        return;
+    }
+
+    if (!normUri.toLowerCase().endsWith(".sql")) {
+        return;
+    }
+
+    // 2) Skip files that are larger than the configured threshold (avoid heavy files)
+    const byteLen = Buffer.byteLength(text || "", "utf8");
+    if (byteLen > MAX_FILE_SIZE_BYTES) {
+        return;
+    }
+
+    // Reset any old defs/refs for this file (purge stale def caches too)
+    const oldDefs = definitions.get(normUri) || [];
+    for (const d of oldDefs) { tablesByName.delete(d.name); columnsByTable.delete(d.name); }
+    definitions.delete(normUri);
+    deleteRefsForFile(normUri);
+
+    const defs: SymbolDef[] = [];
+    const lines = text.split(/\r?\n/);
+    const cleanLines = lines.map(stripComments); // <-- compute once
+    const localRefs: ReferenceDef[] = [];
+    const cleanText = cleanLines.join("\n");
+
+    // Precompile regexes once (reset lastIndex before each use)
+    const tableRegexG = /\b(from|join|update|into)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
+    const aliasColRegexG = /([a-zA-Z0-9_]+)\.(\[[^\]]+\]|[a-zA-Z_][a-zA-Z0-9_]*)/g;
+    const bareColRegexG = /\[([a-zA-Z0-9_ ]+)\]|(?<!@)\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+    const fromJoinRegexG = /\b(from|join)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
+    const procHeaderRegex = /create\s+(?:or\s+alter\s+)?(procedure|proc|function)\s+([\[\]\w\."']+(?:\.[\[\]\w\."']+)*)\s*\(([\s\S]*?)\)\s*(as|begin)/ig;
+
+    let m: RegExpExecArray | null;
+    while ((m = procHeaderRegex.exec(cleanText)) !== null) {
+        const wholeMatch = m[0];
+        const paramsBlock = m[3];
+        const matchIndex = m.index; // absolute offset of start of wholeMatch in clean
+
+        // safer: find the '(' inside the wholeMatch and compute paramsStartAbs from that
+        const openParenInMatch = wholeMatch.indexOf('(');
+        // fallback: if something odd happens, fall back to paramsBlock index inside wholeMatch
+        const paramsStartAbs = (openParenInMatch >= 0)
+            ? (matchIndex + openParenInMatch + 1)                 // right after '('
+            : (matchIndex + wholeMatch.indexOf(paramsBlock));    // less likely path
+
+        const paramTokenRegex = /@([A-Za-z_][A-Za-z0-9_]*)\b/g;
+        let pm: RegExpExecArray | null;
+        while ((pm = paramTokenRegex.exec(paramsBlock)) !== null) {
+            const raw = '@' + pm[1];                 // token text
+            const absOffset = paramsStartAbs + pm.index; // pm.index is relative to paramsBlock
+            const lineStarts = getLineStarts(cleanText);
+            const { line, character } = offsetToPosition(absOffset, lineStarts); // your helper
+            localRefs.push({
+                name: raw,
+                uri: normUri,
+                line,
+                start: character,
+                end: character + raw.length,
+                kind: "parameter"
+            });
+        }
+    }
+
+    // Cache for statement scopes per line (avoids O(N²))
+    const stmtScopeByLine = new Map<number, { text: string; tablesInScope: string[] }>();
+
+    // --- scan for definitions ---
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const match = /^\s*CREATE\s+(PROCEDURE|FUNCTION|VIEW|TABLE|TYPE)\s+([a-zA-Z0-9_\[\]\.]+)/i.exec(line);
+        if (!match) { continue; }
+
+        const kind = match[1].toUpperCase();
+        const rawName = match[2];
+        const norm = normalizeName(rawName);
+
+        const sym: SymbolDef = { name: norm, rawName, uri: normUri, line: i };
+
+        if (kind === "TABLE" || (kind === "TYPE" && /\bAS\s+TABLE\b/i.test(line))) {
+            // Build block from current line and parse columns (linear helper)
+            const createBlock = lines.slice(i).join("\n");
+            const cols = parseColumnsFromCreateBlock(createBlock, 0);
+
+            // Attempt optional AST parse for this CREATE block to discover any additional columns (pool-only)
+            try {
+                if (!isAstPoolReady()) {
+                    //Nothing
+                } else {
+                    // Fire-and-forget parse with short timeout so we don't block indexing
+                    parseSqlWithWorker(createBlock, { database: "mssql" }, 800)
+                        .then((ast) => {
+                            try {
+                                if (!ast) { return; }
+                                const astColsRaw: string[] = [];
+                                if (ast && (ast.type === "create" || (Array.isArray(ast) && ast.length && ast[0].type === "create"))) {
+                                    const node = Array.isArray(ast) ? ast[0] : ast;
+                                    const defs = node.create_definitions || node.createDefinitions || [];
+                                    for (const d of defs) {
+                                        try {
+                                            const cname = (d.column && (d.column.column || d.column.name)) || d.name || d.field;
+                                            if (cname) { astColsRaw.push(String(cname).trim()); }
+                                        } catch { /* ignore per-column errors */ }
+                                    }
+                                }
+
+                                if (astColsRaw.length) {
+                                    // prepare sets for dedupe
+                                    const existingCols = new Set<string>(cols.map(c => normalizeName(c.name)));
+                                    const existingSymCols = new Set<string>((sym.columns || []).map((c: any) => normalizeName((c.rawName || c.name || "").replace(/^\[|\]$/g, ""))));
+                                    const set = columnsByTable.get(norm) || new Set<string>();
+
+                                    // collect new local refs that we will add (deduped by pos)
+                                    const newLocalRefs: ReferenceDef[] = [];
+
+                                    for (const rawAc of astColsRaw) {
+                                        const acNorm = normalizeName(rawAc);
+                                        if (existingCols.has(acNorm) || existingSymCols.has(acNorm) || set.has(acNorm)) {
+                                            continue;
+                                        }
+
+                                        // Add to cols list (keeps downstream logic compatible)
+                                        cols.push({ name: acNorm, rawName: rawAc, line: 0, start: 0, end: rawAc.length });
+
+                                        // Add to per-table set
+                                        set.add(acNorm);
+
+                                        // Add to sym.columns, avoiding duplicates
+                                        if (!sym.columns) { sym.columns = []; }
+                                        const alreadyInSym = (sym.columns as any[]).some((c: any) => normalizeName((c.rawName || c.name || "").replace(/^\[|\]$/g, "")) === acNorm);
+                                        if (!alreadyInSym) {
+                                            (sym.columns as any[]).push({
+                                                name: acNorm,
+                                                rawName: rawAc,
+                                                line: i + 1,
+                                                start: 0,
+                                                end: rawAc.length
+                                            });
+                                        }
+
+                                        // prepare local ref
+                                        const newRef: ReferenceDef = {
+                                            name: `${norm}.${acNorm}`,
+                                            uri: normUri,
+                                            line: i + 1,
+                                            start: 0,
+                                            end: rawAc.length,
+                                            kind: "column"
+                                        };
+                                        const posKey = `${newRef.line}:${newRef.start}:${newRef.end}`;
+                                        if (!newLocalRefs.some(r => `${r.line}:${r.start}:${r.end}` === posKey)) {
+                                            newLocalRefs.push(newRef);
+                                        }
+                                    }
+
+                                    // persist set back
+                                    columnsByTable.set(norm, set);
+
+                                    // merge newLocalRefs into the per-file references (dedupe by position)
+                                    for (const ref of newLocalRefs) {
+                                        const key = ref.name;
+                                        const existingForKey = getRefs(key).filter(r => r.uri === normUri);
+
+                                        // mergedByPos will dedupe by line:start:end
+                                        const mergedByPos = new Map<string, ReferenceDef>();
+                                        for (const r of existingForKey) {
+                                            mergedByPos.set(`${r.line}:${r.start}:${r.end}`, r);
+                                        }
+                                        mergedByPos.set(`${ref.line}:${ref.start}:${ref.end}`, ref);
+
+                                        const merged = Array.from(mergedByPos.values());
+                                        setRefsForFile(key, normUri, merged);
+                                    }
+                                }
+                            } catch (mergeErr) {
+                            }
+                        })
+                        .catch((pErr) => {
+                        });
+                }
+            } catch (e) {
+            }
+
+            // Keep columnsByTable in sync (normalized)
+            const set = new Set<string>();
+            for (const c of cols) { set.add(normalizeName(c.name)); }
+            columnsByTable.set(norm, set);
+
+            // Definitions for columns with correct absolute positions
+            (sym as any).columns = cols.map(c => {
+                const fileLine = i + c.line + 1;   // correct offset: skip CREATE line
+                const sourceLineText = lines[fileLine] || "";
+
+                let startCol = sourceLineText.indexOf(c.rawName);
+                if (startCol < 0) { startCol = sourceLineText.indexOf(c.name); }
+                if (startCol < 0) { startCol = Math.max(0, sourceLineText.search(/\S/)); }
+
+                return {
+                    name: c.name,
+                    rawName: c.rawName,
+                    type: c.type,
+                    line: fileLine,
+                    start: startCol,
+                    end: startCol + c.rawName.length
+                };
+            }) as any;
+
+            // Local column refs (definition locations)
+            for (const c of cols) {
+                const fileLine = i + c.line + 1;
+                const sourceLineText = lines[fileLine] || "";
+
+                let startCol = sourceLineText.indexOf(c.rawName);
+                if (startCol < 0) { startCol = sourceLineText.indexOf(c.name); }
+                if (startCol < 0) { startCol = Math.max(0, sourceLineText.search(/\S/)); }
+
+                localRefs.push({
+                    name: `${norm}.${c.name}`,
+                    uri: normUri,
+                    line: fileLine,
+                    start: startCol,
+                    end: startCol + c.rawName.length,
+                    kind: "column"
+                });
+            }
+        }
+
+        defs.push(sym);
+
+        // Definition ref for the object name on its CREATE line
+        const idx = line.toLowerCase().indexOf(rawName.toLowerCase());
+        if (idx >= 0) {
+            localRefs.push({
+                name: norm,
+                uri: normUri,
+                line: i,
+                start: idx,
+                end: idx + rawName.length,
+                kind: "table"
+            });
+        }
+    }
+
+    // Aliases computed once and reused
+    const aliases = extractAliases(text);
+
+    // --- scan for usages (tables, alias columns, bare columns) ---
+    for (let i = 0; i < lines.length; i++) {
+        const clean = cleanLines[i];
+
+        // table usages
+        tableRegexG.lastIndex = 0;
+        for (let m = tableRegexG.exec(clean); m; m = tableRegexG.exec(clean)) {
+            const raw = m[2];
+            const tnorm = normalizeName(raw);
+
+            const keywordIndex = m.index;
+            const tableIndex = keywordIndex + m[0].indexOf(raw);
+
+            localRefs.push({
+                name: tnorm,
+                uri: normUri,
+                line: i,
+                start: tableIndex,
+                end: tableIndex + raw.length,
+                kind: "table"
+            });
+        }
+
+        // alias.column usages
+        aliasColRegexG.lastIndex = 0;
+        for (let m2 = aliasColRegexG.exec(clean); m2; m2 = aliasColRegexG.exec(clean)) {
+            const alias = m2[1].toLowerCase();
+            const col = normalizeName(m2[2].replace(/[\[\]]/g, ""));
+            const table = aliases.get(alias);
+            if (!table) { continue; }
+
+            const key = `${normalizeName(table)}.${col}`;
+            localRefs.push({
+                name: key,
+                uri: normUri,
+                line: i,
+                start: m2.index,
+                end: m2.index + m2[0].length,
+                kind: "column"
+            });
+        }
+
+        // unaliased column usages (allow [Column])
+        bareColRegexG.lastIndex = 0;
+        for (let m3 = bareColRegexG.exec(clean); m3; m3 = bareColRegexG.exec(clean)) {
+            const tokenRaw = (m3[1] || m3[2] || "");
+            const col = normalizeName(tokenRaw.replace(/[\[\]]/g, ""));
+            if (isSqlKeyword(col)) { continue; }
+
+            // skip if part of alias.column
+            const tokenStart = m3.index;
+            const tokenEnd = m3.index + (m3[0] ? m3[0].length : tokenRaw.length);
+            const beforeChar = clean.charAt(Math.max(0, tokenStart - 1));
+            const afterChar = clean.charAt(tokenEnd);
+            if (beforeChar === "." || afterChar === "." || beforeChar === "@") { continue; }
+
+            // Get (cached) statement text and tables-in-scope for this line
+            let scope = stmtScopeByLine.get(i);
+            if (!scope) {
+                const stmtText = getCurrentStatement(
+                    { getText: () => text } as any,  // no documents needed
+                    { line: i, character: 0 }
+                );
+
+                const tablesInScope: string[] = [];
+                fromJoinRegexG.lastIndex = 0;
+                for (let fm = fromJoinRegexG.exec(stmtText); fm; fm = fromJoinRegexG.exec(stmtText)) {
+                    tablesInScope.push(normalizeName(fm[2]));
+                }
+
+                scope = { text: stmtText, tablesInScope };
+                stmtScopeByLine.set(i, scope);
+            }
+
+            // --- AST disambiguation for UPDATE/INSERT/DELETE ---
+            try {
+                if (isAstPoolReady()) {
+                    parseSqlWithWorker(scope.text, { database: "transactsql" }, 700)
+                        .then((ast) => {
+                            if (!ast) {return;}
+                            let targetTable: string | null = null;
+                            if (ast.type === "update" || ast.type === "insert" || ast.type === "delete") {
+                                targetTable = ast.table?.[0]?.table || null;
+                            }
+                            if (targetTable) {
+                                const resolvedNorm = normalizeName(targetTable);
+                                const resolvedKey = `${resolvedNorm}.${col}`;
+                                const existingForResolved = (referencesIndex.get(resolvedKey)?.get(normUri)) || [];
+                                const hasRef = existingForResolved.some(r => r.line === i && r.start === tokenStart && r.end === tokenEnd);
+                                if (!hasRef) {
+                                    const newRef: ReferenceDef = {
+                                        name: resolvedKey,
+                                        uri: normUri,
+                                        line: i,
+                                        start: tokenStart,
+                                        end: tokenEnd,
+                                        kind: "column"
+                                    };
+                                    const mergedByPos = new Map<string, ReferenceDef>();
+                                    for (const r of existingForResolved) {
+                                        mergedByPos.set(`${r.line}:${r.start}:${r.end}`, r);
+                                    }
+                                    mergedByPos.set(`${newRef.line}:${newRef.start}:${newRef.end}`, newRef);
+                                    setRefsForFile(resolvedKey, normUri, Array.from(mergedByPos.values()));
+                                }
+                            }
+                        })
+                        .catch(() => { });
+                }
+            } catch { }
+
+            const { tablesInScope } = scope;
+            if (tablesInScope.length === 0) { continue; } // fast skip
+
+            const candidateTables: string[] = [];
+            for (const t of tablesInScope) {
+                if (columnsByTable.get(t)?.has(col)) { candidateTables.push(t); }
+            }
+
+            if (candidateTables.length === 1) {
+                localRefs.push({
+                    name: `${candidateTables[0]}.${col}`,
+                    uri: normUri,
+                    line: i,
+                    start: m3.index,
+                    end: m3.index + tokenRaw.length,
+                    kind: "column"
+                });
+            } else if (candidateTables.length > 1) {
+                // keep current immediate behavior (add multiple candidate refs)
+                for (const t of candidateTables) {
+                    localRefs.push({
+                        name: `${t}.${col}`,
+                        uri: normUri,
+                        line: i,
+                        start: m3.index,
+                        end: m3.index + tokenRaw.length,
+                        kind: "column"
+                    });
+                }
+
+                // capture values for the async closure
+                const stmtText = scope.text;
+                const tokenStart = m3.index;
+                const tokenEnd = m3.index + tokenRaw.length;
+                const localCandidateTables = [...candidateTables];
+
+                // Attempt AST-based disambiguation asynchronously (pool-only)
+                try {
+                    if (!isAstPoolReady()) {
+                    } else {
+                        parseSqlWithWorker(stmtText, { database: "mssql" }, 700)
+                            .then((ast) => {
+                                try {
+                                    const resolved = resolveColumnFromAst(ast, col);
+                                    if (!resolved) { return; }
+
+                                    let resolvedNorm = normalizeName(resolved);
+
+                                    // resolved might be an alias name; map via statement aliases if needed
+                                    const stmtAliases = extractAliases(stmtText);
+                                    const mapped = stmtAliases.get(resolved.toLowerCase());
+                                    if (mapped) { resolvedNorm = normalizeName(mapped); }
+
+                                    // only act if AST resolved to one of our candidate tables
+                                    if (!localCandidateTables.includes(resolvedNorm)) { return; }
+
+                                    const resolvedKey = `${resolvedNorm}.${col}`;
+
+                                    // ensure resolved key has a ref for this file/position
+                                    const existingForResolved = (referencesIndex.get(resolvedKey)?.get(normUri)) || [];
+                                    const hasRef = existingForResolved.some(r => r.line === i && r.start === tokenStart && r.end === tokenEnd);
+                                    if (!hasRef) {
+                                        const newRef = { name: resolvedKey, uri: normUri, line: i, start: tokenStart, end: tokenEnd, kind: "column" } as ReferenceDef;
+                                        // merge with any other refs for this uri (preserve others) and dedupe by pos
+                                        const mergedByPos = new Map<string, ReferenceDef>();
+                                        for (const r of existingForResolved) {
+                                            mergedByPos.set(`${r.line}:${r.start}:${r.end}`, r);
+                                        }
+                                        mergedByPos.set(`${newRef.line}:${newRef.start}:${newRef.end}`, newRef);
+                                        setRefsForFile(resolvedKey, normUri, Array.from(mergedByPos.values()));
+                                    }
+
+                                    // remove the previously-added refs for other candidate tables at this exact position
+                                    for (const t of localCandidateTables) {
+                                        if (t === resolvedNorm) { continue; }
+                                        const key = `${t}.${col}`;
+                                        const byUri = referencesIndex.get(key);
+                                        const arrForThis = byUri?.get(normUri) || [];
+                                        const filtered = arrForThis.filter(r => !(r.line === i && r.start === tokenStart && r.end === tokenEnd));
+                                        setRefsForFile(key, normUri, filtered);
+                                    }
+
+                                    // safeLog(`[AST disambiguation] ${col} → ${resolvedNorm} in ${normUri}`);
+                                } catch (e) {
+                                    //safeLog('[AST disambiguation] merge failed: ' + String(e));
+                                }
+                            })
+                            .catch((pErr) => {
+                                // safeLog('[AST disambiguation] parse failed: ' + String(pErr));
+                            });
+                    }
+                } catch (e) {
+                    //safeLog('[indexText][AST disambiguation] unexpected: ' + String(e));
+                }
+            }
+        }
+    }
+
+    // Save definitions
+    definitions.set(normUri, defs);
+
+    // De-dupe local refs and persist per-file by name
+    const byName = new Map<string, ReferenceDef[]>();
+    for (const ref of localRefs) { const arr = byName.get(ref.name) || []; arr.push(ref); byName.set(ref.name, arr); }
+    for (const [name, arr] of byName) {
+        const seen = new Set<string>();
+        const dedup = arr.filter(r => { const k = `${r.line}:${r.start}:${r.end}`; if (seen.has(k)) { return false; } seen.add(k); return true; });
+        setRefsForFile(name, normUri, dedup);
+    }
+
+    // Save aliases (reuse the map we already computed)
+    aliasesByUri.set(normUri, aliases);
+
+    // Index tables by name for quick definition lookup
+    for (const def of defs) { tablesByName.set(def.name, def); }
+}
+
