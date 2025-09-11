@@ -18,13 +18,19 @@ The goal is practical productivity — not perfect SQL understanding.
   Locate table and column references across SQL files.  
   Skips matches in comments and unrelated identifiers to reduce false positives.  
 
+![References](Images/References.png)
+
 - **IntelliSense / Auto-completion**  
   - Suggests table names and types.  
   - After typing `alias.` or `TableName.`, column suggestions appear.  
   - Schema prefixes are handled (`dbo.TableName` is treated the same as `TableName`).  
 
+![Completions](Images/Completion.png)
+
 - **Hover Information**  
   Hover over a table, alias, or column to see its definition and context.  
+
+![Hover](ColumnHover.png)![alt text](Images/TableHover.png)
 
 - **Workspace Indexing**  
   - Automatically indexes all `.sql` files in the workspace.  

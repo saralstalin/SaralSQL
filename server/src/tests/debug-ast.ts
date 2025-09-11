@@ -27,11 +27,11 @@ async function run() {
     @DropLocation VARCHAR(100)
 AS
 BEGIN
-    UPDATE TransportRequests
-    SET EmployeeId = @EmployeeId,
-        RequestDate = @RequestDate,
-        PickLocation = @PickLocation,
-        DropLocation = @DropLocation
+    UPDATE TransportRequests tr
+    SET tr.EmployeeId = @EmployeeId,
+        tr.RequestDate = @RequestDate,
+        tr.PickLocation = @PickLocation,
+        tr.DropLocation = @DropLocation
     WHERE RequestId = @RequestId;
 END;`;
 
