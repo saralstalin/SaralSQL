@@ -45,7 +45,7 @@ export function getCurrentStatement(doc: { getText: (range?: any) => string }, p
         let inBlockComment = false;
 
         let lastStmtSep = -1;     // last semicolon index (outside quotes/comments) before offset
-        let lastWithIndex = -1;   // last 'WITH' (word) index before offset (outside quotes/comments)
+        let lastWithIndex = -1;   // last 'WITH' (word) index before offset for CTEs (outside quotes/comments)
 
         // Helper to check word boundaries for "WITH"
         function isWordBoundaryChar(ch: string | undefined) {
@@ -53,30 +53,45 @@ export function getCurrentStatement(doc: { getText: (range?: any) => string }, p
             return !(/[A-Za-z0-9_]/.test(ch));
         }
 
-        // forward scan up to offset to record last semicolon and WITH occurrences
+        // Helper to check if WITH is part of a CTE (WITH identifier AS ()
+        function isCteWith(full: string, index: number): boolean {
+            const rem = full.length - index;
+            if (rem < 4) {return false;}
+            const slice4 = full.substr(index, 4);
+            if (!/^with$/i.test(slice4)) {return false;}
+            const prev = full[index - 1];
+            const next = full[index + 4];
+            if (!isWordBoundaryChar(prev) || !isWordBoundaryChar(next)) {return false;}
+
+            // Check for CTE pattern: WITH identifier AS (
+            const afterWith = full.slice(index + 4).trim();
+            return /^\s*[A-Za-z0-9_]+\s+AS\s*\(/i.test(afterWith);
+        }
+
+        // Forward scan up to offset to record last semicolon and WITH occurrences
         for (let i = 0; i < offset; i++) {
             const ch = full[i];
             const chNext = full[i + 1];
 
-            // handle line comment start --
+            // Handle line comment start --
             if (!inSingle && !inDouble && !inBlockComment && !inLineComment && ch === "-" && chNext === "-") {
                 inLineComment = true;
                 i++; // skip second '-'
                 continue;
             }
-            // handle block comment start /*
+            // Handle block comment start /*
             if (!inSingle && !inDouble && !inLineComment && !inBlockComment && ch === "/" && chNext === "*") {
                 inBlockComment = true;
                 i++;
                 continue;
             }
-            // handle block comment end */
+            // Handle block comment end */
             if (inBlockComment && ch === "*" && chNext === "/") {
                 inBlockComment = false;
                 i++;
                 continue;
             }
-            // end of line ends line comment
+            // End of line ends line comment
             if (inLineComment && ch === "\n") {
                 inLineComment = false;
                 continue;
@@ -85,26 +100,23 @@ export function getCurrentStatement(doc: { getText: (range?: any) => string }, p
                 continue;
             }
 
-            // bracketed identifier [ ... ]
+            // Bracketed identifier [ ... ]
             if (!inSingle && !inDouble && ch === "[") { inBracket = true; continue; }
             if (inBracket) {
                 if (ch === "]") { inBracket = false; }
                 continue;
             }
 
-            // single-quote string
+            // Single-quote string
             if (!inDouble && ch === "'") {
-                // if starting or ending single quote
                 if (!inSingle) { inSingle = true; continue; }
-                // if inSingle and next is also single => SQL escaped quote '', consume one and stay in string
                 if (inSingle && full[i + 1] === "'") { i++; continue; }
-                // closing quote
                 inSingle = false;
                 continue;
             }
             if (inSingle) { continue; }
 
-            // double-quote string (identifiers or strings)
+            // Double-quote string (identifiers or strings)
             if (!inSingle && ch === '"') {
                 if (!inDouble) { inDouble = true; continue; }
                 if (inDouble && full[i + 1] === '"') { i++; continue; }
@@ -113,30 +125,23 @@ export function getCurrentStatement(doc: { getText: (range?: any) => string }, p
             }
             if (inDouble) { continue; }
 
-            // semicolon outside quotes/comments => statement separator
+            // Semicolon outside quotes/comments => statement separator
             if (ch === ";") {
                 lastStmtSep = i;
                 continue;
             }
 
-            // check for 'WITH' token (case-insensitive) - ensure word boundaries
+            // Check for 'WITH' token (case-insensitive) - only record if it's a CTE
             const rem = full.length - i;
-            if (rem >= 4) {
-                const slice4 = full.substr(i, 4);
-                if (/^with$/i.test(slice4)) {
-                    const prev = full[i - 1];
-                    const next = full[i + 4];
-                    if (isWordBoundaryChar(prev) && isWordBoundaryChar(next)) {
-                        lastWithIndex = i;
-                    }
-                }
+            if (rem >= 4 && isCteWith(full, i)) {
+                lastWithIndex = i;
             }
         } // end forward scan to offset
 
-        // Determine start: prefer lastStmtSep+1, but if there is a WITH after that, include it
+        // Determine start: prefer lastStmtSep+1, but if there is a CTE WITH after that, include it
         let start = lastStmtSep + 1;
         if (lastWithIndex > lastStmtSep) {
-            // include leading whitespace/newlines before WITH
+            // Include leading whitespace/newlines before WITH
             let wstart = lastWithIndex;
             while (wstart > 0 && /\s/.test(full[wstart - 1])) { wstart--; }
             start = wstart;
@@ -145,7 +150,6 @@ export function getCurrentStatement(doc: { getText: (range?: any) => string }, p
 
         // Find next semicolon after offset (end boundary)
         let end = full.length;
-        // resume state for scanning from offset to EOF to find the first semicolon outside strings/comments
         inSingle = false; inDouble = false; inBracket = false; inLineComment = false; inBlockComment = false;
         for (let i = offset; i < full.length; i++) {
             const ch = full[i];
