@@ -921,23 +921,134 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
     dbg('Alias.column resolution error:', e);
   }
 
+    // --- Small fix: prefer UPDATE target ONLY when hover is on the left side of a SET assignment ---
+  try {
+    // find UPDATE token and SET region
+    const updateMatch = /\bupdate\s+([@#]?[A-Za-z0-9_\[\]\."]+)(?:\s+(?:as\s+)?([A-Za-z0-9_]+))?/i.exec(cleanedStmt);
+    if (updateMatch && updateMatch[1]) {
+      const updateTokenRaw = stripBrackets(updateMatch[1]);
+      const updateAliasFromClause = updateMatch[2] ? updateMatch[2].replace(/^\[|\]$/g, "") : null;
+
+      // try to resolve alias->table for update token
+      let resolvedUpdateTargetRaw = updateTokenRaw;
+      try {
+        const resolved = resolveAliasTarget(cleanedStmt || "", updateTokenRaw);
+        if (resolved) { resolvedUpdateTargetRaw = stripBrackets(String(resolved)); }
+      } catch { /* ignore */ }
+
+      // find SET region (between SET and next FROM/WHERE or end)
+      const setRe = /\bset\b/i.exec(cleanedStmt);
+      if (setRe) {
+        const stmtAbsStart = doc.getText().indexOf(cleanedStmt);
+        const setRegionStart = setRe.index + setRe[0].length;
+        // find end-of-assignments: first FROM or WHERE after SET
+        const tailAfterSet = cleanedStmt.slice(setRegionStart);
+        const tailEndMatch = /\b(from|where)\b/i.exec(tailAfterSet);
+        const setRegionEnd = tailEndMatch ? (setRegionStart + tailEndMatch.index) : cleanedStmt.length;
+        const assignsText = cleanedStmt.slice(setRegionStart, setRegionEnd);
+
+        // find left-hand targets like: [alias.]colname  (capture possibly qualified left-side)
+        const lhsRe = /([A-Za-z0-9_\[\]"`\.]+(?:\.[A-Za-z0-9_\[\]"`\.]+)*)\s*=/g;
+        let m: RegExpExecArray | null;
+        const hoverOffset = doc.offsetAt(range.start);
+        let hoverIsOnLeftSide = false;
+        let matchedLeftToken: string | null = null;
+
+        while ((m = lhsRe.exec(assignsText)) !== null) {
+          const leftTok = m[1]; // raw left token in assignment
+          const leftStartInAssign = m.index;
+          const leftAbsStart = stmtAbsStart + setRegionStart + leftStartInAssign;
+          const leftAbsEnd = leftAbsStart + leftTok.length;
+          if (hoverOffset >= leftAbsStart && hoverOffset <= leftAbsEnd) {
+            hoverIsOnLeftSide = true;
+            matchedLeftToken = leftTok;
+            break;
+          }
+        }
+
+        if (hoverIsOnLeftSide) {
+          // canonicalize matched left token (strip brackets/quotes, split qualifier if present)
+          const matchedLeftStripped = stripBrackets(String(matchedLeftToken)).trim();
+          const leftIsQualified = matchedLeftStripped.includes(".");
+          const leftQualifier = leftIsQualified ? matchedLeftStripped.split(".").slice(0, -1).join(".") : null;
+
+          // only prefer update target for the left-side match if hovered token corresponds to that LHS column
+          // (i.e. either hovered token equals the LHS column or hoveredQualifier matches LHS qualifier)
+          const lhsColToken = leftIsQualified ? matchedLeftStripped.split(".").pop()! : matchedLeftStripped;
+          const lhsColNorm = normalizeName(lhsColToken);
+
+          const hoverMatchesLhs = (normalizeName(hoveredColumnToken) === lhsColNorm) ||
+                                  (!hoveredQualifier && normalizeName(hoveredColumnToken) === lhsColNorm) ||
+                                  (hoveredQualifier && leftQualifier && hoveredQualifier.replace(/^\[|\]$/g, "").toLowerCase() === leftQualifier.replace(/^\[|\]$/g, "").toLowerCase());
+
+          if (hoverMatchesLhs) {
+            // build update target keys
+            const updateTargetKeys = tableKeyCandidates(resolvedUpdateTargetRaw.replace(/^dbo\./i, ""));
+
+            // prefer local first (only if it's a genuine local entry)
+            for (const k of updateTargetKeys) {
+              const local = localTableMap.get(k);
+              if (local && local.columns) {
+                const foundLocal = (local.columns || []).find(cc => normalizeName(cc.name) === wordNorm);
+                if (foundLocal) {
+                  const md = `**Column** \`${foundLocal.name}\`${foundLocal.type ? ` ${foundLocal.type}` : ""} in local table \`${local.name}\``;
+                  dbg('UPDATE-SET-left matched local target:', md);
+                  return { contents: { kind: MarkupKind.Markdown, value: md }, range } as Hover;
+                }
+              }
+            }
+
+            // then prefer catalog
+            for (const k of updateTargetKeys) {
+              const def = tablesByName.get(k);
+              if (def && def.columns) {
+                const foundDef = (def.columns as any[]).find(cc =>
+                  (cc.rawName ?? cc.name) === hoveredColumnToken ||
+                  normalizeName(cc.name) === wordNorm
+                );
+                if (foundDef) {
+                  const md = `**Column** \`${foundDef.rawName ?? foundDef.name}\`${foundDef.type ? ` ${foundDef.type}` : ""} in table \`${def.rawName ?? def.name}\``;
+                  dbg('UPDATE-SET-left matched catalog target:', md);
+                  return { contents: { kind: MarkupKind.Markdown, value: md }, range } as Hover;
+                }
+              }
+            }
+            // if not found on update target, fall through to normal logic
+          }
+        }
+      }
+    }
+  } catch (e) {
+    dbg('UPDATE-SET-left small-fix error:', e);
+    // swallow and continue
+  }
+
+
   // 5) Candidate-only column lookup (search only in candidate tables discovered in statement)
   if (candidateTables.size > 0) {
     const matches: string[] = [];
+    const seenSourceKeys = new Set<string>(); // dedupe by canonical table identity
 
     // collect matches across all candidate tables (do NOT short-circuit on first candidate)
     for (const rawTname of Array.from(candidateTables)) {
       const cleanedCandidateToken = String(rawTname).trim();
 
-      // consider local map if token is local-style (but do not prevent catalog matches from being considered)
+      // 1) consider local map if token is local-style
       if (isRawTokenLocal(cleanedCandidateToken)) {
         const local = localTableMap.get(cleanedCandidateToken);
         if (local && local.columns) {
           for (const col of local.columns) {
             if (normalizeName(col.name) === wordNorm) {
-              matches.push(`${col.name}${col.type ? ` ${col.type}` : ""} in local table ${local.name}`);
-              dbg('Local table column match (candidate):', cleanedCandidateToken, local.name, col.name);
-              break;
+              // canonical source key for local = local.name (preserve as-is)
+              const sourceKey = String(local.name || cleanedCandidateToken).toLowerCase();
+              if (!seenSourceKeys.has(sourceKey)) {
+                matches.push(`${col.name}${col.type ? ` ${col.type}` : ""} in local table ${local.name}`);
+                seenSourceKeys.add(sourceKey);
+                dbg('Local table column match (candidate):', cleanedCandidateToken, local.name, col.name);
+              } else {
+                dbg('Skipping duplicate local match for same source:', sourceKey);
+              }
+              break; // matched column in this local table
             }
           }
         } else {
@@ -945,7 +1056,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
         }
       }
 
-      // fallback to catalog: try each table-key variant for the candidate token
+      // 2) fallback to catalog: try each table-key variant for the candidate token
       const candKeys = tableKeyCandidates(cleanedCandidateToken);
       for (const k of candKeys) {
         let def = tablesByName.get(k);
@@ -961,13 +1072,21 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
 
         for (const col of def.columns) {
           if ((col.rawName ?? col.name) === hoveredColumnToken || normalizeName(col.name || col.rawName || "") === wordNorm) {
-            const containerLabel = defIsType ? `table type ${def.rawName ?? def.name}` : `table ${def.rawName ?? def.name}`;
-            matches.push(`${col.rawName ?? col.name}${col.type ? ` ${col.type}` : ""} in ${containerLabel}`);
-            dbg('Catalog table column match (candidate):', k, col.rawName ?? col.name, containerLabel);
-            break; // stop scanning columns for this table
+            // canonical source key for catalog table: prefer rawName if present, else name
+            const canonicalName = String(def.rawName ?? def.name).trim();
+            const sourceKey = canonicalName.toLowerCase();
+            if (!seenSourceKeys.has(sourceKey)) {
+              const containerLabel = defIsType ? `table type ${def.rawName ?? def.name}` : `table ${def.rawName ?? def.name}`;
+              matches.push(`${col.rawName ?? col.name}${col.type ? ` ${col.type}` : ""} in ${containerLabel}`);
+              seenSourceKeys.add(sourceKey);
+              dbg('Catalog table column match (candidate):', k, col.rawName ?? col.name, containerLabel);
+            } else {
+              dbg('Skipping duplicate catalog match for same source:', sourceKey);
+            }
+            break; // stop scanning columns for this table def
           }
         }
-        // continue scanning other candidate keys (we want matches from other tables too)
+        // continue to other candidate keys (we want matches from other tables too)
       }
       // continue scanning next candidate table token
     }
