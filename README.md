@@ -30,7 +30,9 @@ The goal is practical productivity — not perfect SQL understanding.
 - **Hover Information**  
   Hover over a table, alias, or column to see its definition and context.  
 
-![Hover](ColumnHover.png)![alt text](Images/TableHover.png)
+![Column Hover](ColumnHover.png)
+
+![Table Hover](Images/TableHover.png)
 
 - **Workspace Indexing**  
   - Automatically indexes all `.sql` files in the workspace.  
@@ -110,9 +112,6 @@ Be aware of these trade-offs:
 - **Parser Gaps**  
   Some T-SQL constructs (e.g. `TOP(@var)`, `MERGE`, `OUTPUT INTO`) are not fully supported by the parser.  
   Regex fallback ensures partial functionality, but AST-powered features may be incomplete.  
-
-- **Mid-Edit States**  
-  While typing (e.g. after `e.` without a column), some features may only partially work until the statement is complete.  
 
 ---
 

@@ -69,7 +69,7 @@ export function getEnclosingProcedureBody(fullText: string, absOffset: number): 
 }
 
 // ---------- Parameter extraction ----------
-const headerParamRe = /(@[A-Za-z0-9_]+)\s+([^,)\r\n]+?)(?=\s*(?:,|\)|AS\b|BEGIN\b|$))/ig;
+const headerParamRe = /(@[A-Za-z0-9_]+)\s+([^,\r\n]+?)(?=\s*(?:,|AS\b|BEGIN\b|$))/ig;
 export function extractParamsFromHeader(headerText: string | null): Map<string,string> {
   const map = new Map<string,string>();
   if (!headerText) { return map; }

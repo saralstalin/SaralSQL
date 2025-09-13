@@ -28,7 +28,8 @@ export interface SymbolDef {
     rawName: string;
     uri: string;
     line: number;
-    columns?: ColumnDef[];
+    columns?: ColumnDef[],
+    kind?: string;
 }
 
 export interface ReferenceDef {
@@ -45,6 +46,7 @@ export const aliasesByUri = new Map<string, Map<string, string>>();
 export const definitions = new Map<string, SymbolDef[]>();
 export const referencesIndex = new Map<string, Map<string, ReferenceDef[]>>();
 export const tablesByName = new Map<string, SymbolDef>();
+export const tableTypesByName = new Map<string, SymbolDef>();
 
 const MAX_FILE_SIZE_BYTES = 12 * 1024;   // 12 KB (skip larger files)
 const MAX_REFS_PER_FILE = 5000;         // cap number of reference objects created per file
@@ -219,7 +221,7 @@ export function indexText(uri: string, text: string): void {
         const rawName = match[2];
         const norm = normalizeName(rawName);
 
-        const sym: SymbolDef = { name: norm, rawName, uri: normUri, line: i };
+        const sym: SymbolDef = { name: norm, rawName, uri: normUri, line: i, kind };
 
         if (kind === "TABLE" || (kind === "TYPE" && /\bAS\s+TABLE\b/i.test(line))) {
             // Build block from current line and parse columns (linear helper)
@@ -467,7 +469,7 @@ export function indexText(uri: string, text: string): void {
                 if (isAstPoolReady()) {
                     parseSqlWithWorker(scope.text, { database: "transactsql" }, 700)
                         .then((ast) => {
-                            if (!ast) {return;}
+                            if (!ast) { return; }
                             let targetTable: string | null = null;
                             if (ast.type === "update" || ast.type === "insert" || ast.type === "delete") {
                                 targetTable = ast.table?.[0]?.table || null;
@@ -613,6 +615,17 @@ export function indexText(uri: string, text: string): void {
     aliasesByUri.set(normUri, aliases);
 
     // Index tables by name for quick definition lookup
-    for (const def of defs) { tablesByName.set(def.name, def); }
+    for (const def of defs) {
+        if (!def.columns || !Array.isArray(def.columns) || def.columns.length === 0) { continue; }
+        const kindNorm = (def.kind || "").toUpperCase();
+        if (kindNorm === "TABLE" || kindNorm === "VIEW") {
+            tablesByName.set(def.name, def);
+        }
+        else if (kindNorm === "TYPE") {
+            // This is a table-type (CREATE TYPE ... AS TABLE) that we parsed with columns.
+            // Store it separately so hover can show "Table Type".
+            tableTypesByName.set(def.name, def);
+        }
+    }
 }
 
