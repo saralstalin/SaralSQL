@@ -80,8 +80,26 @@ function markIndexReady() {
   }
 }
 
-function toNormUri(rawUri: string): string {
-  return rawUri.startsWith("file://") ? rawUri : url.pathToFileURL(rawUri).toString();
+function toNormUri(rawUri: string) {
+  try {
+    // If it's already a file URI, normalize the path portion; otherwise convert path -> file:///
+    let uri = rawUri;
+    if (!uri.startsWith('file://')) {
+      uri = url.pathToFileURL(uri).toString();
+    }
+    // decode percent encoding so file:///c%3A/... -> file:///c:/...
+    const prefix = 'file:///';
+    if (uri.toLowerCase().startsWith(prefix)) {
+      const pathPart = decodeURIComponent(uri.substring(prefix.length));
+      // normalize backslashes and lowercase drive letter on Windows
+      const normalizedPath = pathPart.replace(/\\/g, '/').replace(/^([A-Za-z]):\//, (m, d) => d.toLowerCase() + ':/');
+      // re-encode only the path portion to keep URI safe
+      return prefix + encodeURI(normalizedPath);
+    }
+    return uri;
+  } catch (e) {
+    return rawUri;
+  }
 }
 
 function safeLog(msg: string): void {
@@ -152,13 +170,14 @@ documents.onDidOpen((e) => {
 });
 
 documents.onDidClose((e) => {
-  const uri = e.document.uri.startsWith("file://") ? e.document.uri : url.pathToFileURL(e.document.uri).toString();
+  /*const uri = e.document.uri.startsWith("file://") ? e.document.uri : url.pathToFileURL(e.document.uri).toString();
   const oldDefs = definitions.get(uri) || [];
   for (const d of oldDefs) { tablesByName.delete(d.name); columnsByTable.delete(d.name); }
   definitions.delete(uri);
   aliasesByUri.delete(uri);
   deleteRefsForFile(uri);
-  connection.sendDiagnostics({ uri, diagnostics: [] });
+  connection.sendDiagnostics({ uri, diagnostics: [] });*/
+  //Do Nothing
 });
 
 const pending = new Map<string, NodeJS.Timeout>();
@@ -350,8 +369,7 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
     const aliasDotMatch = /([a-zA-Z0-9_\[\]]+)\.$/.exec(linePrefix);
     if (aliasDotMatch) {
       // alias token typed (may be bracketed like [lw])
-      let aliasRaw = aliasDotMatch[1].replace(/^\[|\]$/g, "");
-      const aliasLower = aliasRaw.toLowerCase();
+      const aliasLower = normalizeName(aliasDotMatch[1]);
 
       // 1) First try statement-scoped aliases (closest match)
       let aliasesMap = new Map<string, string>();
@@ -380,7 +398,7 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
           const seenCols = new Set<string>();
           const cols: CompletionItem[] = [];
           for (const col of (def.columns as any[])) {
-            const normCol = (col.rawName || col.name || "").replace(/^\[|\]$/g, "").toLowerCase();
+            const normCol = normalizeName(col.rawName || col.name || "");
             if (seenCols.has(normCol)) { continue; }
             seenCols.add(normCol);
             cols.push({
@@ -394,7 +412,7 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
         }
       } else {
         // helpful debug log so we can see unresolved aliases in enterprise runs
-        safeLog(`[completion] alias '${aliasRaw}' not found in statement or file aliases for ${normUri}. linePrefix='${linePrefix.slice(-80)}'`);
+        safeLog(`[completion] alias '${aliasDotMatch}' not found in statement or file aliases for ${normUri}. linePrefix='${linePrefix.slice(-80)}'`);
       }
     }
 
@@ -550,650 +568,626 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
 
 //hover function
 async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> {
-  // helper: remove ALL square brackets and trim
-  const stripBrackets = (s: string | null | undefined): string => {
-    if (!s) { return ""; }
-    return String(s).replace(/\[|\]/g, "").trim();
-  };
-
-  const range = getWordRangeAtPosition(doc, pos);
-  if (!range) {
-    dbg('No range found at position', pos);
-    return null;
-  }
-
-  const rawWord = doc.getText(range);
-  const rawWordStripped = stripBrackets(rawWord);
-
-  // --- handle qualified tokens (alias.col) minimally ---
-  const isQualifiedToken = rawWordStripped.includes(".");
-  let hoveredQualifier: string | null = null;
-  let hoveredColumnToken = rawWordStripped;
-  if (isQualifiedToken) {
-    const parts = rawWordStripped.split(".");
-    hoveredQualifier = parts.slice(0, -1).join(".");
-    hoveredColumnToken = parts[parts.length - 1];
-  }
-
-  // use column-only token for column lookups
-  const wordNorm = normalizeName(hoveredColumnToken);
-  dbg('Hovered word:', { rawWord, rawWordStripped, hoveredQualifier, hoveredColumnToken, wordNorm });
-
-  const stmtText = getCurrentStatement(doc, pos) || "";
-  // small cleaning of table-hints that break token shapes (idempotent)
-  const cleanedStmt = stmtText.replace(/WITH\s*\((?:NOLOCK|READUNCOMMITTED|UPDLOCK|HOLDLOCK|ROWLOCK|FORCESEEK|INDEX\([^)]*\)|FASTFIRSTROW|XLOCK|REPEATABLEREAD|SERIALIZABLE|,)+?\s*\)/gi, ' ');
-  dbg('Statement:', { original: stmtText, cleaned: cleanedStmt });
-
-  // param/declare map from util
-  const paramMap = buildParamMapForDocAtPos(doc, pos);
-
-  // Helper: does the raw token start with @ or # (local table token)?
-  const isRawTokenLocal = (tok: string | null | undefined) => {
-    if (!tok) { return false; }
-    const t = stripBrackets(tok).trim();
-    return t.startsWith("@") || t.startsWith("#");
-  };
-
-  if (rawWord.startsWith("@") || rawWordStripped.startsWith("@")) {
-    // use stripped token for lookup (keys in paramMap are normalized to lower-case '@name')
-    const lookup = paramMap.get(rawWordStripped.toLowerCase());
-    if (lookup) {
-      dbg('Parameter found:', rawWordStripped, lookup);
-      return {
-        contents: {
-          kind: MarkupKind.Markdown,
-          value: `**Parameter** \`${rawWordStripped}\` — \`${lookup}\``
-        },
-        range
-      } as Hover;
-    }
-    dbg('No parameter found for:', rawWordStripped);
-  }
-
-  // local table map from util (table vars, temp tables, learned insert/select)
-  const localTableMap = buildLocalTableMapForDocAtPos(doc, pos);
-
-  // simple helper to produce candidate keys for a table token (minimal)
-  const tableKeyCandidates = (rawToken: string | null | undefined): string[] => {
-    if (!rawToken) { return []; }
-    const cleaned = stripBrackets(String(rawToken).trim());
-    const noSchema = cleaned.replace(/^dbo\./i, "");
-    const keys = new Set<string>();
-    keys.add(noSchema.toLowerCase());
-    try { keys.add(normalizeName(noSchema)); } catch { }
-    const short = (noSchema.split('.').pop() || noSchema);
-    keys.add(short.toLowerCase());
-    try { keys.add(normalizeName(short)); } catch { }
-    return Array.from(keys);
-  };
-
-  // candidate tables (normalized names) from util, using cleanedStmt
-  const candidateTables = collectCandidateTablesFromStatement(cleanedStmt || "");
-
-  // Ensure INSERT/MERGE/SELECT-...-INTO targets are included as candidate tables
   try {
-    const insertIntoRe = /\binsert\s+into\s+([a-zA-Z0-9_\[\]\."]+)/gi;
-    const mergeIntoRe = /\bmerge\s+into\s+([a-zA-Z0-9_\[\]\."]+)/gi;
-    const selectIntoRe = /\bselect\b[\s\S]*?\binto\s+([a-zA-Z0-9_\[\]\."]+)/gi;
 
-    for (const m of cleanedStmt.matchAll(insertIntoRe)) {
-      if (m && m[1]) {
-        const tn = normalizeName(stripBrackets(m[1]).replace(/^dbo\./i, ""));
-        candidateTables.add(tn);
-        dbg('Added INSERT INTO target to candidates:', m[1], tn);
-      }
+    const range = getWordRangeAtPosition(doc, pos);
+    if (!range) {
+      dbg('No range found at position', pos);
+      return null;
     }
-    for (const m of cleanedStmt.matchAll(mergeIntoRe)) {
-      if (m && m[1]) {
-        const tn = normalizeName(stripBrackets(m[1]).replace(/^dbo\./i, ""));
-        candidateTables.add(tn);
-        dbg('Added MERGE INTO target to candidates:', m[1], tn);
-      }
-    }
-    for (const m of cleanedStmt.matchAll(selectIntoRe)) {
-      if (m && m[1]) {
-        const tn = normalizeName(stripBrackets(m[1]).replace(/^dbo\./i, ""));
-        candidateTables.add(tn);
-        dbg('Added SELECT INTO target to candidates:', m[1], tn);
-      }
-    }
-  } catch (e) {
-    dbg('insert/merge/select-into candidate resolution error', e);
-  }
 
-  // --- Augment candidateTables with explicit FROM/JOIN table tokens and aliases ---
-  try {
-    const fromJoinRe = /\b(?:from|join)\s+([^\s,()]+)(?:\s+(?:as\s+)?([A-Za-z0-9_\[\]"]+))?/gi;
-    for (const m of cleanedStmt.matchAll(fromJoinRe)) {
-      if (!m) { continue; }
-      const tableTok = m[1];
-      if (tableTok) {
-        const cleanedTableTok = stripBrackets(String(tableTok)).replace(/^dbo\./i, "");
-        try { candidateTables.add(normalizeName(cleanedTableTok)); } catch { candidateTables.add(cleanedTableTok.toLowerCase()); }
-      }
-      const aliasTok = m[2];
-      if (aliasTok) {
-        const cleanedAlias = String(aliasTok).replace(/^\[|\]$/g, "").trim();
-        candidateTables.add(cleanedAlias.toLowerCase());
-      }
+    const rawWord = doc.getText(range);
+    const rawWordStripped = normalizeName(rawWord); // canonical for lookups
+    const rawWordDisplay = rawWord; // keep original for human display in hover bodies
+
+    // --- handle qualified tokens (alias.col) minimally ---
+    const isQualifiedToken = rawWordStripped.includes(".");
+    let hoveredQualifier: string | null = null;
+    let hoveredColumnToken = rawWordStripped;
+    if (isQualifiedToken) {
+      const parts = rawWordStripped.split(".");
+      hoveredQualifier = parts.slice(0, -1).join(".");
+      hoveredColumnToken = parts[parts.length - 1];
     }
-    dbg('Augmented candidateTables from FROM/JOIN:', Array.from(candidateTables));
-  } catch (e) {
-    dbg('Failed to augment candidateTables from FROM/JOIN', e);
-  }
 
-  dbg('Candidate tables final:', Array.from(candidateTables));
+    // use column-only token for column lookups (normalized)
+    const wordNorm = normalizeName(hoveredColumnToken);
+    dbg('Hovered word:', { rawWord: rawWordDisplay, rawWordStripped, hoveredQualifier, hoveredColumnToken, wordNorm });
 
-  // small helper: decide whether a localTableMap entry should be considered a true "local" table
-  // Accept local table entry only if:
-  //  - the hovered/candidate token looked local (starts with @ or #) OR
-  //  - the local definition's name begins with @ or # (table var or temp table)
-  const isLocalEntryValid = (localDef: any, candidateToken?: string | null | undefined): boolean => {
-    if (!localDef) { return false; }
-    if (isRawTokenLocal(candidateToken)) { return true; }
+    const stmtText = getCurrentStatement(doc, pos) || "";
+    // small cleaning of table-hints that break token shapes (idempotent)
+    const cleanedStmt = stmtText.replace(/WITH\s*\((?:NOLOCK|READUNCOMMITTED|UPDLOCK|HOLDLOCK|ROWLOCK|FORCESEEK|INDEX\([^)]*\)|FASTFIRSTROW|XLOCK|REPEATABLEREAD|SERIALIZABLE|,)+?\s*\)/gi, ' ');
+    dbg('Statement:', { original: stmtText, cleaned: cleanedStmt });
+
+    // param/declare map from util
+    const paramMap = buildParamMapForDocAtPos(doc, pos);
+
+    // Helper: does the raw token look like a local table variable / parameter (starts with @ or #)?
+    const isRawTokenLocal = (tok: string | null | undefined) => {
+      if (!tok) { return false; }
+      const s = String(tok).trim();
+      if (s.startsWith("@") || s.startsWith("#")) { return true; }
+      const n = normalizeName(s);
+      return n.startsWith("@") || n.startsWith("#");
+    };
+
+    if (rawWord.startsWith("@") || rawWordStripped.startsWith("@")) {
+      // use stripped token for lookup (keys in paramMap are normalized to lower-case '@name')
+      const lookup = paramMap.get(rawWordStripped.toLowerCase());
+      if (lookup) {
+        dbg('Parameter found:', rawWordStripped, lookup);
+        return {
+          contents: {
+            kind: MarkupKind.Markdown,
+            value: `**Parameter** \`${rawWordStripped}\` — \`${lookup}\``
+          },
+          range
+        } as Hover;
+      }
+      dbg('No parameter found for:', rawWordStripped);
+    }
+
+    // local table map from util (table vars, temp tables, learned insert/select)
+    const localTableMap = buildLocalTableMapForDocAtPos(doc, pos);
+
+    // canonical table key candidates generation (single source)
+    const tableKeyCandidates = (rawToken: string | null | undefined): string[] => {
+      if (!rawToken) { return []; }
+      const norm = normalizeName(String(rawToken).trim()); // canonical e.g. "department"
+      const keys = new Set<string>();
+      keys.add(norm);
+      const short = norm.includes('.') ? norm.split('.').pop()! : norm;
+      keys.add(short);
+      keys.add(norm.toLowerCase());
+      keys.add(short.toLowerCase());
+      return Array.from(keys);
+    };
+
+    // candidate tables (normalized names) from util, using cleanedStmt
+    const candidateTables = collectCandidateTablesFromStatement(cleanedStmt || "") || new Set<string>();
+
+    // Ensure INSERT/MERGE/SELECT-...-INTO targets are included as candidate tables (normalized)
     try {
-      const n = String(localDef.name || "").trim();
-      if (n.startsWith("@") || n.startsWith("#")) { return true; }
-    } catch { }
-    return false;
-  };
+      const insertIntoRe = /\binsert\s+into\s+([a-zA-Z0-9_\[\]\."]+)/gi;
+      const mergeIntoRe = /\bmerge\s+into\s+([a-zA-Z0-9_\[\]\."]+)/gi;
+      const selectIntoRe = /\bselect\b[\s\S]*?\binto\s+([a-zA-Z0-9_\[\]\."]+)/gi;
 
-  // --------- INSERT-target preference (keeps earlier stricter derived-subquery check) ---------
-  try {
-    const insRe = /\binsert\s+into\s+([^\s(]+)\s*\(\s*([^\)]+)\)/i;
-    const m = insRe.exec(cleanedStmt || "");
-    if (m && m[1] && m[2]) {
-      const insertTargetRaw = m[1];
-      const insertColsRaw = m[2];
-      const insertCols = new Set<string>(
-        insertColsRaw.split(",").map(s => normalizeName(stripBrackets(s.trim())))
-      );
-      dbg('Insert target detected:', insertTargetRaw, Array.from(insertCols));
-
-      const stmtAbsStart = doc.getText().indexOf(cleanedStmt);
-      const insideDerived = (() => {
-        const fm = /\bfrom\s*\(/i.exec(cleanedStmt);
-        if (!fm || stmtAbsStart < 0) { return false; }
-        const parenStart = fm.index + fm[0].indexOf('(');
-        let depth = 1;
-        for (let i = parenStart + 1; i < cleanedStmt.length; i++) {
-          const ch = cleanedStmt[i];
-          if (ch === '(') { depth++; }
-          else if (ch === ')') {
-            depth--;
-            if (depth === 0) {
-              const absInnerStart = stmtAbsStart + parenStart + 1;
-              const absInnerEnd = stmtAbsStart + i;
-              const hoverOffset = doc.offsetAt(range.start);
-              return hoverOffset >= absInnerStart && hoverOffset <= absInnerEnd;
-            }
-          }
+      for (const m of cleanedStmt.matchAll(insertIntoRe)) {
+        if (m && m[1]) {
+          const tn = normalizeName(m[1]);
+          candidateTables.add(tn);
+          candidateTables.add(tn.split('.').pop()!);
+          dbg('Added INSERT INTO target to candidates:', m[1], tn);
         }
-        return false;
-      })();
-
-      if (insertCols.has(wordNorm) || insideDerived) {
-        const cleanedTarget = stripBrackets(insertTargetRaw.replace(/^\[|\]$/g, ""));
-        const targetKeys = tableKeyCandidates(cleanedTarget);
-        dbg('Insert target keys:', targetKeys, { insideDerived });
-
-        // prefer local (but only if local entry is valid)
-        for (const k of targetKeys) {
-          const local = localTableMap.get(k);
-          if (local && isLocalEntryValid(local, insertTargetRaw)) {
-            const found = local.columns && local.columns.find(cc => normalizeName(cc.name) === wordNorm);
-            if (found) {
-              const md = `**Column** \`${found.name}\`${found.type ? ` ${found.type}` : ""} in local table \`${local.name}\``;
-              dbg('Insert-target matched local:', md);
-              return { contents: { kind: MarkupKind.Markdown, value: md }, range } as Hover;
-            }
-          } else if (local) {
-            dbg('Found localTableMap entry but skipping as not a genuine local entry:', k, local && local.name);
-          }
-        }
-
-        // then catalog
-        for (const k of targetKeys) {
-          const def = tablesByName.get(k);
-          if (def && def.columns) {
-            const found = (def.columns as any[]).find(cc =>
-              (cc.rawName ?? cc.name) === hoveredColumnToken ||
-              normalizeName(cc.name) === wordNorm
-            );
-            if (found) {
-              const md = `**Column** \`${found.rawName ?? found.name}\`${found.type ? ` ${found.type}` : ""} in table \`${def.rawName ?? def.name}\``;
-              dbg('Insert-target matched catalog:', md);
-              return { contents: { kind: MarkupKind.Markdown, value: md }, range } as Hover;
-            }
-          }
-        }
-        dbg('Insert-target indicated but not found in local/catalog for:', wordNorm);
       }
+      for (const m of cleanedStmt.matchAll(mergeIntoRe)) {
+        if (m && m[1]) {
+          const tn = normalizeName(m[1]);
+          candidateTables.add(tn);
+          candidateTables.add(tn.split('.').pop()!);
+          dbg('Added MERGE INTO target to candidates:', m[1], tn);
+        }
+      }
+      for (const m of cleanedStmt.matchAll(selectIntoRe)) {
+        if (m && m[1]) {
+          const tn = normalizeName(m[1]);
+          candidateTables.add(tn);
+          candidateTables.add(tn.split('.').pop()!);
+          dbg('Added SELECT INTO target to candidates:', m[1], tn);
+        }
+      }
+    } catch (e) {
+      dbg('insert/merge/select-into candidate resolution error', e);
     }
-  } catch (e) {
-    dbg('Insert-target preference error:', e);
-  }
 
-  // ---------- rest of original resolution flow (kept intact) ----------
+    // --- Augment candidateTables with explicit FROM/JOIN table tokens and aliases (normalized) ---
+    try {
+      const fromJoinRe = /\b(?:from|join)\s+([^\s,()]+)(?:\s+(?:as\s+)?([A-Za-z0-9_\[\]"]+))?/gi;
+      for (const m of cleanedStmt.matchAll(fromJoinRe)) {
+        if (!m) { continue; }
+        const tableTok = m[1];
+        if (tableTok) {
+          // canonicalize fully using normalizeName
+          const tableNorm = normalizeName(String(tableTok));
+          candidateTables.add(tableNorm);
+          // also add unqualified short name
+          candidateTables.add(tableNorm.split('.').pop()!);
+        }
+        const aliasTok = m[2];
+        if (aliasTok) {
+          // normalize alias too (so alias token is consistent with normalized keys)
+          const aliasNorm = normalizeName(String(aliasTok));
+          candidateTables.add(aliasNorm);
+        }
+      }
+      dbg('Augmented candidateTables from FROM/JOIN:', Array.from(candidateTables));
+    } catch (e) {
+      dbg('Failed to augment candidateTables from FROM/JOIN', e);
+    }
 
-  // 1) Local table direct hover (token itself local)
-  if (isRawTokenLocal(rawWord)) {
-    const localDefDirect = localTableMap.get(normalizeName(rawWordStripped));
-    if (localDefDirect && isLocalEntryValid(localDefDirect, rawWordStripped)) {
-      const rows = localDefDirect.columns.map(c => `- \`${c.name}\`${c.type ? ` ${c.type}` : ""}`);
-      const body = `**Local table** \`${localDefDirect.name}\`\n\n${rows.join("\n")}`;
-      dbg('Local table hover:', localDefDirect.name, rows);
+    dbg('Candidate tables final:', Array.from(candidateTables));
+
+    // small helper: decide whether a localTableMap entry should be considered a true "local" table
+    const isLocalEntryValid = (localDef: any, candidateToken?: string | null | undefined): boolean => {
+      if (!localDef) { return false; }
+      if (isRawTokenLocal(candidateToken)) { return true; }
+      try {
+        const n = String(localDef.name || "").trim();
+        if (n.startsWith("@") || n.startsWith("#")) { return true; }
+      } catch { /* ignore */ }
+      return false;
+    };
+
+    // --------- INSERT-target preference (keeps earlier stricter derived-subquery check) ---------
+    try {
+      const insRe = /\binsert\s+into\s+([^\s(]+)\s*\(\s*([^\)]+)\)/i;
+      const m = insRe.exec(cleanedStmt || "");
+      if (m && m[1] && m[2]) {
+        const insertTargetRaw = m[1];
+        const insertColsRaw = m[2];
+        const insertCols = new Set<string>(
+          insertColsRaw.split(",").map(s => normalizeName(String(s).trim()))
+        );
+        dbg('Insert target detected:', insertTargetRaw, Array.from(insertCols));
+
+        const stmtAbsStart = doc.getText().indexOf(cleanedStmt);
+        const insideDerived = (() => {
+          const fm = /\bfrom\s*\(/i.exec(cleanedStmt);
+          if (!fm || stmtAbsStart < 0) { return false; }
+          const parenStart = fm.index + fm[0].indexOf('(');
+          let depth = 1;
+          for (let i = parenStart + 1; i < cleanedStmt.length; i++) {
+            const ch = cleanedStmt[i];
+            if (ch === '(') { depth++; }
+            else if (ch === ')') {
+              depth--;
+              if (depth === 0) {
+                const absInnerStart = stmtAbsStart + parenStart + 1;
+                const absInnerEnd = stmtAbsStart + i;
+                const hoverOffset = doc.offsetAt(range.start);
+                return hoverOffset >= absInnerStart && hoverOffset <= absInnerEnd;
+              }
+            }
+          }
+          return false;
+        })();
+
+        if (insertCols.has(wordNorm) || insideDerived) {
+          const cleanedTarget = normalizeName(insertTargetRaw);
+          const targetKeys = tableKeyCandidates(cleanedTarget);
+          dbg('Insert target keys:', targetKeys, { insideDerived });
+
+          // prefer local (but only if local entry is valid)
+          for (const k of targetKeys) {
+            const local = localTableMap.get(k);
+            if (local && isLocalEntryValid(local, insertTargetRaw)) {
+              const found = local.columns && (local.columns as any[]).find(cc => normalizeName(cc.name) === wordNorm);
+              if (found) {
+                const md = `**Column** \`${found.name}\`${found.type ? ` ${found.type}` : ""} in local table \`${local.name}\``;
+                dbg('Insert-target matched local:', md);
+                return { contents: { kind: MarkupKind.Markdown, value: md }, range } as Hover;
+              }
+            } else if (local) {
+              dbg('Found localTableMap entry but skipping as not a genuine local entry:', k, local && local.name);
+            }
+          }
+
+          // then catalog
+          for (const k of targetKeys) {
+            const def = tablesByName.get(k);
+            if (def && def.columns) {
+              const found = (def.columns as any[]).find(cc =>
+                (cc.rawName ?? cc.name) === hoveredColumnToken ||
+                normalizeName(cc.name) === wordNorm
+              );
+              if (found) {
+                const md = `**Column** \`${found.rawName ?? found.name}\`${found.type ? ` ${found.type}` : ""} in table \`${def.rawName ?? def.name}\``;
+                dbg('Insert-target matched catalog:', md);
+                return { contents: { kind: MarkupKind.Markdown, value: md }, range } as Hover;
+              }
+            }
+          }
+          dbg('Insert-target indicated but not found in local/catalog for:', wordNorm);
+        }
+      }
+    } catch (e) {
+      dbg('Insert-target preference error:', e);
+    }
+
+    // ---------- rest of original resolution flow (kept intact) ----------
+
+    // 1) Local table direct hover (token itself local)
+    if (isRawTokenLocal(rawWord)) {
+      const localDefDirect = localTableMap.get(normalizeName(rawWordStripped));
+      if (localDefDirect && isLocalEntryValid(localDefDirect, rawWordStripped)) {
+        const rows = localDefDirect.columns.map(c => `- \`${c.name}\`${c.type ? ` ${c.type}` : ""}`);
+        const body = `**Local table** \`${localDefDirect.name}\`\n\n${rows.join("\n")}`;
+        dbg('Local table hover:', localDefDirect.name, rows);
+        return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
+      }
+      dbg('No local table found for (or skipped non-local):', rawWordStripped);
+    }
+
+    // 2) Catalog table direct hover (also check table-types)
+    const directTableDef = tablesByName.get(rawWordStripped);
+    if (directTableDef) {
+      const rows: string[] = [];
+      if (directTableDef.columns && Array.isArray(directTableDef.columns)) {
+        for (const c of directTableDef.columns) {
+          const cname = c.rawName ?? c.name;
+          const ctype = c.type ? ` ${c.type}` : "";
+          rows.push(`- \`${cname}\`${ctype}`);
+        }
+      }
+      const body = `**Table** \`${directTableDef.rawName ?? directTableDef.name}\`\n\n${rows.join("\n")}`;
+      dbg('Catalog table hover:', directTableDef.name, rows);
       return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
     }
-    dbg('No local table found for (or skipped non-local):', rawWordStripped);
-  }
 
-  // 2) Catalog table direct hover (also check table-types)
-  const directTableDef = tablesByName.get(normalizeName(rawWordStripped));
-  if (directTableDef) {
-    const rows: string[] = [];
-    if (directTableDef.columns && Array.isArray(directTableDef.columns)) {
-      for (const c of directTableDef.columns) {
-        const cname = c.rawName ?? c.name;
-        const ctype = c.type ? ` ${c.type}` : "";
-        rows.push(`- \`${cname}\`${ctype}`);
+    // If not a real table, check table-type index
+    const directTypeDef = tableTypesByName.get(rawWordStripped);
+    if (directTypeDef) {
+      const rows: string[] = [];
+      if (directTypeDef.columns && Array.isArray(directTypeDef.columns)) {
+        for (const c of directTypeDef.columns) {
+          const cname = c.rawName ?? c.name;
+          const ctype = c.type ? ` ${c.type}` : "";
+          rows.push(`- \`${cname}\`${ctype}`);
+        }
       }
+      const body = `**Table Type** \`${directTypeDef.rawName ?? directTypeDef.name}\`\n\n${rows.join("\n")}`;
+      dbg('Catalog table-type hover:', directTypeDef.name, rows);
+      return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
     }
-    const body = `**Table** \`${directTableDef.rawName ?? directTableDef.name}\`\n\n${rows.join("\n")}`;
-    dbg('Catalog table hover:', directTableDef.name, rows);
-    return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
-  }
 
-  // If not a real table, check table-type index
-  const directTypeDef = tableTypesByName.get(normalizeName(rawWordStripped));
-  if (directTypeDef) {
-    const rows: string[] = [];
-    if (directTypeDef.columns && Array.isArray(directTypeDef.columns)) {
-      for (const c of directTypeDef.columns) {
-        const cname = c.rawName ?? c.name;
-        const ctype = c.type ? ` ${c.type}` : "";
-        rows.push(`- \`${cname}\`${ctype}`);
-      }
-    }
-    const body = `**Table Type** \`${directTypeDef.rawName ?? directTypeDef.name}\`\n\n${rows.join("\n")}`;
-    dbg('Catalog table-type hover:', directTypeDef.name, rows);
-    return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
-  }
+    // 3) Hover over an alias token (map alias -> target using extractAliases via util resolve)
+    try {
+      const aliasLookupToken = (isQualifiedToken && hoveredQualifier) ? hoveredQualifier : rawWordStripped;
+      const aliasTarget = resolveAliasTarget(cleanedStmt || "", aliasLookupToken);
+      if (aliasTarget) {
+        const mappedRawDisplay = String(aliasTarget).replace(/^\.+/, "").replace(/[\[\]"`]/g, "").trim();
+        const mappedNorm = normalizeName(String(aliasTarget));
+        dbg('Alias target resolved:', { rawWord: rawWordStripped, aliasLookupToken, aliasTarget, mappedRawDisplay, mappedNorm });
 
-  // 3) Hover over an alias token (map alias -> target using extractAliases via util resolve)
-  try {
-    const aliasLookupToken = (isQualifiedToken && hoveredQualifier) ? hoveredQualifier : rawWordStripped;
-    const aliasTarget = resolveAliasTarget(cleanedStmt || "", aliasLookupToken);
-    if (aliasTarget) {
-      const mappedRaw = stripBrackets(String(aliasTarget));
-      const mappedNorm = normalizeName(mappedRaw.replace(/^dbo\./i, ""));
-      dbg('Alias target resolved:', { rawWord: rawWordStripped, aliasLookupToken, aliasTarget, mappedRaw, mappedNorm });
-
-      if (isRawTokenLocal(mappedRaw)) {
-        const localMapped = localTableMap.get(mappedNorm);
-        if (localMapped && isLocalEntryValid(localMapped, mappedRaw)) {
-          const rows = localMapped.columns.map(c => `- \`${c.name}\`${c.type ? ` ${c.type}` : ""}`);
-          const body = `**Alias** \`${rawWord}\` → local table \`${localMapped.name}\`\n\n${rows.join("\n")}`;
-          dbg('Local table alias hover:', localMapped.name, rows);
-          return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
-        }
-        dbg('Alias target found in localTableMap but skipped as non-local', mappedNorm, localMapped && localMapped.name);
-      }
-
-      let def = tablesByName.get(mappedNorm);
-      let defIsType = false;
-      if (!def) {
-        def = tableTypesByName.get(mappedNorm);
-        if (def) { defIsType = true; }
-      }
-      if (def) {
-        if (!isQualifiedToken) {
-          const rows: string[] = [];
-          if (def.columns && Array.isArray(def.columns)) {
-            for (const c of def.columns) {
-              const cname = c.rawName ?? c.name;
-              const ctype = c.type ? ` ${c.type}` : "";
-              rows.push(`- \`${cname}\`${ctype}`);
-            }
+        // If this maps to a local table in this file, check localTableMap
+        if (isRawTokenLocal(mappedNorm)) {
+          const localMapped = localTableMap.get(mappedNorm);
+          if (localMapped && isLocalEntryValid(localMapped, mappedRawDisplay)) {
+            const rows = localMapped.columns.map(c => `- \`${c.name}\`${c.type ? ` ${c.type}` : ""}`);
+            const body = `**Alias** \`${rawWordDisplay}\` → local table \`${localMapped.name}\`\n\n${rows.join("\n")}`;
+            dbg('Local table alias hover:', localMapped.name, rows);
+            return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
           }
-          const header = defIsType ? "**Alias** `" + rawWord + "` → table type `" + (def.rawName ?? def.name) + "`" :
-            "**Alias** `" + rawWord + "` → table `" + (def.rawName ?? def.name) + "`";
-          const body = `${header}\n\n${rows.join("\n")}`;
-          dbg('Catalog table alias hover:', def.name, rows);
-          return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
-        } else {
-          dbg('Skipping alias-as-table hover because token is qualified; def exists:', mappedNorm);
-        }
-      }
-      dbg('No catalog table for alias target:', mappedNorm);
-    }
-  } catch (e) {
-    dbg('Alias resolution error:', e);
-  }
-
-  // 4) alias.column explicit handling (resolve alias -> target, prefer local table map)
-  try {
-    const aliasInfo = resolveAlias(rawWord, doc, pos);
-    if (aliasInfo && aliasInfo.table && aliasInfo.column) {
-      let resolvedTarget: string | null = null;
-      let resolvedRaw: string | null = null;
-      try {
-        const mapped = resolveAliasTarget(cleanedStmt || "", stripBrackets(String(aliasInfo.table)));
-        if (mapped) {
-          resolvedTarget = mapped;
-          resolvedRaw = stripBrackets(String(mapped));
-          dbg('Alias.column resolution (cleanedStmt):', { table: aliasInfo.table, column: aliasInfo.column, resolvedTarget, resolvedRaw });
-        } else {
-          const fullText = doc.getText();
-          const fullTextCleaned = fullText.replace(/WITH\s*\((?:NOLOCK|READUNCOMMITTED|UPDLOCK|HOLDLOCK|ROWLOCK|FORCESEEK|INDEX\([^)]*\)|FASTFIRSTROW|XLOCK|REPEATABLEREAD|SERIALIZABLE|,)+?\s*\)/gi, ' ');
-          const mappedFull = resolveAliasTarget(fullTextCleaned, stripBrackets(String(aliasInfo.table)));
-          if (mappedFull) {
-            resolvedTarget = mappedFull;
-            resolvedRaw = stripBrackets(String(mappedFull));
-            dbg('Alias.column resolution (fullText):', { table: aliasInfo.table, column: aliasInfo.column, resolvedTarget, resolvedRaw });
-          } else {
-            resolvedTarget = String(aliasInfo.table);
-            resolvedRaw = stripBrackets(String(aliasInfo.table));
-            dbg('Alias.column resolution (fallback to table):', { table: aliasInfo.table, column: aliasInfo.column, resolvedTarget, resolvedRaw });
-          }
-        }
-      } catch (e) {
-        resolvedTarget = String(aliasInfo.table);
-        resolvedRaw = stripBrackets(String(aliasInfo.table));
-        dbg('Alias.column target resolution error:', e, { resolvedTarget, resolvedRaw });
-      }
-
-      const aliasTableKey = normalizeName(String(resolvedTarget).replace(/^dbo\./i, ""));
-
-      // Only accept local table if the local entry is genuinely local-ish
-      if (isRawTokenLocal(resolvedRaw)) {
-        const localTable = localTableMap.get(aliasTableKey);
-        if (localTable && isLocalEntryValid(localTable, resolvedRaw) && localTable.columns) {
-          const aliasColNorm = aliasInfo.column ? normalizeName(aliasInfo.column) : null;
-          const cLocal = localTable.columns.find(cc => normalizeName(cc.name) === aliasColNorm);
-          if (cLocal) {
-            const value = `**Column** \`${cLocal.name}\`${cLocal.type ? ` ${cLocal.type}` : ""} in local table \`${localTable.name}\``;
-            dbg('Local table column hover:', value);
-            return {
-              contents: {
-                kind: MarkupKind.Markdown,
-                value
-              },
-              range
-            } as Hover;
-          }
-          dbg('No matching column in local table:', aliasTableKey, aliasColNorm);
-        } else {
-          dbg('Local alias target found but not a genuine local table entry:', aliasTableKey);
-        }
-      }
-
-      let def = tablesByName.get(aliasTableKey);
-      let defIsType = false;
-      if (!def) {
-        def = tableTypesByName.get(aliasTableKey);
-        if (def) { defIsType = true; }
-      }
-      if (def && def.columns) {
-        const aliasColNorm = aliasInfo.column ? normalizeName(aliasInfo.column) : null;
-        const c = (def.columns as any[]).find(cc =>
-          (cc.rawName ?? cc.name) === aliasInfo.column ||
-          (aliasColNorm !== null && normalizeName(cc.name) === aliasColNorm)
-        );
-        if (c) {
-          const containerLabel = defIsType ? `table type \`${def.rawName ?? def.name}\`` : `table \`${def.rawName ?? def.name}\``;
-          const value = `**Column** \`${c.rawName ?? c.name}\`${c.type ? ` ${c.type}` : ""} in ${containerLabel}`;
-          dbg('Catalog table column hover:', value);
-          return {
-            contents: {
-              kind: MarkupKind.Markdown,
-              value
-            },
-            range
-          } as Hover;
-        }
-        dbg('No matching column in catalog table:', aliasTableKey, aliasColNorm);
-      }
-    }
-  } catch (e) {
-    dbg('Alias.column resolution error:', e);
-  }
-
-  // --- Small fix: prefer UPDATE target ONLY when hover is on the left side of a SET assignment ---
-  try {
-    // find UPDATE token and SET region
-    const updateMatch = /\bupdate\s+([@#]?[A-Za-z0-9_\[\]\."]+)(?:\s+(?:as\s+)?([A-Za-z0-9_]+))?/i.exec(cleanedStmt);
-    if (updateMatch && updateMatch[1]) {
-      const updateTokenRaw = stripBrackets(updateMatch[1]);
-      const updateAliasFromClause = updateMatch[2] ? updateMatch[2].replace(/^\[|\]$/g, "") : null;
-
-      // try to resolve alias->table for update token
-      let resolvedUpdateTargetRaw = updateTokenRaw;
-      try {
-        const resolved = resolveAliasTarget(cleanedStmt || "", updateTokenRaw);
-        if (resolved) { resolvedUpdateTargetRaw = stripBrackets(String(resolved)); }
-      } catch { /* ignore */ }
-
-      // find SET region (between SET and next FROM/WHERE or end)
-      const setRe = /\bset\b/i.exec(cleanedStmt);
-      if (setRe) {
-        const stmtAbsStart = doc.getText().indexOf(cleanedStmt);
-        const setRegionStart = setRe.index + setRe[0].length;
-        // find end-of-assignments: first FROM or WHERE after SET
-        const tailAfterSet = cleanedStmt.slice(setRegionStart);
-        const tailEndMatch = /\b(from|where)\b/i.exec(tailAfterSet);
-        const setRegionEnd = tailEndMatch ? (setRegionStart + tailEndMatch.index) : cleanedStmt.length;
-        const assignsText = cleanedStmt.slice(setRegionStart, setRegionEnd);
-
-        // find left-hand targets like: [alias.]colname  (capture possibly qualified left-side)
-        const lhsRe = /([A-Za-z0-9_\[\]"`\.]+(?:\.[A-Za-z0-9_\[\]"`\.]+)*)\s*=/g;
-        let m: RegExpExecArray | null;
-        const hoverOffset = doc.offsetAt(range.start);
-        let hoverIsOnLeftSide = false;
-        let matchedLeftToken: string | null = null;
-
-        while ((m = lhsRe.exec(assignsText)) !== null) {
-          const leftTok = m[1]; // raw left token in assignment
-          const leftStartInAssign = m.index;
-          const leftAbsStart = stmtAbsStart + setRegionStart + leftStartInAssign;
-          const leftAbsEnd = leftAbsStart + leftTok.length;
-          if (hoverOffset >= leftAbsStart && hoverOffset <= leftAbsEnd) {
-            hoverIsOnLeftSide = true;
-            matchedLeftToken = leftTok;
-            break;
-          }
+          dbg('Alias target found in localTableMap but skipped as non-local', mappedNorm, localMapped && localMapped.name);
         }
 
-        if (hoverIsOnLeftSide) {
-          // canonicalize matched left token (strip brackets/quotes, split qualifier if present)
-          const matchedLeftStripped = stripBrackets(String(matchedLeftToken)).trim();
-          const leftIsQualified = matchedLeftStripped.includes(".");
-          const leftQualifier = leftIsQualified ? matchedLeftStripped.split(".").slice(0, -1).join(".") : null;
-
-          // only prefer update target for the left-side match if hovered token corresponds to that LHS column
-          // (i.e. either hovered token equals the LHS column or hoveredQualifier matches LHS qualifier)
-          const lhsColToken = leftIsQualified ? matchedLeftStripped.split(".").pop()! : matchedLeftStripped;
-          const lhsColNorm = normalizeName(lhsColToken);
-
-          const hoverMatchesLhs = (normalizeName(hoveredColumnToken) === lhsColNorm) ||
-            (!hoveredQualifier && normalizeName(hoveredColumnToken) === lhsColNorm) ||
-            (hoveredQualifier && leftQualifier && hoveredQualifier.replace(/^\[|\]$/g, "").toLowerCase() === leftQualifier.replace(/^\[|\]$/g, "").toLowerCase());
-
-          if (hoverMatchesLhs) {
-            // build update target keys
-            const updateTargetKeys = tableKeyCandidates(resolvedUpdateTargetRaw.replace(/^dbo\./i, ""));
-
-            // prefer local first (only if it's a genuine local entry)
-            for (const k of updateTargetKeys) {
-              const local = localTableMap.get(k);
-              if (local && local.columns) {
-                const foundLocal = (local.columns || []).find(cc => normalizeName(cc.name) === wordNorm);
-                if (foundLocal) {
-                  const md = `**Column** \`${foundLocal.name}\`${foundLocal.type ? ` ${foundLocal.type}` : ""} in local table \`${local.name}\``;
-                  dbg('UPDATE-SET-left matched local target:', md);
-                  return { contents: { kind: MarkupKind.Markdown, value: md }, range } as Hover;
-                }
-              }
-            }
-
-            // then prefer catalog
-            for (const k of updateTargetKeys) {
-              const def = tablesByName.get(k);
-              if (def && def.columns) {
-                const foundDef = (def.columns as any[]).find(cc =>
-                  (cc.rawName ?? cc.name) === hoveredColumnToken ||
-                  normalizeName(cc.name) === wordNorm
-                );
-                if (foundDef) {
-                  const md = `**Column** \`${foundDef.rawName ?? foundDef.name}\`${foundDef.type ? ` ${foundDef.type}` : ""} in table \`${def.rawName ?? def.name}\``;
-                  dbg('UPDATE-SET-left matched catalog target:', md);
-                  return { contents: { kind: MarkupKind.Markdown, value: md }, range } as Hover;
-                }
-              }
-            }
-            // if not found on update target, fall through to normal logic
-          }
-        }
-      }
-    }
-  } catch (e) {
-    dbg('UPDATE-SET-left small-fix error:', e);
-    // swallow and continue
-  }
-
-
-  // 5) Candidate-only column lookup (search only in candidate tables discovered in statement)
-  if (candidateTables.size > 0) {
-    const matches: string[] = [];
-    const seenSourceKeys = new Set<string>(); // dedupe by canonical table identity
-
-    // collect matches across all candidate tables (do NOT short-circuit on first candidate)
-    for (const rawTname of Array.from(candidateTables)) {
-      const cleanedCandidateToken = String(rawTname).trim();
-
-      // 1) consider local map if token is local-style
-      if (isRawTokenLocal(cleanedCandidateToken)) {
-        const local = localTableMap.get(cleanedCandidateToken);
-        if (local && local.columns) {
-          for (const col of local.columns) {
-            if (normalizeName(col.name) === wordNorm) {
-              // canonical source key for local = local.name (preserve as-is)
-              const sourceKey = String(local.name || cleanedCandidateToken).toLowerCase();
-              if (!seenSourceKeys.has(sourceKey)) {
-                matches.push(`${col.name}${col.type ? ` ${col.type}` : ""} in local table ${local.name}`);
-                seenSourceKeys.add(sourceKey);
-                dbg('Local table column match (candidate):', cleanedCandidateToken, local.name, col.name);
-              } else {
-                dbg('Skipping duplicate local match for same source:', sourceKey);
-              }
-              break; // matched column in this local table
-            }
-          }
-        } else {
-          dbg('Candidate token looked local but no entry in localTableMap for:', cleanedCandidateToken);
-        }
-      }
-
-      // 2) fallback to catalog: try each table-key variant for the candidate token
-      const candKeys = tableKeyCandidates(cleanedCandidateToken);
-      for (const k of candKeys) {
-        let def = tablesByName.get(k);
+        // Fall back to catalog/global index lookup
+        let def = tablesByName.get(mappedNorm);
         let defIsType = false;
         if (!def) {
-          const tdef = tableTypesByName.get(k);
-          if (tdef) { defIsType = true; def = tdef; }
-        }
-        if (!def || !def.columns) {
-          dbg('No catalog table or columns for candidate key:', k);
-          continue;
+          def = tableTypesByName.get(mappedNorm);
+          if (def) { defIsType = true; }
         }
 
-        for (const col of def.columns) {
-          if ((col.rawName ?? col.name) === hoveredColumnToken || normalizeName(col.name || col.rawName || "") === wordNorm) {
-            // canonical source key for catalog table: prefer rawName if present, else name
-            const canonicalName = String(def.rawName ?? def.name).trim();
-            const sourceKey = canonicalName.toLowerCase();
-            if (!seenSourceKeys.has(sourceKey)) {
-              const containerLabel = defIsType ? `table type ${def.rawName ?? def.name}` : `table ${def.rawName ?? def.name}`;
-              matches.push(`${col.rawName ?? col.name}${col.type ? ` ${col.type}` : ""} in ${containerLabel}`);
-              seenSourceKeys.add(sourceKey);
-              dbg('Catalog table column match (candidate):', k, col.rawName ?? col.name, containerLabel);
-            } else {
-              dbg('Skipping duplicate catalog match for same source:', sourceKey);
+        if (def) {
+          if (!isQualifiedToken) {
+            const rows: string[] = [];
+            if (def.columns && Array.isArray(def.columns)) {
+              for (const c of def.columns) {
+                const cname = c.rawName ?? c.name;
+                const ctype = c.type ? ` ${c.type}` : "";
+                rows.push(`- \`${cname}\`${ctype}`);
+              }
             }
-            break; // stop scanning columns for this table def
+            const header = defIsType
+              ? `**Alias** \`${rawWordDisplay}\` → table type \`${def.rawName ?? def.name}\``
+              : `**Alias** \`${rawWordDisplay}\` → table \`${def.rawName ?? def.name}\``;
+            const body = `${header}\n\n${rows.join("\n")}`;
+            dbg('Catalog table alias hover:', def.name, rows);
+            return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
+          } else {
+            dbg('Skipping alias-as-table hover because token is qualified; def exists:', mappedNorm);
+          }
+        } else {
+          dbg('No catalog table for alias target:', mappedNorm);
+        }
+      }
+    } catch (e) {
+      dbg('Alias resolution error:', e);
+    }
+
+    // 4) alias.column explicit handling (resolve alias -> target, prefer local table map)
+    try {
+      const aliasInfo = resolveAlias(rawWord, doc, pos);
+      if (aliasInfo && aliasInfo.table && aliasInfo.column) {
+        let resolvedTarget: string | null = null;
+        let resolvedRaw: string | null = null;
+        try {
+          const mapped = resolveAliasTarget(cleanedStmt || "", normalizeName(String(aliasInfo.table)));
+          if (mapped) {
+            resolvedTarget = mapped;
+            resolvedRaw = normalizeName(String(mapped));
+            dbg('Alias.column resolution (cleanedStmt):', { table: aliasInfo.table, column: aliasInfo.column, resolvedTarget, resolvedRaw });
+          } else {
+            const fullText = doc.getText();
+            const fullTextCleaned = fullText.replace(/WITH\s*\((?:NOLOCK|READUNCOMMITTED|UPDLOCK|HOLDLOCK|ROWLOCK|FORCESEEK|INDEX\([^)]*\)|FASTFIRSTROW|XLOCK|REPEATABLEREAD|SERIALIZABLE|,)+?\s*\)/gi, ' ');
+            const mappedFull = resolveAliasTarget(fullTextCleaned, normalizeName(String(aliasInfo.table)));
+            if (mappedFull) {
+              resolvedTarget = mappedFull;
+              resolvedRaw = normalizeName(String(mappedFull));
+              dbg('Alias.column resolution (fullText):', { table: aliasInfo.table, column: aliasInfo.column, resolvedTarget, resolvedRaw });
+            } else {
+              resolvedTarget = String(aliasInfo.table);
+              resolvedRaw = normalizeName(String(aliasInfo.table));
+              dbg('Alias.column resolution (fallback to table):', { table: aliasInfo.table, column: aliasInfo.column, resolvedTarget, resolvedRaw });
+            }
+          }
+        } catch (e) {
+          resolvedTarget = String(aliasInfo.table);
+          resolvedRaw = normalizeName(String(aliasInfo.table));
+          dbg('Alias.column target resolution error:', e, { resolvedTarget, resolvedRaw });
+        }
+
+        const aliasTableKey = normalizeName(String(resolvedTarget).replace(/^dbo\./i, ""));
+
+        // Only accept local table if the local entry is genuinely local-ish
+        if (isRawTokenLocal(resolvedRaw)) {
+          const localTable = localTableMap.get(aliasTableKey);
+          if (localTable && isLocalEntryValid(localTable, resolvedRaw) && localTable.columns) {
+            const aliasColNorm = aliasInfo.column ? normalizeName(aliasInfo.column) : null;
+            const cLocal = (localTable.columns || []).find(cc => normalizeName(cc.name) === aliasColNorm);
+            if (cLocal) {
+              const value = `**Column** \`${cLocal.name}\`${cLocal.type ? ` ${cLocal.type}` : ""} in local table \`${localTable.name}\``;
+              dbg('Local table column hover:', value);
+              return {
+                contents: { kind: MarkupKind.Markdown, value },
+                range
+              } as Hover;
+            }
+            dbg('No matching column in local table:', aliasTableKey, aliasColNorm);
+          } else {
+            dbg('Local alias target found but not a genuine local table entry:', aliasTableKey);
           }
         }
-        // continue to other candidate keys (we want matches from other tables too)
-      }
-      // continue scanning next candidate table token
-    }
 
-    if (matches.length === 1) {
-      dbg('Single column match (candidates):', matches[0]);
-      return { contents: { kind: MarkupKind.Markdown, value: `**Column** ${matches[0]}` }, range } as Hover;
-    } else if (matches.length > 1) {
-      dbg('Ambiguous column matches (candidates):', matches);
-      return { contents: { kind: MarkupKind.Markdown, value: `**Column** \`${hoveredColumnToken}\` (ambiguous — found in: ${matches.join(", ")})` }, range } as Hover;
-    }
-    dbg('No column matches found in candidate tables for:', wordNorm);
-  } else {
-    dbg('No candidate tables found');
-  }
-
-  // 6) Heuristic: if statement is UPDATE prefer its target
-  try {
-    const updateMatch = /\bupdate\s+([a-zA-Z0-9_\[\]\.]+)/i.exec(cleanedStmt);
-    if (updateMatch && updateMatch[1]) {
-      const rawUpdateMatch = stripBrackets(updateMatch[1]);
-      const tnorm = normalizeName(rawUpdateMatch.replace(/^dbo\./i, ""));
-      const rawUpdateTarget = rawUpdateMatch;
-      dbg('UPDATE target:', { raw: rawUpdateTarget, normalized: tnorm });
-
-      if (isRawTokenLocal(rawUpdateTarget)) {
-        const local = localTableMap.get(tnorm);
-        if (local && isLocalEntryValid(local, rawUpdateTarget) && local.columns) {
-          const colDefLocal = local.columns.find(c => normalizeName(c.name) === wordNorm);
-          if (colDefLocal) {
-            const value = `**Column** \`${colDefLocal.name}\`${colDefLocal.type ? ` ${colDefLocal.type}` : ""} in local table \`${local.name}\``;
-            dbg('UPDATE local table column hover:', value);
+        let def = tablesByName.get(aliasTableKey);
+        let defIsType = false;
+        if (!def) {
+          const tdef = tableTypesByName.get(aliasTableKey);
+          if (tdef) { defIsType = true; def = tdef; }
+        }
+        if (def && def.columns) {
+          const aliasColNorm = aliasInfo.column ? normalizeName(aliasInfo.column) : null;
+          const c = (def.columns as any[]).find(cc =>
+            (cc.rawName ?? cc.name) === aliasInfo.column ||
+            (aliasColNorm !== null && normalizeName(cc.name) === aliasColNorm)
+          );
+          if (c) {
+            const containerLabel = defIsType ? `table type \`${def.rawName ?? def.name}\`` : `table \`${def.rawName ?? def.name}\``;
+            const value = `**Column** \`${c.rawName ?? c.name}\`${c.type ? ` ${c.type}` : ""} in ${containerLabel}`;
+            dbg('Catalog table column hover:', value);
             return {
-              contents: {
-                kind: MarkupKind.Markdown,
-                value
-              },
+              contents: { kind: MarkupKind.Markdown, value },
               range
             } as Hover;
           }
-          dbg('No matching column in UPDATE local table:', tnorm, wordNorm);
+          dbg('No matching column in catalog table:', aliasTableKey, aliasColNorm);
         }
       }
-
-      const def = tablesByName.get(tnorm);
-      if (def && def.columns) {
-        const colDef = (def.columns as any[]).find(c => normalizeName((c.name || c.rawName || "")) === wordNorm);
-        if (colDef) {
-          const value = `**Column** \`${colDef.rawName ?? colDef.name}\`${colDef.type ? ` ${colDef.type}` : ""} in table \`${def.rawName ?? def.name}\``;
-          dbg('UPDATE catalog table column hover:', value);
-          return {
-            contents: {
-              kind: MarkupKind.Markdown,
-              value
-            },
-            range
-          } as Hover;
-        }
-        dbg('No matching column in UPDATE catalog table:', tnorm, wordNorm);
-      }
-    } else {
-      dbg('No UPDATE target found in statement');
+    } catch (e) {
+      dbg('Alias.column resolution error:', e);
     }
-  } catch (e) {
-    dbg('UPDATE heuristic error:', e);
-  }
 
-  dbg('No hover result for:', rawWord);
-  return null;
+    // --- Small fix: prefer UPDATE target ONLY when hover is on the left side of a SET assignment ---
+    try {
+      const updateMatch = /\bupdate\s+([@#]?[A-Za-z0-9_\[\]\."]+)(?:\s+(?:as\s+)?([A-Za-z0-9_]+))?/i.exec(cleanedStmt);
+      if (updateMatch && updateMatch[1]) {
+        const updateTokenRaw = normalizeName(updateMatch[1]);
+        const updateAliasFromClause = updateMatch[2] ? normalizeName(updateMatch[2]) : null;
+
+        // try to resolve alias->table for update token
+        let resolvedUpdateTargetRaw = updateTokenRaw;
+        try {
+          const resolved = resolveAliasTarget(cleanedStmt || "", updateTokenRaw);
+          if (resolved) { resolvedUpdateTargetRaw = normalizeName(String(resolved)); }
+        } catch { /* ignore */ }
+
+        const setRe = /\bset\b/i.exec(cleanedStmt);
+        if (setRe) {
+          const stmtAbsStart = doc.getText().indexOf(cleanedStmt);
+          const setRegionStart = setRe.index + setRe[0].length;
+          const tailAfterSet = cleanedStmt.slice(setRegionStart);
+          const tailEndMatch = /\b(from|where)\b/i.exec(tailAfterSet);
+          const setRegionEnd = tailEndMatch ? (setRegionStart + tailEndMatch.index) : cleanedStmt.length;
+          const assignsText = cleanedStmt.slice(setRegionStart, setRegionEnd);
+
+          const lhsRe = /([A-Za-z0-9_\[\]"`\.]+(?:\.[A-Za-z0-9_\[\]"`\.]+)*)\s*=/g;
+          let m: RegExpExecArray | null;
+          const hoverOffset = doc.offsetAt(range.start);
+          let hoverIsOnLeftSide = false;
+          let matchedLeftToken: string | null = null;
+
+          while ((m = lhsRe.exec(assignsText)) !== null) {
+            const leftTok = m[1];
+            const leftStartInAssign = m.index;
+            const leftAbsStart = stmtAbsStart + setRegionStart + leftStartInAssign;
+            const leftAbsEnd = leftAbsStart + leftTok.length;
+            if (hoverOffset >= leftAbsStart && hoverOffset <= leftAbsEnd) {
+              hoverIsOnLeftSide = true;
+              matchedLeftToken = leftTok;
+              break;
+            }
+          }
+
+          if (hoverIsOnLeftSide && matchedLeftToken) {
+            const matchedLeftStripped = normalizeName(String(matchedLeftToken)).trim();
+            const leftIsQualified = matchedLeftStripped.includes(".");
+            const leftQualifier = leftIsQualified ? matchedLeftStripped.split(".").slice(0, -1).join(".") : null;
+            const lhsColToken = leftIsQualified ? matchedLeftStripped.split(".").pop()! : matchedLeftStripped;
+            const lhsColNorm = normalizeName(lhsColToken);
+
+            const hoverMatchesLhs = (normalizeName(hoveredColumnToken) === lhsColNorm) ||
+              (!hoveredQualifier && normalizeName(hoveredColumnToken) === lhsColNorm) ||
+              (hoveredQualifier && leftQualifier && normalizeName(hoveredQualifier) === normalizeName(leftQualifier));
+
+            if (hoverMatchesLhs) {
+              const updateTargetKeys = tableKeyCandidates(resolvedUpdateTargetRaw.replace(/^dbo\./i, ""));
+              // prefer local first
+              for (const k of updateTargetKeys) {
+                const local = localTableMap.get(k);
+                if (local && local.columns) {
+                  const foundLocal = (local.columns || []).find(cc => normalizeName(cc.name) === wordNorm);
+                  if (foundLocal) {
+                    const md = `**Column** \`${foundLocal.name}\`${foundLocal.type ? ` ${foundLocal.type}` : ""} in local table \`${local.name}\``;
+                    dbg('UPDATE-SET-left matched local target:', md);
+                    return { contents: { kind: MarkupKind.Markdown, value: md }, range } as Hover;
+                  }
+                }
+              }
+              // then prefer catalog
+              for (const k of updateTargetKeys) {
+                const def = tablesByName.get(k);
+                if (def && def.columns) {
+                  const foundDef = (def.columns as any[]).find(cc =>
+                    (cc.rawName ?? cc.name) === hoveredColumnToken ||
+                    normalizeName(cc.name) === wordNorm
+                  );
+                  if (foundDef) {
+                    const md = `**Column** \`${foundDef.rawName ?? foundDef.name}\`${foundDef.type ? ` ${foundDef.type}` : ""} in table \`${def.rawName ?? def.name}\``;
+                    dbg('UPDATE-SET-left matched catalog target:', md);
+                    return { contents: { kind: MarkupKind.Markdown, value: md }, range } as Hover;
+                  }
+                }
+              }
+            }
+          }
+        }
+      } else {
+        dbg('No UPDATE target found in statement');
+      }
+    } catch (e) {
+      dbg('UPDATE-SET-left small-fix error:', e);
+    }
+
+    // 5) Candidate-only column lookup (search only in candidate tables discovered in statement)
+    if (candidateTables.size > 0) {
+      const matches: string[] = [];
+      const seenSourceKeys = new Set<string>(); // dedupe by canonical table identity
+
+      for (const rawTname of Array.from(candidateTables)) {
+        const candidateNorm = normalizeName(String(rawTname).trim());
+
+        // 1) consider local map if token is local-style
+        if (isRawTokenLocal(candidateNorm)) {
+          const local = localTableMap.get(candidateNorm);
+          if (local && local.columns) {
+            for (const col of local.columns) {
+              if (normalizeName(col.name) === wordNorm) {
+                const sourceKey = String(local.name || candidateNorm).toLowerCase();
+                if (!seenSourceKeys.has(sourceKey)) {
+                  matches.push(`${col.name}${col.type ? ` ${col.type}` : ""} in local table ${local.name}`);
+                  seenSourceKeys.add(sourceKey);
+                  dbg('Local table column match (candidate):', candidateNorm, local.name, col.name);
+                } else {
+                  dbg('Skipping duplicate local match for same source:', sourceKey);
+                }
+                break;
+              }
+            }
+          } else {
+            dbg('Candidate token looked local but no entry in localTableMap for:', candidateNorm);
+          }
+        }
+
+        // 2) fallback to catalog: try each table-key variant for the candidate token
+        const candKeys = tableKeyCandidates(candidateNorm);
+        for (const k of candKeys) {
+          let def = tablesByName.get(k);
+          let defIsType = false;
+          if (!def) {
+            const tdef = tableTypesByName.get(k);
+            if (tdef) { defIsType = true; def = tdef; }
+          }
+          if (!def || !def.columns) {
+            dbg('No catalog table or columns for candidate key:', k);
+            continue;
+          }
+
+          for (const col of def.columns) {
+            if ((col.rawName ?? col.name) === hoveredColumnToken || normalizeName(col.name || col.rawName || "") === wordNorm) {
+              const canonicalName = String(def.rawName ?? def.name).trim();
+              const sourceKey = canonicalName.toLowerCase();
+              if (!seenSourceKeys.has(sourceKey)) {
+                const containerLabel = defIsType ? `table type ${def.rawName ?? def.name}` : `table ${def.rawName ?? def.name}`;
+                matches.push(`${col.rawName ?? col.name}${col.type ? ` ${col.type}` : ""} in ${containerLabel}`);
+                seenSourceKeys.add(sourceKey);
+                dbg('Catalog table column match (candidate):', k, col.rawName ?? col.name, containerLabel);
+              } else {
+                dbg('Skipping duplicate catalog match for same source:', sourceKey);
+              }
+              break;
+            }
+          }
+        }
+      }
+
+      if (matches.length === 1) {
+        dbg('Single column match (candidates):', matches[0]);
+        return { contents: { kind: MarkupKind.Markdown, value: `**Column** ${matches[0]}` }, range } as Hover;
+      } else if (matches.length > 1) {
+        dbg('Ambiguous column matches (candidates):', matches);
+        return { contents: { kind: MarkupKind.Markdown, value: `**Column** \`${hoveredColumnToken}\` (ambiguous — found in: ${matches.join(", ")})` }, range } as Hover;
+      }
+      dbg('No column matches found in candidate tables for:', wordNorm);
+    } else {
+      dbg('No candidate tables found');
+    }
+
+    // 6) Heuristic: if statement is UPDATE prefer its target (final pass)
+    try {
+      const updateMatch = /\bupdate\s+([a-zA-Z0-9_\[\]\."]+)/i.exec(cleanedStmt);
+      if (updateMatch && updateMatch[1]) {
+        const rawUpdateMatch = normalizeName(updateMatch[1]);
+        const tnorm = normalizeName(rawUpdateMatch.replace(/^dbo\./i, ""));
+        const rawUpdateTarget = rawUpdateMatch;
+        dbg('UPDATE target:', { raw: rawUpdateTarget, normalized: tnorm });
+
+        if (isRawTokenLocal(rawUpdateTarget)) {
+          const local = localTableMap.get(tnorm);
+          if (local && isLocalEntryValid(local, rawUpdateTarget) && local.columns) {
+            const colDefLocal = (local.columns || []).find(c => normalizeName(c.name) === wordNorm);
+            if (colDefLocal) {
+              const value = `**Column** \`${colDefLocal.name}\`${colDefLocal.type ? ` ${colDefLocal.type}` : ""} in local table \`${local.name}\``;
+              dbg('UPDATE local table column hover:', value);
+              return { contents: { kind: MarkupKind.Markdown, value }, range } as Hover;
+            }
+            dbg('No matching column in UPDATE local table:', tnorm, wordNorm);
+          }
+        }
+
+        const def = tablesByName.get(tnorm);
+        if (def && def.columns) {
+          const colDef = (def.columns as any[]).find(c => normalizeName((c.name || c.rawName || "")) === wordNorm);
+          if (colDef) {
+            const value = `**Column** \`${colDef.rawName ?? colDef.name}\`${colDef.type ? ` ${colDef.type}` : ""} in table \`${def.rawName ?? def.name}\``;
+            dbg('UPDATE catalog table column hover:', value);
+            return { contents: { kind: MarkupKind.Markdown, value }, range } as Hover;
+          }
+          dbg('No matching column in UPDATE catalog table:', tnorm, wordNorm);
+        }
+      } else {
+        dbg('No UPDATE target found in statement');
+      }
+    } catch (e) {
+      dbg('UPDATE heuristic error:', e);
+    }
+
+    dbg('No hover result for:', rawWordDisplay);
+    return null;
+  } catch (ex) {
+    dbg('doHover top-level error:', ex);
+    return null;
+  }
 }
 
 // Full validator with @-skip and SELECT-alias skip
@@ -1228,21 +1222,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
     while ((cm = cursorRegex.exec(text))) { cursors.add(cm[1].toLowerCase()); }
   }
 
-  // helper: split top-level comma list (ignore commas inside parentheses)
-  function splitTopLevelCommas(s: string) {
-    const parts: string[] = [];
-    let cur = "";
-    let depth = 0;
-    for (let i = 0; i < s.length; i++) {
-      const ch = s[i];
-      if (ch === "(") { depth++; cur += ch; continue; }
-      if (ch === ")") { if (depth > 0) { depth--; } cur += ch; continue; }
-      if (ch === "," && depth === 0) { parts.push(cur); cur = ""; continue; }
-      cur += ch;
-    }
-    if (cur.trim() !== "") { parts.push(cur); }
-    return parts.map(p => p.trim()).filter(Boolean);
-  }
+  
 
   // iterate over lines
   for (let i = 0; i < lines.length; i++) {
@@ -1487,241 +1467,305 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
 
 // ---------- Helpers ----------
 function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Position): Location[] {
-  const word = normalizeName(rawWord);
-  const fullText = doc.getText();
-  const results: Location[] = [];
-  const seen = new Set<string>(); // dedupe key: uri|line|start|end
+  // Quick guard
+  if (!rawWord || rawWord.trim().length === 0) { return []; }
 
-  // small helpers
-  const pushLoc = (uri: string, line: number, start: number, end: number) => {
-    const key = `${uri}:${line}:${start}:${end}`;
+  // Helpers
+  const stripBrackets = (s: string) => String(s).replace(/^\[|\]$/g, "");
+  const normalizeKey = (s: string) => normalizeName(stripBrackets(String(s)));
+  const rawNorm = normalizeKey(rawWord);
+
+  // Don't attempt to find references for keywords
+  if (isSqlKeyword(rawNorm)) { return []; }
+
+  const fullText = doc.getText();
+  const stmtText = position ? getCurrentStatement(doc, position) || fullText : fullText;
+
+  const results: Location[] = [];
+  const seen = new Set<string>(); // uri:line:start:end
+
+  const pushLocFromRef = (r: { uri: string; line: number; start: number; end: number }) => {
+    const key = `${r.uri}:${r.line}:${r.start}:${r.end}`;
     if (seen.has(key)) { return; }
     seen.add(key);
     results.push({
-      uri: uri,
+      uri: r.uri,
       range: {
-        start: { line, character: start },
-        end: { line, character: end }
+        start: { line: r.line, character: r.start },
+        end: { line: r.line, character: r.end }
       }
     });
   };
 
-  // --- quick guards ---
-  if (!rawWord || rawWord.trim().length === 0) { return []; }
+  // ---------
+  // Utility: collect candidate tables from statement with knowledge of role
+  // Returns: {sources: string[], targets: string[], all: string[]}
+  // - sources: tables used in FROM/JOIN/USING/SELECT sources
+  // - targets: tables that are targets (INSERT INTO, UPDATE, DELETE FROM, MERGE INTO, SELECT INTO)
+  // - all: union of normalized table names
+  // ---------
+  function collectScopedTables(stmt: string): { sources: string[]; targets: string[]; all: string[] } {
+    const src = new Set<string>();
+    const tgt = new Set<string>();
 
-  // treat SQL keywords as not-referenceable
-  if (isSqlKeyword(normalizeName(rawWord).replace(/^\[|\]$/g, ""))) { return []; }
+    // normalize candidate and push helpers
+    const addSource = (raw: string) => { const n = normalizeKey(raw.replace(/^dbo\./i, "")); if (n) { src.add(n); } };
+    const addTarget = (raw: string) => { const n = normalizeKey(raw.replace(/^dbo\./i, "")); if (n) { tgt.add(n); } };
 
-  // If a position is provided, build some local context we reuse
-  const stmtText = position ? getCurrentStatement(doc, position) || fullText : fullText;
+    // Regexes to capture different clauses. We keep them conservative and tolerant of brackets/quotes/aliases.
+    // FROM/JOIN/USING: capture table or subquery alias (we only record the table token part)
+    const fromJoinRegex = /\b(?:from|join|apply|using)\s+([A-Za-z0-9_\[\]"\.]+)(?:\s+(?:as\s+)?([A-Za-z0-9_\[\]"]+))?/gi;
+    // INSERT INTO / INSERT ... INTO / SELECT ... INTO target
+    const insertIntoRegex = /\binsert\s+(?:into\s+)?([A-Za-z0-9_\[\]"\.]+)\b/gi;
+    const selectIntoRegex = /\bselect\b[\s\S]*?\binto\s+([A-Za-z0-9_\[\]"\.]+)\b/gi; // may match SELECT ... INTO target
+    // UPDATE <table>
+    const updateRegex = /\bupdate\s+([A-Za-z0-9_\[\]"\.]+)\b/gi;
+    // DELETE FROM <table>
+    const deleteRegex = /\bdelete\s+(?:from\s+)?([A-Za-z0-9_\[\]"\.]+)\b/gi;
+    // MERGE INTO <table>
+    const mergeRegex = /\bmerge\s+into\s+([A-Za-z0-9_\[\]"\.]+)\b/gi;
+    // OUTPUT INTO <table>
+    const outputIntoRegex = /\boutput\s+into\s+([A-Za-z0-9_\[\]"\.]+)\b/gi;
 
-  // ----------------------
-  // 1) Parameter handling (prefer parameters exactly like hover)
-  // ----------------------
-  // If the token looks like a param (@name) — prefer param map and return param occurrences in the same proc body.
-  if (rawWord.startsWith("@")) {
-    try {
-      if (position) {
-        const paramMap = buildParamMapForDocAtPos(doc, position); // Map<nameLower, type>
-        const key = rawWord.toLowerCase();
-        if (paramMap.has(key)) {
-          // Find occurrences of the exact token in the enclosing body/statement (best-effort)
-          // Use a simple regex to find @param boundaries
-          const body = stmtText;
-          const re = new RegExp(`\\b${rawWord.replace(/\[/g, "\\[").replace(/\]/g, "\\]")}\\b`, "g");
-          let m: RegExpExecArray | null;
-          // compute offset of stmtText within fullText when position provided
-          let stmtOffset = 0;
-          if (position) {
-            const stmtFull = getCurrentStatement(doc, position) || fullText;
-            stmtOffset = fullText.indexOf(stmtFull);
-            if (stmtOffset < 0) { stmtOffset = 0; }
-          }
-          while ((m = re.exec(body))) {
-            // compute line/char from offset
-            const abs = stmtOffset + (m.index || 0);
-            const p = offsetAt(doc, Position.create(0, 0)); // we will compute via offsetAt helper below
-            // compute line/character using offset -> position util already in project
-            const pos = offsetAtPositionFromOffset(doc, abs); // defined below
-            pushLoc(doc.uri, pos.line, pos.character, pos.character + (m[0]?.length || rawWord.length));
-          }
-          // If we found matches, return them
-          if (results.length > 0) { return results; }
-        }
-        // If token is param but not in paramMap, do not fall back to column resolution (avoid mis-classification)
-        // This mirrors hover's behavior of preferring parameters.
-      }
-    } catch (e) {
-      // swallow — best-effort only
+    let m: RegExpExecArray | null;
+    while ((m = fromJoinRegex.exec(stmt))) {
+      // m[1] is table token (may be schema.table). If it's a subquery "(" ignore.
+      const token = (m[1] || "").trim();
+      if (!token) { continue; }
+      if (token.startsWith("(")) { continue; }
+      addSource(token);
     }
+
+    while ((m = insertIntoRegex.exec(stmt))) {
+      const token = (m[1] || "").trim();
+      if (!token) { continue; }
+      addTarget(token);
+    }
+
+    while ((m = selectIntoRegex.exec(stmt))) {
+      const token = (m[1] || "").trim();
+      if (!token) { continue; }
+      addTarget(token);
+    }
+
+    while ((m = updateRegex.exec(stmt))) {
+      const token = (m[1] || "").trim();
+      if (!token) { continue; }
+      addTarget(token);
+    }
+
+    while ((m = deleteRegex.exec(stmt))) {
+      const token = (m[1] || "").trim();
+      if (!token) { continue; }
+      addTarget(token);
+    }
+
+    while ((m = mergeRegex.exec(stmt))) {
+      const token = (m[1] || "").trim();
+      if (!token) { continue; }
+      addTarget(token);
+    }
+
+    while ((m = outputIntoRegex.exec(stmt))) {
+      const token = (m[1] || "").trim();
+      if (!token) { continue; }
+      addTarget(token);
+    }
+
+    // Also look for "INTO <table>" occurrences (covers some patterns)
+    const intoRegex = /\binto\s+([A-Za-z0-9_\[\]"\.]+)\b/gi;
+    while ((m = intoRegex.exec(stmt))) {
+      const token = (m[1] || "").trim();
+      if (!token) { continue; }
+      addTarget(token);
+    }
+
+    // union all
+    const all = new Set<string>([...src, ...tgt]);
+    return {
+      sources: Array.from(src),
+      targets: Array.from(tgt),
+      all: Array.from(all)
+    };
   }
 
-  // ----------------------
-  // 2) Qualified form: alias.table or schema.table.column
-  // ----------------------
+  // --------------------------
+  // 1) Qualified forms (schema.table.column, table.column, alias.col)
+  // --------------------------
   if (rawWord.includes(".")) {
-    const parts = rawWord.split(".");
-    // handle simple alias.col or table.col (only 2-part) — prefer alias resolution in current statement
-    if (parts.length === 2 && position) {
-      const aliasTok = parts[0].replace(/^\[|\]$/g, "");
-      const colTok = normalizeName(parts[1]);
+    const partsRaw = rawWord.split(".");
+    // 1.a handle common alias.col pattern preferentially (if we have position and can extract aliases)
+    if (partsRaw.length === 2 && position) {
+      const aliasRaw = stripBrackets(partsRaw[0]);
+      const aliasNorm = normalizeKey(aliasRaw);
+      const colNorm = normalizeKey(partsRaw[1]);
+
       try {
-        // try statement-local alias resolution first
-        const mapped = resolveAliasTarget(stmtText, aliasTok); // may return table name or null
-        if (mapped) {
-          const normTable = normalizeName(mapped);
-          const locs = findColumnInTable(normTable, colTok);
-          for (const l of locs) { pushLoc(l.uri, l.range.start.line, l.range.start.character, l.range.end.character); }
+        const aliases = extractAliases(stmtText); // expected Map<string,string> or similar
+        const mappedTable = aliases.get(aliasNorm) ?? aliases.get(aliasRaw.toLowerCase());
+        if (mappedTable) {
+          const key = `${normalizeKey(mappedTable)}.${colNorm}`;
+          const refs = getRefs(key);
+          for (const r of refs) { pushLocFromRef(r); }
           if (results.length > 0) { return results; }
         }
-
-        // fallback: if alias not found, maybe the token is schema.table or table.column — try getRefs/findColumnInTable
-        // try full normalized key
-        const lastTwo = `${normalizeName(parts[parts.length - 2])}.${normalizeName(parts[parts.length - 1])}`;
-        const refs = getRefs(lastTwo);
-        for (const r of refs) {
-          pushLoc(r.uri, r.line, r.start, r.end);
-        }
-        if (results.length > 0) { return results; }
-      } catch { /* best-effort */ }
-    } else {
-      // For longer dotted forms, try exact table/object lookup from references index
-      const cleaned = rawWord.replace(/^\[|\]$/g, "").toLowerCase();
-      const refs = getRefs(cleaned);
-      for (const r of refs) { pushLoc(r.uri, r.line, r.start, r.end); }
-      if (results.length > 0) { return results; }
+      } catch (e) {
+        // best-effort alias resolution: fallback below
+      }
     }
+
+    // 1.b exact normalized key lookup (handles table.column and schema.table.column)
+    const cleanedNorm = normalizeKey(rawWord);
+    const direct = getRefs(cleanedNorm);
+    for (const r of direct) { pushLocFromRef(r); }
+    if (results.length > 0) { return results; }
+
+    // 1.c suffix fallback across index (any key ending with `.table.column` or exact match)
+    const suffix = cleanedNorm;
+    for (const [key, byUri] of referencesIndex.entries()) {
+      if (key === suffix || key.endsWith("." + suffix)) {
+        for (const arr of byUri.values()) {
+          for (const r of arr) { pushLocFromRef(r); }
+        }
+      }
+    }
+    return results;
   }
 
-  // ----------------------
-  // 3) Bare column resolution (prefer statement-scoped candidates, prefer locals)
-  // ----------------------
-  // If token has no dot and not a param
+  // --------------------------
+  // 2) Table exact match (global)
+  // --------------------------
+  {
+    const tableRefs = getRefs(rawNorm);
+    for (const r of tableRefs) { pushLocFromRef(r); }
+    if (results.length > 0) { return results; }
+  }
+
+  // --------------------------
+  // 3) Bare column resolution (improved scoping & ranking with INSERT/UPDATE/DELETE awareness)
+  // --------------------------
   if (!rawWord.includes(".") && !rawWord.startsWith("@")) {
     try {
-      // 3a) Collect candidate tables from the current statement (FROM/JOIN/INSERT/UPDATE/DELETE)
-      const candidateTables = Array.from(collectCandidateTablesFromStatement(stmtText) || []);
-      // 3b) Prefer local table (table variables / temp tables) if present
+      // collect candidate tables with role (sources vs targets)
+      const scoped = collectScopedTables(stmtText);
+      const candidateTables = scoped.all;         // all normalized candidates in statement
+      const targetTables = scoped.targets || [];  // destination tables (INSERT/UPDATE/DELETE/etc)
+      const sourceTables = scoped.sources || [];  // source tables (FROM/JOIN)
+
+      // build local map and partition into localPreferred vs remote
       const localMap = position ? buildLocalTableMapForDocAtPos(doc, position) : new Map<string, any>();
       const localPreferred: string[] = [];
       const remoteCandidates: string[] = [];
-
       for (const t of candidateTables) {
-        // normalize table key in same way as utils
-        const tnorm = t; // collectCandidateTablesFromStatement already normalized keys
-        if (isTokenLocalTable(tnorm, localMap as any)) {
-          localPreferred.push(tnorm);
-        } else {
-          remoteCandidates.push(tnorm);
-        }
+        if (isTokenLocalTable(t, localMap as any)) { localPreferred.push(t); }
+        else { remoteCandidates.push(t); }
       }
 
-      // helper to add refs for a table.key
-      const addRefsForTableCol = (tableKey: string, col: string) => {
-        const key = `${tableKey}.${col}`;
+      const addRefsForTableColKey = (tableKey: string, colNorm: string) => {
+        const key = `${tableKey}.${colNorm}`;
         const refs = getRefs(key);
-        for (const r of refs) { pushLoc(r.uri, r.line, r.start, r.end); }
+        if (refs && refs.length) {
+          for (const r of refs) { pushLocFromRef(r); }
+          return true;
+        }
+        return false;
       };
 
-      // check local preferred first
-      for (const t of localPreferred) { addRefsForTableCol(t, word); }
-      if (results.length > 0) { return results; }
+      // Priority A: If column is likely a target (e.g. UPDATE SET lhs, INSERT column list), prefer targets first.
+      // Heuristic: if stmt contains targetTables, check them first.
+      for (const t of targetTables) {
+        if (addRefsForTableColKey(t, rawNorm)) { return results; }
+      }
 
-      // then remote candidates
-      for (const t of remoteCandidates) { addRefsForTableCol(t, word); }
-      if (results.length > 0) {
-        // If there are multiple candidate tables, initiate an async AST parse to disambiguate for future lookups
-        if (candidateTables.length > 1 && position) {
-          (async () => {
-            try {
-              if (isAstPoolReady()) {
-                const ast = await parseSqlWithWorker(stmtText, { database: "transactsql" }, 500);
-                if (ast) {
-                  const resolved = resolveColumnFromAst(ast, word);
-                  if (resolved) {
-                    // resolved may be alias or table — map it via statement aliases or global
-                    const aliases = extractAliases(stmtText);
-                    const mapped = aliases.get(resolved.toLowerCase());
-                    const resolvedTable = mapped ? mapped : resolved;
-                    // Only update index if resolved is one of candidateTables
-                    const resolvedNorm = normalizeName(resolvedTable);
-                    if (candidateTables.includes(resolvedNorm)) {
-                      // We intentionally call findColumnInTable to get exact locations and then write them back into referencesIndex
-                      const found = findColumnInTable(resolvedNorm, word);
-                      // Merge into referencesIndex via setRefsForFile (indexText pattern handles merge)
-                      // We don't write directly here to avoid duplication; rely on existing index-time logic or
-                      // optionally you can add a small local merge similar to indexText logic.
-                      // (left as noop — parse result will help other async indexing jobs)
+      // Priority B: alias-resolved tables within statement (if any map to candidates)
+      try {
+        const aliases = extractAliases(stmtText);
+        for (const [alias, tableRef] of aliases.entries()) {
+          const tableNorm = normalizeKey(String(tableRef));
+          // if this alias maps to a candidate table, prefer it
+          if (candidateTables.includes(tableNorm)) {
+            if (addRefsForTableColKey(tableNorm, rawNorm)) { return results; }
+          }
+        }
+      } catch (e) { /* best-effort */ }
+
+      // Priority C: local preferred (temp / table vars / CTE)
+      for (const t of localPreferred) {
+        if (addRefsForTableColKey(t, rawNorm)) { return results; }
+      }
+
+      // Priority D: source tables from FROM/JOIN (remoteCandidates include these as well)
+      // But prefer explicit sourceTables first
+      for (const t of sourceTables) {
+        if (addRefsForTableColKey(t, rawNorm)) { return results; }
+      }
+
+      // Then try remoteCandidates (other statement tables)
+      for (const t of remoteCandidates) {
+        if (addRefsForTableColKey(t, rawNorm)) {
+          // Ambiguity handling: if multiple statement candidates existed and position provided,
+          // kick off a background AST disambiguation to improve future lookups.
+          if (candidateTables.length > 1 && position) {
+            (async () => {
+              try {
+                if (isAstPoolReady()) {
+                  const ast = await parseSqlWithWorker(stmtText, { database: "transactsql" }, 500);
+                  if (ast) {
+                    const resolved = resolveColumnFromAst(ast, rawNorm);
+                    if (resolved) {
+                      const aliases = extractAliases(stmtText);
+                      const mapped = aliases.get(resolved.toLowerCase());
+                      const resolvedTable = mapped ? mapped : resolved;
+                      const resolvedNorm = normalizeKey(resolvedTable);
+                      if (candidateTables.includes(resolvedNorm)) {
+                        try {
+                          const exact = findColumnInTable(resolvedNorm, rawNorm);
+                          if (exact && exact.length > 0) {
+                            for (const loc of exact) {
+                              pushLocFromRef({
+                                uri: loc.uri,
+                                line: loc.range.start.line,
+                                start: loc.range.start.character,
+                                end: loc.range.end.character
+                              });
+                            }
+                            // Optional: merge into referencesIndex for future speedups
+                          }
+                        } catch (e) { /* swallow */ }
+                      }
                     }
                   }
                 }
+              } catch (e) {
+                safeLog('[refs][AST] background disambiguation failed: ' + String(e));
               }
-            } catch (e) {
-              safeLog('[refs][AST] background parse failed: ' + String(e));
-            }
-          })();
+            })();
+          }
+          return results;
         }
-        return results;
       }
 
-      // 3c) If no candidates found in statement, try global referencesIndex search for `*.col`
-      // This mirrors earlier fallback behaviour but restricts to keys that endWith `.col`
+      // Final fallback: global suffix fallback
       for (const [key, byUri] of referencesIndex.entries()) {
-        if (key.endsWith(`.${word}`)) {
+        if (key.endsWith(`.${rawNorm}`)) {
           for (const arr of byUri.values()) {
-            for (const r of arr) {
-              pushLoc(r.uri, r.line, r.start, r.end);
-            }
+            for (const r of arr) { pushLocFromRef(r); }
           }
         }
       }
       if (results.length > 0) { return results; }
     } catch (e) {
-      // swallow — best-effort
+      // swallow - best-effort
     }
   }
 
-  // ----------------------
-  // 4) Table (object) lookup via index
-  // ----------------------
-  // If nothing yet, check if the word itself is an indexed object (table/view/type) or column definition name
-  try {
-    const tableRefs = getRefs(word);
-    for (const r of tableRefs) { pushLoc(r.uri, r.line, r.start, r.end); }
-    if (results.length > 0) { return results; }
-
-    // final fallback: scan definitions for table or column via findTableOrColumn
-    const fallback = findTableOrColumn(word);
-    for (const f of fallback) {
-      pushLoc(f.uri, f.range.start.line, f.range.start.character, f.range.end.character);
-    }
-    if (results.length > 0) { return results; }
-  } catch (e) {
-    // swallow
-  }
-
+  // --------------------------
+  // 4) Final fallback: none found
+  // --------------------------
   return results;
-
-  // ----------------------
-  // helper: compute Position from absolute offset (uses text-utils offsetAt inverse)
-  // ----------------------
-  function offsetAtPositionFromOffset(docLocal: TextDocument, absOffset: number): Position {
-    // implement small local binary-search using line starts (similar to text-utils)
-    const text = docLocal.getText();
-    const lines = text.split(/\r?\n/);
-    let off = 0;
-    for (let i = 0; i < lines.length; i++) {
-      const lineLen = lines[i].length + 1; // include newline
-      if (absOffset < off + lineLen) {
-        return Position.create(i, Math.max(0, absOffset - off));
-      }
-      off += lineLen;
-    }
-    // fallback to last
-    const last = lines.length - 1;
-    return Position.create(last, Math.max(0, lines[last].length));
-  }
 }
+
+
 
 // --- Capture configuration updates ---
 connection.onDidChangeConfiguration(change => {

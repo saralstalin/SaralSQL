@@ -9,20 +9,24 @@ const SQL_KEYWORDS = new Set([
 ]);
 
 export function normalizeName(name: string): string {
-    if (!name) { return ""; }
+  if (!name) {return "";}
 
-    // remove square brackets and lowercase
-    let n = name.replace(/[\[\]]/g, "").toLowerCase().trim();
+  // 1) remove any leading dots (e.g. ".Department")
+  // 2) remove all square brackets anywhere
+  // 3) lowercase + trim
+  let n = String(name).replace(/^\.+/, "").replace(/[\[\]]/g, "").toLowerCase().trim();
 
-    const parts = n.split(".");
-    if (parts.length === 2) {
-        const [schema, object] = parts;
-        if (schema === "dbo") {
-            return object; // strip dbo
-        }
-        return `${schema}.${object}`;
-    }
-    return n;
+  // collapse whitespace around dots and compact dotted parts
+  n = n.split('.').map(p => p.trim()).filter(Boolean).join('.');
+
+  // strip dbo. canonicalization: return unqualified object for dbo
+  const parts = n.split(".");
+  if (parts.length === 2) {
+    const [schema, object] = parts;
+    if (schema === "dbo") {return object;}
+    return `${schema}.${object}`;
+  }
+  return n;
 }
 
 export function getCurrentStatement(doc: { getText: (range?: any) => string }, position: { line: number; character: number }): string {
@@ -197,7 +201,16 @@ export function getWordRangeAtPosition(doc: TextDocument, pos: { line: number; c
         start: { line: pos.line, character: 0 },
         end: { line: pos.line, character: Number.MAX_VALUE }
     });
-    const regex = /@?[a-zA-Z0-9_\[\]\.]+/g;
+
+    // Improved token regex:
+    // - optional leading @
+    // - bracketed identifiers: [ ... ]  (allow anything except closing bracket inside)
+    // - double-quoted identifiers: "..."
+    // - backtick-quoted identifiers: `...`
+    // - or unquoted identifier with dots allowed (schema.table) and underscores
+    // Note: we capture the full token including brackets/quotes so doHover can strip later.
+    const regex = /@?(?:\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z0-9_\.]+)/g;
+
     let match: RegExpExecArray | null;
     while ((match = regex.exec(lineText))) {
         const start = match.index;
@@ -208,6 +221,7 @@ export function getWordRangeAtPosition(doc: TextDocument, pos: { line: number; c
     }
     return null;
 }
+
 
 export function extractAliases(text: string): Map<string, string> {
     const aliases = new Map<string, string>();
