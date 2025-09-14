@@ -39,7 +39,7 @@ import {
   , stripStrings
   , offsetAt
 } from "./text-utils";
-import { parseSqlWithWorker } from "./parser-pool";
+import { parseSqlWithWorker, isAstPoolReady } from "./parser-pool";
 import { resolveColumnFromAst, normalizeAstTableName, walkAst } from "./ast-utils";
 import {
   setIndexReady
@@ -61,7 +61,7 @@ import {
   buildParamMapForDocAtPos,
   buildLocalTableMapForDocAtPos,
   collectCandidateTablesFromStatement,
-  resolveAliasTarget
+  resolveAliasTarget, isTokenLocalTable
 } from "./sql-scope-utils"; // adjust path to where you placed the utils    
 
 // ---------- Connection + Documents ----------
@@ -322,7 +322,8 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
   return fallback.length > 0 ? fallback : null;
 });
 
-// --- Completion (robust) ---
+
+// --- Completion ---
 connection.onCompletion((params: CompletionParams): CompletionItem[] => {
   try {
     const rawUri = params.textDocument.uri;
@@ -471,6 +472,7 @@ connection.onReferences((params: ReferenceParams): Location[] => {
   return findReferencesForWord(rawWord, doc, params.position);
 });
 
+// --- Renames ---
 connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) { return null; }
@@ -502,12 +504,48 @@ connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
   return { changes: editsByUri };
 });
 
+// --- Hover ---
 connection.onHover(async (params): Promise<Hover | null> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) {
     return null;
   }
   return await doHover(doc, params.position);
+});
+
+// --- Symbols
+connection.onDocumentSymbol((params): DocumentSymbol[] => {
+  const uri = params.textDocument.uri;
+  const defs = definitions.get(uri) || [];
+  const symbols: DocumentSymbol[] = [];
+
+  for (const def of defs) {
+    const tableSymbol: DocumentSymbol = {
+      name: def.rawName,
+      kind: SymbolKind.Class, // table/view/etc.
+      range: Range.create(def.line, 0, def.line, 200),
+      selectionRange: Range.create(def.line, 0, def.line, 200),
+      children: []
+    };
+
+    if (def.columns) {
+      tableSymbol.children = def.columns.map((col) => {
+        const startChar = typeof (col as any).start === "number" ? (col as any).start : 0;
+        const endChar = typeof (col as any).end === "number" ? (col as any).end : 200;
+        return {
+          name: col.rawName,
+          kind: SymbolKind.Field,
+          range: Range.create(col.line, startChar, col.line, endChar),
+          selectionRange: Range.create(col.line, startChar, col.line, endChar),
+          detail: col.type || undefined
+        };
+      });
+    }
+
+    symbols.push(tableSymbol);
+  }
+
+  return symbols;
 });
 
 //hover function
@@ -627,7 +665,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
   try {
     const fromJoinRe = /\b(?:from|join)\s+([^\s,()]+)(?:\s+(?:as\s+)?([A-Za-z0-9_\[\]"]+))?/gi;
     for (const m of cleanedStmt.matchAll(fromJoinRe)) {
-      if (!m) {continue;}
+      if (!m) { continue; }
       const tableTok = m[1];
       if (tableTok) {
         const cleanedTableTok = stripBrackets(String(tableTok)).replace(/^dbo\./i, "");
@@ -651,12 +689,12 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
   //  - the hovered/candidate token looked local (starts with @ or #) OR
   //  - the local definition's name begins with @ or # (table var or temp table)
   const isLocalEntryValid = (localDef: any, candidateToken?: string | null | undefined): boolean => {
-    if (!localDef) {return false;}
-    if (isRawTokenLocal(candidateToken)) {return true;}
+    if (!localDef) { return false; }
+    if (isRawTokenLocal(candidateToken)) { return true; }
     try {
       const n = String(localDef.name || "").trim();
-      if (n.startsWith("@") || n.startsWith("#")) {return true;}
-    } catch {}
+      if (n.startsWith("@") || n.startsWith("#")) { return true; }
+    } catch { }
     return false;
   };
 
@@ -675,12 +713,12 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
       const stmtAbsStart = doc.getText().indexOf(cleanedStmt);
       const insideDerived = (() => {
         const fm = /\bfrom\s*\(/i.exec(cleanedStmt);
-        if (!fm || stmtAbsStart < 0) {return false;}
+        if (!fm || stmtAbsStart < 0) { return false; }
         const parenStart = fm.index + fm[0].indexOf('(');
         let depth = 1;
         for (let i = parenStart + 1; i < cleanedStmt.length; i++) {
           const ch = cleanedStmt[i];
-          if (ch === '(') {depth++;}
+          if (ch === '(') { depth++; }
           else if (ch === ')') {
             depth--;
             if (depth === 0) {
@@ -921,7 +959,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
     dbg('Alias.column resolution error:', e);
   }
 
-    // --- Small fix: prefer UPDATE target ONLY when hover is on the left side of a SET assignment ---
+  // --- Small fix: prefer UPDATE target ONLY when hover is on the left side of a SET assignment ---
   try {
     // find UPDATE token and SET region
     const updateMatch = /\bupdate\s+([@#]?[A-Za-z0-9_\[\]\."]+)(?:\s+(?:as\s+)?([A-Za-z0-9_]+))?/i.exec(cleanedStmt);
@@ -978,8 +1016,8 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
           const lhsColNorm = normalizeName(lhsColToken);
 
           const hoverMatchesLhs = (normalizeName(hoveredColumnToken) === lhsColNorm) ||
-                                  (!hoveredQualifier && normalizeName(hoveredColumnToken) === lhsColNorm) ||
-                                  (hoveredQualifier && leftQualifier && hoveredQualifier.replace(/^\[|\]$/g, "").toLowerCase() === leftQualifier.replace(/^\[|\]$/g, "").toLowerCase());
+            (!hoveredQualifier && normalizeName(hoveredColumnToken) === lhsColNorm) ||
+            (hoveredQualifier && leftQualifier && hoveredQualifier.replace(/^\[|\]$/g, "").toLowerCase() === leftQualifier.replace(/^\[|\]$/g, "").toLowerCase());
 
           if (hoverMatchesLhs) {
             // build update target keys
@@ -1157,7 +1195,6 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
   dbg('No hover result for:', rawWord);
   return null;
 }
-
 
 // Full validator with @-skip and SELECT-alias skip
 export async function validateTextDocument(doc: TextDocument): Promise<void> {
@@ -1452,127 +1489,241 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
 function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Position): Location[] {
   const word = normalizeName(rawWord);
   const fullText = doc.getText();
-  const lines = fullText.split(/\r?\n/);
   const results: Location[] = [];
+  const seen = new Set<string>(); // dedupe key: uri|line|start|end
 
-  // --- helper: get current statement text (works with optional `position`) ---
-  function _getCurrentStatementLocal(): string {
-    if (!position) { return fullText; }
-
-    const currentLine = position.line;
-    let start = currentLine;
-    let end = currentLine;
-
-    // look upward until BEGIN or ; or top
-    for (let i = currentLine; i >= 0; i--) {
-      if (/^\s*begin\b/i.test(lines[i]) || /;\s*$/.test(lines[i])) {
-        start = i + 1;
-        break;
+  // small helpers
+  const pushLoc = (uri: string, line: number, start: number, end: number) => {
+    const key = `${uri}:${line}:${start}:${end}`;
+    if (seen.has(key)) { return; }
+    seen.add(key);
+    results.push({
+      uri: uri,
+      range: {
+        start: { line, character: start },
+        end: { line, character: end }
       }
-      if (i === 0) { start = 0; }
-    }
+    });
+  };
 
-    // look downward until END or ; or bottom
-    for (let i = currentLine; i < lines.length; i++) {
-      if (/^\s*end\b/i.test(lines[i]) || /;\s*$/.test(lines[i])) {
-        end = i;
-        break;
+  // --- quick guards ---
+  if (!rawWord || rawWord.trim().length === 0) { return []; }
+
+  // treat SQL keywords as not-referenceable
+  if (isSqlKeyword(normalizeName(rawWord).replace(/^\[|\]$/g, ""))) { return []; }
+
+  // If a position is provided, build some local context we reuse
+  const stmtText = position ? getCurrentStatement(doc, position) || fullText : fullText;
+
+  // ----------------------
+  // 1) Parameter handling (prefer parameters exactly like hover)
+  // ----------------------
+  // If the token looks like a param (@name) — prefer param map and return param occurrences in the same proc body.
+  if (rawWord.startsWith("@")) {
+    try {
+      if (position) {
+        const paramMap = buildParamMapForDocAtPos(doc, position); // Map<nameLower, type>
+        const key = rawWord.toLowerCase();
+        if (paramMap.has(key)) {
+          // Find occurrences of the exact token in the enclosing body/statement (best-effort)
+          // Use a simple regex to find @param boundaries
+          const body = stmtText;
+          const re = new RegExp(`\\b${rawWord.replace(/\[/g, "\\[").replace(/\]/g, "\\]")}\\b`, "g");
+          let m: RegExpExecArray | null;
+          // compute offset of stmtText within fullText when position provided
+          let stmtOffset = 0;
+          if (position) {
+            const stmtFull = getCurrentStatement(doc, position) || fullText;
+            stmtOffset = fullText.indexOf(stmtFull);
+            if (stmtOffset < 0) { stmtOffset = 0; }
+          }
+          while ((m = re.exec(body))) {
+            // compute line/char from offset
+            const abs = stmtOffset + (m.index || 0);
+            const p = offsetAt(doc, Position.create(0, 0)); // we will compute via offsetAt helper below
+            // compute line/character using offset -> position util already in project
+            const pos = offsetAtPositionFromOffset(doc, abs); // defined below
+            pushLoc(doc.uri, pos.line, pos.character, pos.character + (m[0]?.length || rawWord.length));
+          }
+          // If we found matches, return them
+          if (results.length > 0) { return results; }
+        }
+        // If token is param but not in paramMap, do not fall back to column resolution (avoid mis-classification)
+        // This mirrors hover's behavior of preferring parameters.
       }
-      if (i === lines.length - 1) { end = lines.length - 1; }
+    } catch (e) {
+      // swallow — best-effort only
     }
-
-    return lines.slice(start, end + 1).join("\n");
   }
 
-  // Use the local helper (safe for optional `position`)
-  const statementText = _getCurrentStatementLocal();
-
-  // --- 1) Handle alias.column explicitly ---
+  // ----------------------
+  // 2) Qualified form: alias.table or schema.table.column
+  // ----------------------
   if (rawWord.includes(".")) {
     const parts = rawWord.split(".");
-    if (parts.length === 2) {
-      const alias = parts[0].toLowerCase();
-      const colName = normalizeName(parts[1]);
-      const aliases = extractAliases(statementText);
-      const table = aliases.get(alias);
-      if (table) {
-        const key = `${normalizeName(table)}.${colName}`;
-        const refs = getRefs(key);
+    // handle simple alias.col or table.col (only 2-part) — prefer alias resolution in current statement
+    if (parts.length === 2 && position) {
+      const aliasTok = parts[0].replace(/^\[|\]$/g, "");
+      const colTok = normalizeName(parts[1]);
+      try {
+        // try statement-local alias resolution first
+        const mapped = resolveAliasTarget(stmtText, aliasTok); // may return table name or null
+        if (mapped) {
+          const normTable = normalizeName(mapped);
+          const locs = findColumnInTable(normTable, colTok);
+          for (const l of locs) { pushLoc(l.uri, l.range.start.line, l.range.start.character, l.range.end.character); }
+          if (results.length > 0) { return results; }
+        }
+
+        // fallback: if alias not found, maybe the token is schema.table or table.column — try getRefs/findColumnInTable
+        // try full normalized key
+        const lastTwo = `${normalizeName(parts[parts.length - 2])}.${normalizeName(parts[parts.length - 1])}`;
+        const refs = getRefs(lastTwo);
         for (const r of refs) {
-          results.push({
-            uri: r.uri,
-            range: {
-              start: { line: r.line, character: r.start },
-              end: { line: r.line, character: r.end }
+          pushLoc(r.uri, r.line, r.start, r.end);
+        }
+        if (results.length > 0) { return results; }
+      } catch { /* best-effort */ }
+    } else {
+      // For longer dotted forms, try exact table/object lookup from references index
+      const cleaned = rawWord.replace(/^\[|\]$/g, "").toLowerCase();
+      const refs = getRefs(cleaned);
+      for (const r of refs) { pushLoc(r.uri, r.line, r.start, r.end); }
+      if (results.length > 0) { return results; }
+    }
+  }
+
+  // ----------------------
+  // 3) Bare column resolution (prefer statement-scoped candidates, prefer locals)
+  // ----------------------
+  // If token has no dot and not a param
+  if (!rawWord.includes(".") && !rawWord.startsWith("@")) {
+    try {
+      // 3a) Collect candidate tables from the current statement (FROM/JOIN/INSERT/UPDATE/DELETE)
+      const candidateTables = Array.from(collectCandidateTablesFromStatement(stmtText) || []);
+      // 3b) Prefer local table (table variables / temp tables) if present
+      const localMap = position ? buildLocalTableMapForDocAtPos(doc, position) : new Map<string, any>();
+      const localPreferred: string[] = [];
+      const remoteCandidates: string[] = [];
+
+      for (const t of candidateTables) {
+        // normalize table key in same way as utils
+        const tnorm = t; // collectCandidateTablesFromStatement already normalized keys
+        if (isTokenLocalTable(tnorm, localMap as any)) {
+          localPreferred.push(tnorm);
+        } else {
+          remoteCandidates.push(tnorm);
+        }
+      }
+
+      // helper to add refs for a table.key
+      const addRefsForTableCol = (tableKey: string, col: string) => {
+        const key = `${tableKey}.${col}`;
+        const refs = getRefs(key);
+        for (const r of refs) { pushLoc(r.uri, r.line, r.start, r.end); }
+      };
+
+      // check local preferred first
+      for (const t of localPreferred) { addRefsForTableCol(t, word); }
+      if (results.length > 0) { return results; }
+
+      // then remote candidates
+      for (const t of remoteCandidates) { addRefsForTableCol(t, word); }
+      if (results.length > 0) {
+        // If there are multiple candidate tables, initiate an async AST parse to disambiguate for future lookups
+        if (candidateTables.length > 1 && position) {
+          (async () => {
+            try {
+              if (isAstPoolReady()) {
+                const ast = await parseSqlWithWorker(stmtText, { database: "transactsql" }, 500);
+                if (ast) {
+                  const resolved = resolveColumnFromAst(ast, word);
+                  if (resolved) {
+                    // resolved may be alias or table — map it via statement aliases or global
+                    const aliases = extractAliases(stmtText);
+                    const mapped = aliases.get(resolved.toLowerCase());
+                    const resolvedTable = mapped ? mapped : resolved;
+                    // Only update index if resolved is one of candidateTables
+                    const resolvedNorm = normalizeName(resolvedTable);
+                    if (candidateTables.includes(resolvedNorm)) {
+                      // We intentionally call findColumnInTable to get exact locations and then write them back into referencesIndex
+                      const found = findColumnInTable(resolvedNorm, word);
+                      // Merge into referencesIndex via setRefsForFile (indexText pattern handles merge)
+                      // We don't write directly here to avoid duplication; rely on existing index-time logic or
+                      // optionally you can add a small local merge similar to indexText logic.
+                      // (left as noop — parse result will help other async indexing jobs)
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              safeLog('[refs][AST] background parse failed: ' + String(e));
             }
-          });
+          })();
         }
         return results;
       }
-    }
-  }
 
-  // --- 2) Table match ---
-  const tableRefs = getRefs(word);
-  for (const r of tableRefs) {
-    results.push({
-      uri: r.uri,
-      range: {
-        start: { line: r.line, character: r.start },
-        end: { line: r.line, character: r.end }
-      }
-    });
-  }
-
-  // --- 3) Column match with scoped tables ---
-  if (!rawWord.includes(".")) {
-    const candidateTables = new Set<string>();
-
-    const fromJoinRegex = /\b(from|join)\s+([a-zA-Z0-9_\[\]\.]+)(?:\s+[a-zA-Z0-9_]+)?/gi;
-    let m: RegExpExecArray | null;
-    while ((m = fromJoinRegex.exec(statementText))) {
-      const tableName = normalizeName(m[2].replace(/^dbo\./i, ""));
-      candidateTables.add(tableName);
-    }
-
-    // scoped lookup
-    for (const table of candidateTables) {
-      const key = `${table}.${word}`;
-      const refs = getRefs(key);
-      for (const r of refs) {
-        results.push({
-          uri: r.uri,
-          range: {
-            start: { line: r.line, character: r.start },
-            end: { line: r.line, character: r.end }
-          }
-        });
-      }
-    }
-
-    // fallback to global if none — updated for the Map<string, Map<string, ReferenceDef[]>> shape
-    if (results.length === 0) {
+      // 3c) If no candidates found in statement, try global referencesIndex search for `*.col`
+      // This mirrors earlier fallback behaviour but restricts to keys that endWith `.col`
       for (const [key, byUri] of referencesIndex.entries()) {
         if (key.endsWith(`.${word}`)) {
           for (const arr of byUri.values()) {
             for (const r of arr) {
-              results.push({
-                uri: r.uri,
-                range: {
-                  start: { line: r.line, character: r.start },
-                  end: { line: r.line, character: r.end }
-                }
-              });
+              pushLoc(r.uri, r.line, r.start, r.end);
             }
           }
         }
       }
+      if (results.length > 0) { return results; }
+    } catch (e) {
+      // swallow — best-effort
     }
   }
 
+  // ----------------------
+  // 4) Table (object) lookup via index
+  // ----------------------
+  // If nothing yet, check if the word itself is an indexed object (table/view/type) or column definition name
+  try {
+    const tableRefs = getRefs(word);
+    for (const r of tableRefs) { pushLoc(r.uri, r.line, r.start, r.end); }
+    if (results.length > 0) { return results; }
+
+    // final fallback: scan definitions for table or column via findTableOrColumn
+    const fallback = findTableOrColumn(word);
+    for (const f of fallback) {
+      pushLoc(f.uri, f.range.start.line, f.range.start.character, f.range.end.character);
+    }
+    if (results.length > 0) { return results; }
+  } catch (e) {
+    // swallow
+  }
+
   return results;
+
+  // ----------------------
+  // helper: compute Position from absolute offset (uses text-utils offsetAt inverse)
+  // ----------------------
+  function offsetAtPositionFromOffset(docLocal: TextDocument, absOffset: number): Position {
+    // implement small local binary-search using line starts (similar to text-utils)
+    const text = docLocal.getText();
+    const lines = text.split(/\r?\n/);
+    let off = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const lineLen = lines[i].length + 1; // include newline
+      if (absOffset < off + lineLen) {
+        return Position.create(i, Math.max(0, absOffset - off));
+      }
+      off += lineLen;
+    }
+    // fallback to last
+    const last = lines.length - 1;
+    return Position.create(last, Math.max(0, lines[last].length));
+  }
 }
 
+// --- Capture configuration updates ---
 connection.onDidChangeConfiguration(change => {
   const settings = (change.settings || {}) as any;
   // expect setting under "saralsql.enableValidation"

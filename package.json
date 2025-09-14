@@ -1,7 +1,7 @@
 {
   "name": "saralsql",
   "displayName": "SaralSQL : Preview",
-  "description": "Language Server for SQL (Database Projects in VS Code)",
+  "description": "Language Server for SQL ( SSDT / Database Projects in VS Code)",
   "publisher": "SaralStalin",
   "keywords": [
     "SQL",
@@ -9,7 +9,7 @@
     "VS Code"
   ],
   "license": "MIT",
-  "version": "0.2.3",
+  "version": "0.2.5",
   "engines": {
     "vscode": "^1.103.0"
   },

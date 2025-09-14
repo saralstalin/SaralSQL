@@ -76,6 +76,8 @@ We’re releasing early to gather real-world feedback before expanding the featu
 - **Schema-aware resolution** when multiple schemas contain the same table name.  
 - **Incremental indexing** for faster performance on very large workspaces.  
 
+- **New TSQL Parser Based Version** If there is enough user interest we will migrate this extension to a custom T-SQL Parser which would have comprehensive coverage.
+
 ---
 
 ## 🧑‍💻 Contributing
