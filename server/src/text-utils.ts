@@ -9,24 +9,24 @@ const SQL_KEYWORDS = new Set([
 ]);
 
 export function normalizeName(name: string): string {
-  if (!name) {return "";}
+    if (!name) { return ""; }
 
-  // 1) remove any leading dots (e.g. ".Department")
-  // 2) remove all square brackets anywhere
-  // 3) lowercase + trim
-  let n = String(name).replace(/^\.+/, "").replace(/[\[\]]/g, "").toLowerCase().trim();
+    // 1) remove any leading dots (e.g. ".Department")
+    // 2) remove all square brackets anywhere
+    // 3) lowercase + trim
+    let n = String(name).replace(/^\.+/, "").replace(/[\[\]]/g, "").toLowerCase().trim();
 
-  // collapse whitespace around dots and compact dotted parts
-  n = n.split('.').map(p => p.trim()).filter(Boolean).join('.');
+    // collapse whitespace around dots and compact dotted parts
+    n = n.split('.').map(p => p.trim()).filter(Boolean).join('.');
 
-  // strip dbo. canonicalization: return unqualified object for dbo
-  const parts = n.split(".");
-  if (parts.length === 2) {
-    const [schema, object] = parts;
-    if (schema === "dbo") {return object;}
-    return `${schema}.${object}`;
-  }
-  return n;
+    // strip dbo. canonicalization: return unqualified object for dbo
+    const parts = n.split(".");
+    if (parts.length === 2) {
+        const [schema, object] = parts;
+        if (schema === "dbo") { return object; }
+        return `${schema}.${object}`;
+    }
+    return n;
 }
 
 export function getCurrentStatement(doc: { getText: (range?: any) => string }, position: { line: number; character: number }): string {
@@ -60,12 +60,12 @@ export function getCurrentStatement(doc: { getText: (range?: any) => string }, p
         // Helper to check if WITH is part of a CTE (WITH identifier AS ()
         function isCteWith(full: string, index: number): boolean {
             const rem = full.length - index;
-            if (rem < 4) {return false;}
+            if (rem < 4) { return false; }
             const slice4 = full.substr(index, 4);
-            if (!/^with$/i.test(slice4)) {return false;}
+            if (!/^with$/i.test(slice4)) { return false; }
             const prev = full[index - 1];
             const next = full[index + 4];
-            if (!isWordBoundaryChar(prev) || !isWordBoundaryChar(next)) {return false;}
+            if (!isWordBoundaryChar(prev) || !isWordBoundaryChar(next)) { return false; }
 
             // Check for CTE pattern: WITH identifier AS (
             const afterWith = full.slice(index + 4).trim();
@@ -227,8 +227,9 @@ export function extractAliases(text: string): Map<string, string> {
     const aliases = new Map<string, string>();
 
     // Table aliases: supports [dbo].[X] [a], dbo.[X] a, schema.X AS alias
-    const tableAliasRegex =
-        /\b(from|join)\s+((?:\[?[a-zA-Z0-9_]+\]?)(?:\.\[?[a-zA-Z0-9_]+\]?)?)\s+(?:as\s+)?(\[?[a-zA-Z0-9_]+\]?)/gi;
+    // new: allow optional leading @ or # on the table token
+    const tableAliasRegex = /\b(from|join)\s+([@#]?(?:\[?[a-zA-Z0-9_]+\]?)(?:\.\[?[a-zA-Z0-9_]+\]?)?)\s+(?:as\s+)?(\[?[a-zA-Z0-9_]+\]?)/gi;
+
     let m: RegExpExecArray | null;
     while ((m = tableAliasRegex.exec(text))) {
         const rawTable = m[2];
@@ -317,7 +318,7 @@ export function resolveAlias(
             if (rest && rest.length > 0) {
                 return {
                     table: normalizeName(tableFromAlias),
-                    column: normalizeName(rest.replace(/^[\[\]"]+|[\[\]"]+$/g, ""))
+                    column: normalizeName(rest)
                 };
             } else {
                 return { table: normalizeName(tableFromAlias) };
@@ -388,7 +389,7 @@ export function extractSelectAliasesFromStatement(statementText: string): Set<st
             const before = item.slice(0, item.length - candidate.length).trim();
             const looksLikeExpr = /[\(\)\+\-\*\/%]|case\b|over\b|\brow_number\b|\bsum\b|\bcount\b|\bmin\b|\bmax\b|\bconvert\b|\bcast\b|\bcoalesce\b/i.test(before);
             if (looksLikeExpr) {
-                const norm = normalizeName(candidate.replace(/[\[\]]/g, ""));
+                const norm = normalizeName(candidate);
                 if (norm) { out.add(norm); }
             }
         }

@@ -250,24 +250,24 @@ export function collectCandidateTablesFromStatement(stmtText: string): Set<strin
     // UPDATE (allow @ / #)
     const updateRe = /\bupdate\s+([@#]?[a-zA-Z0-9_\[\]\.]+)/i;
     const upd = updateRe.exec(stmtText);
-    if (upd && upd[1]) { candidateTables.add(normalizeTableKey(upd[1])); }
+    if (upd && upd[1]) { candidateTables.add(normalizeName(upd[1])); }
 
     // INSERT (allow optional INTO and @ / # temp or table vars)
     const insertRe = /\binsert\s+(?:into\s+)?([@#]?[a-zA-Z0-9_\[\]\.]+)/i;
     const ins = insertRe.exec(stmtText);
-    if (ins && ins[1]) { candidateTables.add(normalizeTableKey(ins[1])); }
+    if (ins && ins[1]) { candidateTables.add(normalizeName(ins[1])); }
 
     // DELETE FROM (allow @ / #)
     const deleteRe = /\bdelete\s+from\s+([@#]?[a-zA-Z0-9_\[\]\.]+)/i;
     const del = deleteRe.exec(stmtText);
-    if (del && del[1]) { candidateTables.add(normalizeTableKey(del[1])); }
+    if (del && del[1]) { candidateTables.add(normalizeName(del[1])); }
 
     // FROM / JOIN (allow optional alias; capture table token possibly prefixed with @/#)
     const fromJoinRe = /\b(from|join)\s+([@#]?[a-zA-Z0-9_\[\]\.]+)(?:\s+(?:as\s+)?([a-zA-Z0-9_\[\]]+))?/gi;
     let m: RegExpExecArray | null;
     while ((m = fromJoinRe.exec(stmtText))) {
       const tableTok = m[2];
-      candidateTables.add(normalizeTableKey(tableTok));
+      candidateTables.add(normalizeName(tableTok));
     }
 
   } catch {
@@ -316,16 +316,6 @@ export function buildLocalTableMapForDocAtPos(doc: TextDocument, pos: Position):
  * Normalize a table key for maps while preserving @/# prefix for locals.
  * e.g. "@MyTV" -> "@mytv", "#Tmp" -> "#tmp", "dbo.MyTbl" -> "mytbl" (strip dbo.)
  */
-function normalizeTableKey(raw: string): string {
-  if (!raw) {return raw;}
-  const cleaned = raw.replace(/^\[|\]$/g, "").replace(/^"|"$/g, "").replace(/`/g, "");
-  // preserve leading @ or # when present
-  if (cleaned.startsWith("@") || cleaned.startsWith("#")) {
-    return cleaned.toLowerCase();
-  }
-  // remove common schema prefix like dbo.
-  return cleaned.replace(/^dbo\./i, "").toLowerCase();
-}
 
 // ---------- Local table checks (explicit) ----------
 /**

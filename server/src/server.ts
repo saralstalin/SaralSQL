@@ -629,6 +629,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
 
     // local table map from util (table vars, temp tables, learned insert/select)
     const localTableMap = buildLocalTableMapForDocAtPos(doc, pos);
+    // --- synthesize parameter-backed local entries for TVPs ---
 
     // canonical table key candidates generation (single source)
     const tableKeyCandidates = (rawToken: string | null | undefined): string[] => {
@@ -849,6 +850,41 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
         const mappedNorm = normalizeName(String(aliasTarget));
         dbg('Alias target resolved:', { rawWord: rawWordStripped, aliasLookupToken, aliasTarget, mappedRawDisplay, mappedNorm });
 
+        // --- NEW: if alias maps to a parameter (@...), prefer the parameter's TVP type for alias hover ---
+        try {
+          const mappedNorm = normalizeName(String(aliasTarget || "").trim()); // e.g. "@transportrequests"
+          if (mappedNorm && (mappedNorm.startsWith("@") || mappedNorm.startsWith("#"))) {
+            // paramMap was created earlier in doHover
+            const paramTypeRaw = paramMap.get(mappedNorm.toLowerCase());
+            if (paramTypeRaw) {
+              // pick first non-READONLY token as type
+              const typeToken = String(paramTypeRaw).split(/\s+/).find(t => t && t.toLowerCase() !== "readonly");
+              const typeKey = typeToken ? normalizeName(typeToken.replace(/^dbo\./i, "")) : null;
+              const typeDef = typeKey ? (tableTypesByName.get(typeKey) || tablesByName.get(typeKey)) : null;
+
+              if (typeDef && typeDef.columns) {
+                // Option A: return hover immediately showing the type columns (clean and direct)
+                const rows = (typeDef.columns as any[]).map(c => `- \`${c.rawName ?? c.name}\`${c.type ? ` ${c.type}` : ""}`);
+                const header = `**Alias** \`${rawWordDisplay}\` → table type \`${typeDef.rawName ?? typeDef.name}\` (parameter \`${mappedNorm}\`)`;
+                const body = `${header}\n\n${rows.join("\n")}`;
+                dbg('Alias -> parameter TVP hover (direct):', { mappedNorm, typeKey, rows: rows.length });
+                return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
+
+                // Option B (alternative): synthesize a localTableMap entry so later local-table logic can run:
+                // const synthCols = (typeDef.columns as any[]).map((cc: any) => ({ name: cc.rawName ?? cc.name, type: cc.type }));
+                // localTableMap.set(mappedNorm, { name: mappedNorm, columns: synthCols });
+              } else {
+                dbg('Alias -> parameter type not indexed:', { mappedNorm, paramTypeRaw, typeKey });
+              }
+            } else {
+              dbg('Alias maps to param but paramMap has no entry:', mappedNorm);
+            }
+          }
+        } catch (e) {
+          dbg('alias->param hover error', e);
+        }
+
+
         // If this maps to a local table in this file, check localTableMap
         if (isRawTokenLocal(mappedNorm)) {
           const localMapped = localTableMap.get(mappedNorm);
@@ -930,6 +966,52 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
 
         const aliasTableKey = normalizeName(String(resolvedTarget).replace(/^dbo\./i, ""));
 
+        // --- NEW: if alias maps to a procedure parameter (@...), prefer the parameter's declared TVP type ---
+        try {
+          const mappedNorm = normalizeName(String(resolvedTarget || "").trim()); // e.g. "@transportrequests" or "transportrequests"
+          if (mappedNorm && (mappedNorm.startsWith("@") || mappedNorm.startsWith("#"))) {
+            // paramMap keys are normalized to lower-case '@name'
+            const paramTypeRaw = paramMap.get(mappedNorm.toLowerCase());
+            if (paramTypeRaw) {
+              // paramTypeRaw looks like: "TransportRequests READONLY" or "dbo.TransportRequests readonly" or "TransportRequests"
+              // extract the type token (first token that is not READONLY)
+              let typeToken = paramTypeRaw.split(/\s+/).find(t => t && t.toLowerCase() !== "readonly");
+              if (typeToken) {
+                // canonicalize the type name for lookup
+                const typeKey = normalizeName(typeToken.replace(/^dbo\./i, ""));
+                // Look up table type definitions (you index table types into tableTypesByName)
+                const typeDef = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
+                if (typeDef && typeDef.columns) {
+                  const aliasColNorm = aliasInfo.column ? normalizeName(aliasInfo.column) : null;
+                  const c = (typeDef.columns as any[]).find(cc =>
+                    (cc.rawName ?? cc.name) === aliasInfo.column ||
+                    (aliasColNorm !== null && normalizeName(cc.name) === aliasColNorm)
+                  );
+                  if (c) {
+                    const label = typeDef === tableTypesByName.get(typeKey) ? `table type \`${typeDef.rawName ?? typeDef.name}\`` : `table \`${typeDef.rawName ?? typeDef.name}\``;
+                    const value = `**Column** \`${c.rawName ?? c.name}\`${c.type ? ` ${c.type}` : ""} in ${label} (parameter \`${mappedNorm}\`)`;
+                    dbg('Alias -> parameter TVP column hover:', { mappedNorm, typeKey, value });
+                    return {
+                      contents: { kind: MarkupKind.Markdown, value },
+                      range
+                    } as Hover;
+                  } else {
+                    dbg('Parameter TVP found but column not present on type:', mappedNorm, typeKey);
+                  }
+                } else {
+                  dbg('Parameter type not found in tableTypesByName/tablesByName:', mappedNorm, typeToken, typeKey);
+                }
+              } else {
+                dbg('Param type token extraction failed for:', mappedNorm, paramTypeRaw);
+              }
+            } else {
+              dbg('No paramMap entry for alias token:', mappedNorm);
+            }
+          }
+        } catch (e) {
+          dbg('parameter-TV P lookup error:', e);
+        }
+
         // Only accept local table if the local entry is genuinely local-ish
         if (isRawTokenLocal(resolvedRaw)) {
           const localTable = localTableMap.get(aliasTableKey);
@@ -944,9 +1026,6 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
                 range
               } as Hover;
             }
-            dbg('No matching column in local table:', aliasTableKey, aliasColNorm);
-          } else {
-            dbg('Local alias target found but not a genuine local table entry:', aliasTableKey);
           }
         }
 
@@ -1222,7 +1301,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
     while ((cm = cursorRegex.exec(text))) { cursors.add(cm[1].toLowerCase()); }
   }
 
-  
+
 
   // iterate over lines
   for (let i = 0; i < lines.length; i++) {
