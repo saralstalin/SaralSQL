@@ -629,20 +629,80 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
 
     // local table map from util (table vars, temp tables, learned insert/select)
     const localTableMap = buildLocalTableMapForDocAtPos(doc, pos);
+
+    // Helper: lookup localTableMap under common key shapes (k, @k, #k, unprefixed)
+    const lookupLocalByKey = (k: string | null | undefined) => {
+      if (!k) { return undefined; }
+      const key = normalizeName(String(k).trim());
+      return localTableMap.get(key) ||
+        localTableMap.get(`@${key}`) ||
+        localTableMap.get(`#${key}`) ||
+        localTableMap.get(key.replace(/^[@#]/, ""));
+    };
     // --- synthesize parameter-backed local entries for TVPs ---
+    // (ensures @param TVPs behave like DECLAREd table variables for hover resolution)
+    try {
+      for (const [pname, pval] of paramMap.entries()) {
+        try {
+          if (!pname || !(pname.startsWith("@") || pname.startsWith("#"))) { continue; }
+          // pval examples: "TransportRequestsType READONLY" or "dbo.TransportRequestsType readonly"
+          const typeToken = String(pval).split(/\s+/).find(tok => tok && tok.toLowerCase() !== "readonly");
+          if (!typeToken) { continue; }
+          const typeKey = normalizeName(typeToken.replace(/^dbo\./i, ""));
+          const typeDef = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
+          if (!typeDef || !typeDef.columns) { continue; }
+          const synthCols = (typeDef.columns as any[]).map(cc => ({ name: cc.rawName ?? cc.name, type: cc.type }));
+          if (!localTableMap.has(pname)) {
+            localTableMap.set(pname, { name: pname, columns: synthCols });
+            dbg('Synthesized localTableMap entry from paramMap', { pname, typeKey, cols: synthCols.map(c => c.name) });
+          }
+        } catch (e) {
+          dbg('synth-param->local inner error', e);
+        }
+      }
+    } catch (e) {
+      dbg('synth-param->local outer error', e);
+    }
 
     // canonical table key candidates generation (single source)
     const tableKeyCandidates = (rawToken: string | null | undefined): string[] => {
       if (!rawToken) { return []; }
-      const norm = normalizeName(String(rawToken).trim()); // canonical e.g. "department"
-      const keys = new Set<string>();
-      keys.add(norm);
+      const token = String(rawToken).trim();
+      if (!token) { return []; }
+
+      const norm = normalizeName(token); // canonical e.g. "schema.table" or "@param"
       const short = norm.includes('.') ? norm.split('.').pop()! : norm;
+
+      const keys = new Set<string>();
+
+      // base normalized forms (full + short, lower/upper not strictly necessary but safe)
+      keys.add(norm);
       keys.add(short);
       keys.add(norm.toLowerCase());
       keys.add(short.toLowerCase());
-      return Array.from(keys);
+
+      // If the normalized token is not already @/# prefixed, also add @/# variants
+      if (!norm.startsWith("@") && !norm.startsWith("#")) {
+        for (const pfx of ["@", "#"]) {
+          keys.add(pfx + norm);
+          keys.add(pfx + short);
+          keys.add((pfx + norm).toLowerCase());
+          keys.add((pfx + short).toLowerCase());
+        }
+      } else {
+        // If it *is* prefixed, also add the unprefixed variants to help reverse-lookup
+        const unpref = norm.replace(/^[@#]/, "");
+        const unprefShort = unpref.includes('.') ? unpref.split('.').pop()! : unpref;
+        keys.add(unpref);
+        keys.add(unprefShort);
+        keys.add(unpref.toLowerCase());
+        keys.add(unprefShort.toLowerCase());
+      }
+
+      // remove any empty strings and return
+      return Array.from(keys).filter(Boolean);
     };
+
 
     // candidate tables (normalized names) from util, using cleanedStmt
     const candidateTables = collectCandidateTablesFromStatement(cleanedStmt || "") || new Set<string>();
@@ -760,7 +820,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
 
           // prefer local (but only if local entry is valid)
           for (const k of targetKeys) {
-            const local = localTableMap.get(k);
+            const local = lookupLocalByKey(k);
             if (local && isLocalEntryValid(local, insertTargetRaw)) {
               const found = local.columns && (local.columns as any[]).find(cc => normalizeName(cc.name) === wordNorm);
               if (found) {
@@ -1113,7 +1173,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
               const updateTargetKeys = tableKeyCandidates(resolvedUpdateTargetRaw.replace(/^dbo\./i, ""));
               // prefer local first
               for (const k of updateTargetKeys) {
-                const local = localTableMap.get(k);
+                const local = lookupLocalByKey(k);
                 if (local && local.columns) {
                   const foundLocal = (local.columns || []).find(cc => normalizeName(cc.name) === wordNorm);
                   if (foundLocal) {
