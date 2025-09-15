@@ -566,21 +566,135 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
   return symbols;
 });
 
-//hover function
+// --- Helper: check if a token represents a local table variable (starts with @ or #) ---
+function isRawTokenLocal(tok: string | null | undefined): boolean {
+  if (!tok) { return false; }
+  const s = String(tok).trim();
+  if (s.startsWith("@") || s.startsWith("#")) { return true; }
+  const n = normalizeName(s);
+  return n.startsWith("@") || n.startsWith("#");
+}
+
+// --- Helper: produce a set of candidate table/key names from a raw token ---
+const tableKeyCandidates = (rawToken: string | null | undefined): string[] => {
+  if (!rawToken) { return []; }
+  const token = String(rawToken).trim();
+  if (!token) { return []; }
+
+  const norm = normalizeName(token); // canonical e.g. "schema.table" or "@param"
+  const short = norm.includes('.') ? norm.split('.').pop()! : norm;
+
+  const keys = new Set<string>();
+  keys.add(norm);
+  keys.add(short);
+  keys.add(norm.toLowerCase());
+  keys.add(short.toLowerCase());
+
+  if (!norm.startsWith("@") && !norm.startsWith("#")) {
+    for (const pfx of ["@", "#"]) {
+      keys.add(pfx + norm);
+      keys.add(pfx + short);
+      keys.add((pfx + norm).toLowerCase());
+      keys.add((pfx + short).toLowerCase());
+    }
+  } else {
+    const unpref = norm.replace(/^[@#]/, "");
+    const unprefShort = unpref.includes('.') ? unpref.split('.').pop()! : unpref;
+    keys.add(unpref);
+    keys.add(unprefShort);
+    keys.add(unpref.toLowerCase());
+    keys.add(unprefShort.toLowerCase());
+  }
+
+  return Array.from(keys).filter(Boolean);
+};
+
+// --- Helper: lookup a localTableMap entry using several common key shapes (@k, #k, unprefixed) ---
+const lookupLocalByKey = (localTableMap: Map<string, any>, k: string | null | undefined) => {
+  if (!k) { return undefined; }
+  const key = normalizeName(String(k).trim());
+  return localTableMap.get(key) ||
+    localTableMap.get(`@${key}`) ||
+    localTableMap.get(`#${key}`) ||
+    localTableMap.get(key.replace(/^[@#]/, ""));
+};
+
+// --- Helper: synthesize local table entries for TVP parameters (so @param behaves like a table variable) ---
+function synthesizeParamBackedLocals(localTableMap: Map<string, any>, paramMap: Map<string, string>) {
+  try {
+    for (const [pname, pval] of paramMap.entries()) {
+      try {
+        if (!pname || !(pname.startsWith("@") || pname.startsWith("#"))) { continue; }
+        const typeToken = String(pval).split(/\s+/).find(tok => tok && tok.toLowerCase() !== "readonly");
+        if (!typeToken) { continue; }
+        const typeKey = normalizeName(typeToken.replace(/^dbo\./i, ""));
+        const typeDef = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
+        if (!typeDef || !typeDef.columns) { continue; }
+        const synthCols = (typeDef.columns as any[]).map(cc => ({ name: cc.rawName ?? cc.name, type: cc.type }));
+        if (!localTableMap.has(pname)) {
+          localTableMap.set(pname, { name: pname, columns: synthCols });
+        }
+      } catch {
+        /* ignore inner synthesis errors */
+      }
+    }
+  } catch {
+    /* ignore outer synthesis errors */
+  }
+}
+
+// --- Helper: augment candidateTables set with tokens discovered in FROM/JOIN clauses ---
+function augmentCandidateTablesFromFromJoin(candidateTables: Set<string>, cleanedStmt: string) {
+  try {
+    const fromJoinRe = /\b(?:from|join)\s+([^\s,()]+)(?:\s+(?:as\s+)?([A-Za-z0-9_\[\]"]+))?/gi;
+    for (const m of cleanedStmt.matchAll(fromJoinRe)) {
+      if (!m) { continue; }
+      const tableTok = m[1];
+      if (tableTok) {
+        const tableNorm = normalizeName(String(tableTok));
+        candidateTables.add(tableNorm);
+        candidateTables.add(tableNorm.split('.').pop()!);
+      }
+      const aliasTok = m[2];
+      if (aliasTok) {
+        const aliasNorm = normalizeName(String(aliasTok));
+        candidateTables.add(aliasNorm);
+      }
+    }
+  } catch {
+    /* ignore augmentation errors */
+  }
+}
+
+// --- Helper: decide whether a localTableMap entry should be treated as a genuine local table ---
+function isLocalEntryValid(localDef: any, candidateToken?: string | null | undefined): boolean {
+  if (!localDef) { return false; }
+  if (isRawTokenLocal(candidateToken)) { return true; }
+  try {
+    const n = String(localDef.name || "").trim();
+    if (n.startsWith("@") || n.startsWith("#")) { return true; }
+  } catch { /* ignore */ }
+  return false;
+}
+
+// --- Main hover function ---
 async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> {
   try {
 
+    // === types & helpers for typed column access ===
+    type ColumnDef = { name: string; rawName?: string; type?: string };
+    const asCols = (arr: any): ColumnDef[] => (arr || []) as ColumnDef[];
+
+    // get word range at cursor and bail if none
     const range = getWordRangeAtPosition(doc, pos);
-    if (!range) {
-      dbg('No range found at position', pos);
-      return null;
-    }
+    if (!range) { return null; }
 
+    // read hovered token and normalized forms
     const rawWord = doc.getText(range);
-    const rawWordStripped = normalizeName(rawWord); // canonical for lookups
-    const rawWordDisplay = rawWord; // keep original for human display in hover bodies
+    const rawWordStripped = normalizeName(rawWord);
+    const rawWordDisplay = rawWord;
 
-    // --- handle qualified tokens (alias.col) minimally ---
+    // decide if token is qualified (alias.column) and split into qualifier + column token
     const isQualifiedToken = rawWordStripped.includes(".");
     let hoveredQualifier: string | null = null;
     let hoveredColumnToken = rawWordStripped;
@@ -590,124 +704,35 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
       hoveredColumnToken = parts[parts.length - 1];
     }
 
-    // use column-only token for column lookups (normalized)
+    // normalized column token for lookups
     const wordNorm = normalizeName(hoveredColumnToken);
-    dbg('Hovered word:', { rawWord: rawWordDisplay, rawWordStripped, hoveredQualifier, hoveredColumnToken, wordNorm });
 
+    // get statement text and apply small cleaning for table hints
     const stmtText = getCurrentStatement(doc, pos) || "";
-    // small cleaning of table-hints that break token shapes (idempotent)
     const cleanedStmt = stmtText.replace(/WITH\s*\((?:NOLOCK|READUNCOMMITTED|UPDLOCK|HOLDLOCK|ROWLOCK|FORCESEEK|INDEX\([^)]*\)|FASTFIRSTROW|XLOCK|REPEATABLEREAD|SERIALIZABLE|,)+?\s*\)/gi, ' ');
-    dbg('Statement:', { original: stmtText, cleaned: cleanedStmt });
 
-    // param/declare map from util
+    // build parameter map for this doc/position
     const paramMap = buildParamMapForDocAtPos(doc, pos);
 
-    // Helper: does the raw token look like a local table variable / parameter (starts with @ or #)?
-    const isRawTokenLocal = (tok: string | null | undefined) => {
-      if (!tok) { return false; }
-      const s = String(tok).trim();
-      if (s.startsWith("@") || s.startsWith("#")) { return true; }
-      const n = normalizeName(s);
-      return n.startsWith("@") || n.startsWith("#");
-    };
-
+    // quick resolution if hovering directly over a parameter name
     if (rawWord.startsWith("@") || rawWordStripped.startsWith("@")) {
-      // use stripped token for lookup (keys in paramMap are normalized to lower-case '@name')
       const lookup = paramMap.get(rawWordStripped.toLowerCase());
       if (lookup) {
-        dbg('Parameter found:', rawWordStripped, lookup);
         return {
-          contents: {
-            kind: MarkupKind.Markdown,
-            value: `**Parameter** \`${rawWordStripped}\` — \`${lookup}\``
-          },
+          contents: { kind: MarkupKind.Markdown, value: `**Parameter** \`${rawWordStripped}\` — \`${lookup}\`` },
           range
         } as Hover;
       }
-      dbg('No parameter found for:', rawWordStripped);
     }
 
-    // local table map from util (table vars, temp tables, learned insert/select)
+    // build local table map and synthesize any TVP-backed locals
     const localTableMap = buildLocalTableMapForDocAtPos(doc, pos);
+    synthesizeParamBackedLocals(localTableMap, paramMap);
 
-    // Helper: lookup localTableMap under common key shapes (k, @k, #k, unprefixed)
-    const lookupLocalByKey = (k: string | null | undefined) => {
-      if (!k) { return undefined; }
-      const key = normalizeName(String(k).trim());
-      return localTableMap.get(key) ||
-        localTableMap.get(`@${key}`) ||
-        localTableMap.get(`#${key}`) ||
-        localTableMap.get(key.replace(/^[@#]/, ""));
-    };
-    // --- synthesize parameter-backed local entries for TVPs ---
-    // (ensures @param TVPs behave like DECLAREd table variables for hover resolution)
-    try {
-      for (const [pname, pval] of paramMap.entries()) {
-        try {
-          if (!pname || !(pname.startsWith("@") || pname.startsWith("#"))) { continue; }
-          // pval examples: "TransportRequestsType READONLY" or "dbo.TransportRequestsType readonly"
-          const typeToken = String(pval).split(/\s+/).find(tok => tok && tok.toLowerCase() !== "readonly");
-          if (!typeToken) { continue; }
-          const typeKey = normalizeName(typeToken.replace(/^dbo\./i, ""));
-          const typeDef = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
-          if (!typeDef || !typeDef.columns) { continue; }
-          const synthCols = (typeDef.columns as any[]).map(cc => ({ name: cc.rawName ?? cc.name, type: cc.type }));
-          if (!localTableMap.has(pname)) {
-            localTableMap.set(pname, { name: pname, columns: synthCols });
-            dbg('Synthesized localTableMap entry from paramMap', { pname, typeKey, cols: synthCols.map(c => c.name) });
-          }
-        } catch (e) {
-          dbg('synth-param->local inner error', e);
-        }
-      }
-    } catch (e) {
-      dbg('synth-param->local outer error', e);
-    }
-
-    // canonical table key candidates generation (single source)
-    const tableKeyCandidates = (rawToken: string | null | undefined): string[] => {
-      if (!rawToken) { return []; }
-      const token = String(rawToken).trim();
-      if (!token) { return []; }
-
-      const norm = normalizeName(token); // canonical e.g. "schema.table" or "@param"
-      const short = norm.includes('.') ? norm.split('.').pop()! : norm;
-
-      const keys = new Set<string>();
-
-      // base normalized forms (full + short, lower/upper not strictly necessary but safe)
-      keys.add(norm);
-      keys.add(short);
-      keys.add(norm.toLowerCase());
-      keys.add(short.toLowerCase());
-
-      // If the normalized token is not already @/# prefixed, also add @/# variants
-      if (!norm.startsWith("@") && !norm.startsWith("#")) {
-        for (const pfx of ["@", "#"]) {
-          keys.add(pfx + norm);
-          keys.add(pfx + short);
-          keys.add((pfx + norm).toLowerCase());
-          keys.add((pfx + short).toLowerCase());
-        }
-      } else {
-        // If it *is* prefixed, also add the unprefixed variants to help reverse-lookup
-        const unpref = norm.replace(/^[@#]/, "");
-        const unprefShort = unpref.includes('.') ? unpref.split('.').pop()! : unpref;
-        keys.add(unpref);
-        keys.add(unprefShort);
-        keys.add(unpref.toLowerCase());
-        keys.add(unprefShort.toLowerCase());
-      }
-
-      // remove any empty strings and return
-      return Array.from(keys).filter(Boolean);
-    };
-
-
-    // candidate tables (normalized names) from util, using cleanedStmt
+    // collect candidate tables from statement text
     const candidateTables = collectCandidateTablesFromStatement(cleanedStmt || "") || new Set<string>();
 
-    // Ensure INSERT/MERGE/SELECT-...-INTO targets are included as candidate tables (normalized)
+    // include INSERT/MERGE/SELECT-...-INTO targets as candidates
     try {
       const insertIntoRe = /\binsert\s+into\s+([a-zA-Z0-9_\[\]\."]+)/gi;
       const mergeIntoRe = /\bmerge\s+into\s+([a-zA-Z0-9_\[\]\."]+)/gi;
@@ -718,7 +743,6 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
           const tn = normalizeName(m[1]);
           candidateTables.add(tn);
           candidateTables.add(tn.split('.').pop()!);
-          dbg('Added INSERT INTO target to candidates:', m[1], tn);
         }
       }
       for (const m of cleanedStmt.matchAll(mergeIntoRe)) {
@@ -726,7 +750,6 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
           const tn = normalizeName(m[1]);
           candidateTables.add(tn);
           candidateTables.add(tn.split('.').pop()!);
-          dbg('Added MERGE INTO target to candidates:', m[1], tn);
         }
       }
       for (const m of cleanedStmt.matchAll(selectIntoRe)) {
@@ -734,106 +757,35 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
           const tn = normalizeName(m[1]);
           candidateTables.add(tn);
           candidateTables.add(tn.split('.').pop()!);
-          dbg('Added SELECT INTO target to candidates:', m[1], tn);
         }
       }
-    } catch (e) {
-      dbg('insert/merge/select-into candidate resolution error', e);
+    } catch {
+      /* ignore insert/merge/select-into errors */
     }
 
-    // --- Augment candidateTables with explicit FROM/JOIN table tokens and aliases (normalized) ---
-    try {
-      const fromJoinRe = /\b(?:from|join)\s+([^\s,()]+)(?:\s+(?:as\s+)?([A-Za-z0-9_\[\]"]+))?/gi;
-      for (const m of cleanedStmt.matchAll(fromJoinRe)) {
-        if (!m) { continue; }
-        const tableTok = m[1];
-        if (tableTok) {
-          // canonicalize fully using normalizeName
-          const tableNorm = normalizeName(String(tableTok));
-          candidateTables.add(tableNorm);
-          // also add unqualified short name
-          candidateTables.add(tableNorm.split('.').pop()!);
-        }
-        const aliasTok = m[2];
-        if (aliasTok) {
-          // normalize alias too (so alias token is consistent with normalized keys)
-          const aliasNorm = normalizeName(String(aliasTok));
-          candidateTables.add(aliasNorm);
-        }
-      }
-      dbg('Augmented candidateTables from FROM/JOIN:', Array.from(candidateTables));
-    } catch (e) {
-      dbg('Failed to augment candidateTables from FROM/JOIN', e);
-    }
+    // augment candidateTables with explicit FROM/JOIN tokens
+    augmentCandidateTablesFromFromJoin(candidateTables, cleanedStmt);
 
-    dbg('Candidate tables final:', Array.from(candidateTables));
-
-    // small helper: decide whether a localTableMap entry should be considered a true "local" table
-    const isLocalEntryValid = (localDef: any, candidateToken?: string | null | undefined): boolean => {
-      if (!localDef) { return false; }
-      if (isRawTokenLocal(candidateToken)) { return true; }
-      try {
-        const n = String(localDef.name || "").trim();
-        if (n.startsWith("@") || n.startsWith("#")) { return true; }
-      } catch { /* ignore */ }
-      return false;
-    };
-
-    // --------- INSERT-target preference (keeps earlier stricter derived-subquery check) ---------
+    // INSERT-target preference: if we're over a column that is listed in the INSERT INTO (...) list, prefer that target
     try {
       const insRe = /\binsert\s+into\s+([^\s(]+)\s*\(\s*([^\)]+)\)/i;
       const m = insRe.exec(cleanedStmt || "");
       if (m && m[1] && m[2]) {
-        const insertTargetRaw = m[1];
         const insertColsRaw = m[2];
-        const insertCols = new Set<string>(
-          insertColsRaw.split(",").map(s => normalizeName(String(s).trim()))
-        );
-        dbg('Insert target detected:', insertTargetRaw, Array.from(insertCols));
-
-        const stmtAbsStart = doc.getText().indexOf(cleanedStmt);
-        const insideDerived = (() => {
-          const fm = /\bfrom\s*\(/i.exec(cleanedStmt);
-          if (!fm || stmtAbsStart < 0) { return false; }
-          const parenStart = fm.index + fm[0].indexOf('(');
-          let depth = 1;
-          for (let i = parenStart + 1; i < cleanedStmt.length; i++) {
-            const ch = cleanedStmt[i];
-            if (ch === '(') { depth++; }
-            else if (ch === ')') {
-              depth--;
-              if (depth === 0) {
-                const absInnerStart = stmtAbsStart + parenStart + 1;
-                const absInnerEnd = stmtAbsStart + i;
-                const hoverOffset = doc.offsetAt(range.start);
-                return hoverOffset >= absInnerStart && hoverOffset <= absInnerEnd;
-              }
-            }
-          }
-          return false;
-        })();
-
-        if (insertCols.has(wordNorm) || insideDerived) {
-          const cleanedTarget = normalizeName(insertTargetRaw);
+        const insertCols = new Set<string>(insertColsRaw.split(",").map(s => normalizeName(String(s).trim())));
+        if (insertCols.has(wordNorm)) {
+          const cleanedTarget = normalizeName(m[1]);
           const targetKeys = tableKeyCandidates(cleanedTarget);
-          dbg('Insert target keys:', targetKeys, { insideDerived });
-
-          // prefer local (but only if local entry is valid)
           for (const k of targetKeys) {
-            const local = lookupLocalByKey(k);
-            if (local && isLocalEntryValid(local, insertTargetRaw)) {
+            const local = lookupLocalByKey(localTableMap, k);
+            if (local && isLocalEntryValid(local, m[1])) {
               const found = local.columns && (local.columns as any[]).find(cc => normalizeName(cc.name) === wordNorm);
               if (found) {
                 const md = `**Column** \`${found.name}\`${found.type ? ` ${found.type}` : ""} in local table \`${local.name}\``;
-                dbg('Insert-target matched local:', md);
                 return { contents: { kind: MarkupKind.Markdown, value: md }, range } as Hover;
               }
-            } else if (local) {
-              dbg('Found localTableMap entry but skipping as not a genuine local entry:', k, local && local.name);
             }
           }
-
-          // then catalog
           for (const k of targetKeys) {
             const def = tablesByName.get(k);
             if (def && def.columns) {
@@ -843,33 +795,27 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
               );
               if (found) {
                 const md = `**Column** \`${found.rawName ?? found.name}\`${found.type ? ` ${found.type}` : ""} in table \`${def.rawName ?? def.name}\``;
-                dbg('Insert-target matched catalog:', md);
                 return { contents: { kind: MarkupKind.Markdown, value: md }, range } as Hover;
               }
             }
           }
-          dbg('Insert-target indicated but not found in local/catalog for:', wordNorm);
         }
       }
-    } catch (e) {
-      dbg('Insert-target preference error:', e);
+    } catch {
+      /* ignore insert-target preference errors */
     }
 
-    // ---------- rest of original resolution flow (kept intact) ----------
-
-    // 1) Local table direct hover (token itself local)
+    // direct hover over a local table name (e.g., @tvp or #temp)
     if (isRawTokenLocal(rawWord)) {
       const localDefDirect = localTableMap.get(normalizeName(rawWordStripped));
       if (localDefDirect && isLocalEntryValid(localDefDirect, rawWordStripped)) {
         const rows = localDefDirect.columns.map(c => `- \`${c.name}\`${c.type ? ` ${c.type}` : ""}`);
         const body = `**Local table** \`${localDefDirect.name}\`\n\n${rows.join("\n")}`;
-        dbg('Local table hover:', localDefDirect.name, rows);
         return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
       }
-      dbg('No local table found for (or skipped non-local):', rawWordStripped);
     }
 
-    // 2) Catalog table direct hover (also check table-types)
+    // direct hover over a catalog table name
     const directTableDef = tablesByName.get(rawWordStripped);
     if (directTableDef) {
       const rows: string[] = [];
@@ -881,11 +827,10 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
         }
       }
       const body = `**Table** \`${directTableDef.rawName ?? directTableDef.name}\`\n\n${rows.join("\n")}`;
-      dbg('Catalog table hover:', directTableDef.name, rows);
       return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
     }
 
-    // If not a real table, check table-type index
+    // direct hover over a table-type name
     const directTypeDef = tableTypesByName.get(rawWordStripped);
     if (directTypeDef) {
       const rows: string[] = [];
@@ -897,74 +842,52 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
         }
       }
       const body = `**Table Type** \`${directTypeDef.rawName ?? directTypeDef.name}\`\n\n${rows.join("\n")}`;
-      dbg('Catalog table-type hover:', directTypeDef.name, rows);
       return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
     }
 
-    // 3) Hover over an alias token (map alias -> target using extractAliases via util resolve)
+    // hover over an alias token: map alias -> target (including param-backed TVPs)
     try {
       const aliasLookupToken = (isQualifiedToken && hoveredQualifier) ? hoveredQualifier : rawWordStripped;
       const aliasTarget = resolveAliasTarget(cleanedStmt || "", aliasLookupToken);
       if (aliasTarget) {
         const mappedRawDisplay = String(aliasTarget).replace(/^\.+/, "").replace(/[\[\]"`]/g, "").trim();
         const mappedNorm = normalizeName(String(aliasTarget));
-        dbg('Alias target resolved:', { rawWord: rawWordStripped, aliasLookupToken, aliasTarget, mappedRawDisplay, mappedNorm });
 
-        // --- NEW: if alias maps to a parameter (@...), prefer the parameter's TVP type for alias hover ---
         try {
-          const mappedNorm = normalizeName(String(aliasTarget || "").trim()); // e.g. "@transportrequests"
-          if (mappedNorm && (mappedNorm.startsWith("@") || mappedNorm.startsWith("#"))) {
-            // paramMap was created earlier in doHover
-            const paramTypeRaw = paramMap.get(mappedNorm.toLowerCase());
+          const mnorm = normalizeName(String(aliasTarget || "").trim());
+          if (mnorm && (mnorm.startsWith("@") || mnorm.startsWith("#"))) {
+            const paramTypeRaw = paramMap.get(mnorm.toLowerCase());
             if (paramTypeRaw) {
-              // pick first non-READONLY token as type
               const typeToken = String(paramTypeRaw).split(/\s+/).find(t => t && t.toLowerCase() !== "readonly");
               const typeKey = typeToken ? normalizeName(typeToken.replace(/^dbo\./i, "")) : null;
               const typeDef = typeKey ? (tableTypesByName.get(typeKey) || tablesByName.get(typeKey)) : null;
-
               if (typeDef && typeDef.columns) {
-                // Option A: return hover immediately showing the type columns (clean and direct)
                 const rows = (typeDef.columns as any[]).map(c => `- \`${c.rawName ?? c.name}\`${c.type ? ` ${c.type}` : ""}`);
-                const header = `**Alias** \`${rawWordDisplay}\` → table type \`${typeDef.rawName ?? typeDef.name}\` (parameter \`${mappedNorm}\`)`;
+                const header = `**Alias** \`${rawWordDisplay}\` → table type \`${typeDef.rawName ?? typeDef.name}\` (parameter \`${mnorm}\`)`;
                 const body = `${header}\n\n${rows.join("\n")}`;
-                dbg('Alias -> parameter TVP hover (direct):', { mappedNorm, typeKey, rows: rows.length });
                 return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
-
-                // Option B (alternative): synthesize a localTableMap entry so later local-table logic can run:
-                // const synthCols = (typeDef.columns as any[]).map((cc: any) => ({ name: cc.rawName ?? cc.name, type: cc.type }));
-                // localTableMap.set(mappedNorm, { name: mappedNorm, columns: synthCols });
-              } else {
-                dbg('Alias -> parameter type not indexed:', { mappedNorm, paramTypeRaw, typeKey });
               }
-            } else {
-              dbg('Alias maps to param but paramMap has no entry:', mappedNorm);
             }
           }
-        } catch (e) {
-          dbg('alias->param hover error', e);
+        } catch {
+          /* ignore alias->param hover errors */
         }
 
-
-        // If this maps to a local table in this file, check localTableMap
         if (isRawTokenLocal(mappedNorm)) {
           const localMapped = localTableMap.get(mappedNorm);
           if (localMapped && isLocalEntryValid(localMapped, mappedRawDisplay)) {
             const rows = localMapped.columns.map(c => `- \`${c.name}\`${c.type ? ` ${c.type}` : ""}`);
             const body = `**Alias** \`${rawWordDisplay}\` → local table \`${localMapped.name}\`\n\n${rows.join("\n")}`;
-            dbg('Local table alias hover:', localMapped.name, rows);
             return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
           }
-          dbg('Alias target found in localTableMap but skipped as non-local', mappedNorm, localMapped && localMapped.name);
         }
 
-        // Fall back to catalog/global index lookup
         let def = tablesByName.get(mappedNorm);
         let defIsType = false;
         if (!def) {
           def = tableTypesByName.get(mappedNorm);
           if (def) { defIsType = true; }
         }
-
         if (def) {
           if (!isQualifiedToken) {
             const rows: string[] = [];
@@ -979,20 +902,15 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
               ? `**Alias** \`${rawWordDisplay}\` → table type \`${def.rawName ?? def.name}\``
               : `**Alias** \`${rawWordDisplay}\` → table \`${def.rawName ?? def.name}\``;
             const body = `${header}\n\n${rows.join("\n")}`;
-            dbg('Catalog table alias hover:', def.name, rows);
             return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
-          } else {
-            dbg('Skipping alias-as-table hover because token is qualified; def exists:', mappedNorm);
           }
-        } else {
-          dbg('No catalog table for alias target:', mappedNorm);
         }
       }
-    } catch (e) {
-      dbg('Alias resolution error:', e);
+    } catch {
+      /* ignore alias resolution errors */
     }
 
-    // 4) alias.column explicit handling (resolve alias -> target, prefer local table map)
+    // explicit alias.column handling (resolve alias then column, preferring local entries and TVP types)
     try {
       const aliasInfo = resolveAlias(rawWord, doc, pos);
       if (aliasInfo && aliasInfo.table && aliasInfo.column) {
@@ -1003,7 +921,6 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
           if (mapped) {
             resolvedTarget = mapped;
             resolvedRaw = normalizeName(String(mapped));
-            dbg('Alias.column resolution (cleanedStmt):', { table: aliasInfo.table, column: aliasInfo.column, resolvedTarget, resolvedRaw });
           } else {
             const fullText = doc.getText();
             const fullTextCleaned = fullText.replace(/WITH\s*\((?:NOLOCK|READUNCOMMITTED|UPDLOCK|HOLDLOCK|ROWLOCK|FORCESEEK|INDEX\([^)]*\)|FASTFIRSTROW|XLOCK|REPEATABLEREAD|SERIALIZABLE|,)+?\s*\)/gi, ' ');
@@ -1011,35 +928,26 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
             if (mappedFull) {
               resolvedTarget = mappedFull;
               resolvedRaw = normalizeName(String(mappedFull));
-              dbg('Alias.column resolution (fullText):', { table: aliasInfo.table, column: aliasInfo.column, resolvedTarget, resolvedRaw });
             } else {
               resolvedTarget = String(aliasInfo.table);
               resolvedRaw = normalizeName(String(aliasInfo.table));
-              dbg('Alias.column resolution (fallback to table):', { table: aliasInfo.table, column: aliasInfo.column, resolvedTarget, resolvedRaw });
             }
           }
-        } catch (e) {
+        } catch {
           resolvedTarget = String(aliasInfo.table);
           resolvedRaw = normalizeName(String(aliasInfo.table));
-          dbg('Alias.column target resolution error:', e, { resolvedTarget, resolvedRaw });
         }
 
         const aliasTableKey = normalizeName(String(resolvedTarget).replace(/^dbo\./i, ""));
 
-        // --- NEW: if alias maps to a procedure parameter (@...), prefer the parameter's declared TVP type ---
         try {
-          const mappedNorm = normalizeName(String(resolvedTarget || "").trim()); // e.g. "@transportrequests" or "transportrequests"
+          const mappedNorm = normalizeName(String(resolvedTarget || "").trim());
           if (mappedNorm && (mappedNorm.startsWith("@") || mappedNorm.startsWith("#"))) {
-            // paramMap keys are normalized to lower-case '@name'
             const paramTypeRaw = paramMap.get(mappedNorm.toLowerCase());
             if (paramTypeRaw) {
-              // paramTypeRaw looks like: "TransportRequests READONLY" or "dbo.TransportRequests readonly" or "TransportRequests"
-              // extract the type token (first token that is not READONLY)
               let typeToken = paramTypeRaw.split(/\s+/).find(t => t && t.toLowerCase() !== "readonly");
               if (typeToken) {
-                // canonicalize the type name for lookup
                 const typeKey = normalizeName(typeToken.replace(/^dbo\./i, ""));
-                // Look up table type definitions (you index table types into tableTypesByName)
                 const typeDef = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
                 if (typeDef && typeDef.columns) {
                   const aliasColNorm = aliasInfo.column ? normalizeName(aliasInfo.column) : null;
@@ -1050,41 +958,24 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
                   if (c) {
                     const label = typeDef === tableTypesByName.get(typeKey) ? `table type \`${typeDef.rawName ?? typeDef.name}\`` : `table \`${typeDef.rawName ?? typeDef.name}\``;
                     const value = `**Column** \`${c.rawName ?? c.name}\`${c.type ? ` ${c.type}` : ""} in ${label} (parameter \`${mappedNorm}\`)`;
-                    dbg('Alias -> parameter TVP column hover:', { mappedNorm, typeKey, value });
-                    return {
-                      contents: { kind: MarkupKind.Markdown, value },
-                      range
-                    } as Hover;
-                  } else {
-                    dbg('Parameter TVP found but column not present on type:', mappedNorm, typeKey);
+                    return { contents: { kind: MarkupKind.Markdown, value }, range } as Hover;
                   }
-                } else {
-                  dbg('Parameter type not found in tableTypesByName/tablesByName:', mappedNorm, typeToken, typeKey);
                 }
-              } else {
-                dbg('Param type token extraction failed for:', mappedNorm, paramTypeRaw);
               }
-            } else {
-              dbg('No paramMap entry for alias token:', mappedNorm);
             }
           }
-        } catch (e) {
-          dbg('parameter-TV P lookup error:', e);
+        } catch {
+          /* ignore param TVP lookup error */
         }
 
-        // Only accept local table if the local entry is genuinely local-ish
         if (isRawTokenLocal(resolvedRaw)) {
-          const localTable = localTableMap.get(aliasTableKey);
+          const localTable = lookupLocalByKey(localTableMap, aliasTableKey);
           if (localTable && isLocalEntryValid(localTable, resolvedRaw) && localTable.columns) {
             const aliasColNorm = aliasInfo.column ? normalizeName(aliasInfo.column) : null;
-            const cLocal = (localTable.columns || []).find(cc => normalizeName(cc.name) === aliasColNorm);
+            const cLocal = asCols(localTable.columns).find(cc => normalizeName(cc.name) === aliasColNorm);
             if (cLocal) {
               const value = `**Column** \`${cLocal.name}\`${cLocal.type ? ` ${cLocal.type}` : ""} in local table \`${localTable.name}\``;
-              dbg('Local table column hover:', value);
-              return {
-                contents: { kind: MarkupKind.Markdown, value },
-                range
-              } as Hover;
+              return { contents: { kind: MarkupKind.Markdown, value }, range } as Hover;
             }
           }
         }
@@ -1104,27 +995,19 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
           if (c) {
             const containerLabel = defIsType ? `table type \`${def.rawName ?? def.name}\`` : `table \`${def.rawName ?? def.name}\``;
             const value = `**Column** \`${c.rawName ?? c.name}\`${c.type ? ` ${c.type}` : ""} in ${containerLabel}`;
-            dbg('Catalog table column hover:', value);
-            return {
-              contents: { kind: MarkupKind.Markdown, value },
-              range
-            } as Hover;
+            return { contents: { kind: MarkupKind.Markdown, value }, range } as Hover;
           }
-          dbg('No matching column in catalog table:', aliasTableKey, aliasColNorm);
         }
       }
-    } catch (e) {
-      dbg('Alias.column resolution error:', e);
+    } catch {
+      /* ignore alias.column resolution errors */
     }
 
-    // --- Small fix: prefer UPDATE target ONLY when hover is on the left side of a SET assignment ---
+    // prefer UPDATE target if hover is on left side of SET assignment (small fix)
     try {
       const updateMatch = /\bupdate\s+([@#]?[A-Za-z0-9_\[\]\."]+)(?:\s+(?:as\s+)?([A-Za-z0-9_]+))?/i.exec(cleanedStmt);
       if (updateMatch && updateMatch[1]) {
         const updateTokenRaw = normalizeName(updateMatch[1]);
-        const updateAliasFromClause = updateMatch[2] ? normalizeName(updateMatch[2]) : null;
-
-        // try to resolve alias->table for update token
         let resolvedUpdateTargetRaw = updateTokenRaw;
         try {
           const resolved = resolveAliasTarget(cleanedStmt || "", updateTokenRaw);
@@ -1171,19 +1054,16 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
 
             if (hoverMatchesLhs) {
               const updateTargetKeys = tableKeyCandidates(resolvedUpdateTargetRaw.replace(/^dbo\./i, ""));
-              // prefer local first
               for (const k of updateTargetKeys) {
-                const local = lookupLocalByKey(k);
+                const local = lookupLocalByKey(localTableMap, k);
                 if (local && local.columns) {
-                  const foundLocal = (local.columns || []).find(cc => normalizeName(cc.name) === wordNorm);
+                  const foundLocal = asCols(local.columns || []).find(cc => normalizeName(cc.name) === wordNorm);
                   if (foundLocal) {
                     const md = `**Column** \`${foundLocal.name}\`${foundLocal.type ? ` ${foundLocal.type}` : ""} in local table \`${local.name}\``;
-                    dbg('UPDATE-SET-left matched local target:', md);
                     return { contents: { kind: MarkupKind.Markdown, value: md }, range } as Hover;
                   }
                 }
               }
-              // then prefer catalog
               for (const k of updateTargetKeys) {
                 const def = tablesByName.get(k);
                 if (def && def.columns) {
@@ -1193,7 +1073,6 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
                   );
                   if (foundDef) {
                     const md = `**Column** \`${foundDef.rawName ?? foundDef.name}\`${foundDef.type ? ` ${foundDef.type}` : ""} in table \`${def.rawName ?? def.name}\``;
-                    dbg('UPDATE-SET-left matched catalog target:', md);
                     return { contents: { kind: MarkupKind.Markdown, value: md }, range } as Hover;
                   }
                 }
@@ -1201,44 +1080,33 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
             }
           }
         }
-      } else {
-        dbg('No UPDATE target found in statement');
       }
-    } catch (e) {
-      dbg('UPDATE-SET-left small-fix error:', e);
+    } catch {
+      /* ignore UPDATE-SET-left errors */
     }
 
-    // 5) Candidate-only column lookup (search only in candidate tables discovered in statement)
+    // candidate-only column lookup across discovered candidate tables
     if (candidateTables.size > 0) {
       const matches: string[] = [];
-      const seenSourceKeys = new Set<string>(); // dedupe by canonical table identity
+      const seenSourceKeys = new Set<string>();
 
       for (const rawTname of Array.from(candidateTables)) {
         const candidateNorm = normalizeName(String(rawTname).trim());
 
-        // 1) consider local map if token is local-style
-        if (isRawTokenLocal(candidateNorm)) {
-          const local = localTableMap.get(candidateNorm);
-          if (local && local.columns) {
-            for (const col of local.columns) {
-              if (normalizeName(col.name) === wordNorm) {
-                const sourceKey = String(local.name || candidateNorm).toLowerCase();
-                if (!seenSourceKeys.has(sourceKey)) {
-                  matches.push(`${col.name}${col.type ? ` ${col.type}` : ""} in local table ${local.name}`);
-                  seenSourceKeys.add(sourceKey);
-                  dbg('Local table column match (candidate):', candidateNorm, local.name, col.name);
-                } else {
-                  dbg('Skipping duplicate local match for same source:', sourceKey);
-                }
-                break;
+        const local = lookupLocalByKey(localTableMap, candidateNorm);
+        if (local && local.columns) {
+          for (const col of local.columns) {
+            if (normalizeName(col.name) === wordNorm) {
+              const sourceKey = String(local.name || candidateNorm).toLowerCase();
+              if (!seenSourceKeys.has(sourceKey)) {
+                matches.push(`${col.name}${col.type ? ` ${col.type}` : ""} in local table ${local.name}`);
+                seenSourceKeys.add(sourceKey);
               }
+              break;
             }
-          } else {
-            dbg('Candidate token looked local but no entry in localTableMap for:', candidateNorm);
           }
         }
 
-        // 2) fallback to catalog: try each table-key variant for the candidate token
         const candKeys = tableKeyCandidates(candidateNorm);
         for (const k of candKeys) {
           let def = tablesByName.get(k);
@@ -1247,10 +1115,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
             const tdef = tableTypesByName.get(k);
             if (tdef) { defIsType = true; def = tdef; }
           }
-          if (!def || !def.columns) {
-            dbg('No catalog table or columns for candidate key:', k);
-            continue;
-          }
+          if (!def || !def.columns) { continue; }
 
           for (const col of def.columns) {
             if ((col.rawName ?? col.name) === hoveredColumnToken || normalizeName(col.name || col.rawName || "") === wordNorm) {
@@ -1260,9 +1125,6 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
                 const containerLabel = defIsType ? `table type ${def.rawName ?? def.name}` : `table ${def.rawName ?? def.name}`;
                 matches.push(`${col.rawName ?? col.name}${col.type ? ` ${col.type}` : ""} in ${containerLabel}`);
                 seenSourceKeys.add(sourceKey);
-                dbg('Catalog table column match (candidate):', k, col.rawName ?? col.name, containerLabel);
-              } else {
-                dbg('Skipping duplicate catalog match for same source:', sourceKey);
               }
               break;
             }
@@ -1271,63 +1133,48 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
       }
 
       if (matches.length === 1) {
-        dbg('Single column match (candidates):', matches[0]);
         return { contents: { kind: MarkupKind.Markdown, value: `**Column** ${matches[0]}` }, range } as Hover;
       } else if (matches.length > 1) {
-        dbg('Ambiguous column matches (candidates):', matches);
         return { contents: { kind: MarkupKind.Markdown, value: `**Column** \`${hoveredColumnToken}\` (ambiguous — found in: ${matches.join(", ")})` }, range } as Hover;
       }
-      dbg('No column matches found in candidate tables for:', wordNorm);
-    } else {
-      dbg('No candidate tables found');
     }
 
-    // 6) Heuristic: if statement is UPDATE prefer its target (final pass)
+    // final heuristic: if statement is UPDATE prefer its target table
     try {
       const updateMatch = /\bupdate\s+([a-zA-Z0-9_\[\]\."]+)/i.exec(cleanedStmt);
       if (updateMatch && updateMatch[1]) {
         const rawUpdateMatch = normalizeName(updateMatch[1]);
         const tnorm = normalizeName(rawUpdateMatch.replace(/^dbo\./i, ""));
-        const rawUpdateTarget = rawUpdateMatch;
-        dbg('UPDATE target:', { raw: rawUpdateTarget, normalized: tnorm });
-
-        if (isRawTokenLocal(rawUpdateTarget)) {
-          const local = localTableMap.get(tnorm);
-          if (local && isLocalEntryValid(local, rawUpdateTarget) && local.columns) {
-            const colDefLocal = (local.columns || []).find(c => normalizeName(c.name) === wordNorm);
+        if (isRawTokenLocal(rawUpdateMatch)) {
+          const local = lookupLocalByKey(localTableMap, tnorm);
+          if (local && isLocalEntryValid(local, rawUpdateMatch) && local.columns) {
+            const colDefLocal = asCols(local.columns || []).find(c => normalizeName(c.name) === wordNorm);
             if (colDefLocal) {
               const value = `**Column** \`${colDefLocal.name}\`${colDefLocal.type ? ` ${colDefLocal.type}` : ""} in local table \`${local.name}\``;
-              dbg('UPDATE local table column hover:', value);
               return { contents: { kind: MarkupKind.Markdown, value }, range } as Hover;
             }
-            dbg('No matching column in UPDATE local table:', tnorm, wordNorm);
           }
         }
-
         const def = tablesByName.get(tnorm);
         if (def && def.columns) {
           const colDef = (def.columns as any[]).find(c => normalizeName((c.name || c.rawName || "")) === wordNorm);
           if (colDef) {
             const value = `**Column** \`${colDef.rawName ?? colDef.name}\`${colDef.type ? ` ${colDef.type}` : ""} in table \`${def.rawName ?? def.name}\``;
-            dbg('UPDATE catalog table column hover:', value);
             return { contents: { kind: MarkupKind.Markdown, value }, range } as Hover;
           }
-          dbg('No matching column in UPDATE catalog table:', tnorm, wordNorm);
         }
-      } else {
-        dbg('No UPDATE target found in statement');
       }
-    } catch (e) {
-      dbg('UPDATE heuristic error:', e);
+    } catch {
+      /* ignore final UPDATE heuristic errors */
     }
 
-    dbg('No hover result for:', rawWordDisplay);
+    // nothing matched
     return null;
-  } catch (ex) {
-    dbg('doHover top-level error:', ex);
+  } catch {
     return null;
   }
 }
+
 
 // Full validator with @-skip and SELECT-alias skip
 export async function validateTextDocument(doc: TextDocument): Promise<void> {
