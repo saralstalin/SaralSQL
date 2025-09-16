@@ -2,7 +2,7 @@ import { TextDocument } from "vscode-languageserver-textdocument";
 import { Position } from "vscode-languageserver";
 import {
   normalizeName,
-  extractAliases,   
+  extractAliases,
 } from "./text-utils";
 
 // Types
@@ -70,8 +70,8 @@ export function getEnclosingProcedureBody(fullText: string, absOffset: number): 
 
 // ---------- Parameter extraction ----------
 const headerParamRe = /(@[A-Za-z0-9_]+)\s+([^,\r\n]+?)(?=\s*(?:,|AS\b|BEGIN\b|$))/ig;
-export function extractParamsFromHeader(headerText: string | null): Map<string,string> {
-  const map = new Map<string,string>();
+export function extractParamsFromHeader(headerText: string | null): Map<string, string> {
+  const map = new Map<string, string>();
   if (!headerText) { return map; }
   let m: RegExpExecArray | null;
   while ((m = headerParamRe.exec(headerText))) {
@@ -84,8 +84,8 @@ export function extractParamsFromHeader(headerText: string | null): Map<string,s
 }
 
 // DECLARE variable extraction (multi-declare supported)
-export function extractDeclareVarsFromText(text: string | null): Map<string,string> {
-  const map = new Map<string,string>();
+export function extractDeclareVarsFromText(text: string | null): Map<string, string> {
+  const map = new Map<string, string>();
   if (!text) { return map; }
   const declareRe = /\bdeclare\b\s+([^;\r\n]+)/ig;
   let m: RegExpExecArray | null;
@@ -97,7 +97,7 @@ export function extractDeclareVarsFromText(text: string | null): Map<string,stri
     for (let i = 0; i < declList.length; i++) {
       const ch = declList[i];
       if (ch === "(") { depth++; cur += ch; continue; }
-      if (ch === ")") { if (depth>0) {depth--;} cur += ch; continue; }
+      if (ch === ")") { if (depth > 0) { depth--; } cur += ch; continue; }
       if (ch === "," && depth === 0) { parts.push(cur); cur = ""; continue; }
       cur += ch;
     }
@@ -125,11 +125,11 @@ function splitTopLevelCommas(s: string) {
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     if (ch === "(") { depth++; cur += ch; continue; }
-    if (ch === ")") { if (depth>0) {depth--;} cur += ch; continue; }
+    if (ch === ")") { if (depth > 0) { depth--; } cur += ch; continue; }
     if (ch === "," && depth === 0) { parts.push(cur); cur = ""; continue; }
     cur += ch;
   }
-  if (cur.trim() !== "") {parts.push(cur);}
+  if (cur.trim() !== "") { parts.push(cur); }
   return parts.map(p => p.trim()).filter(Boolean);
 }
 
@@ -151,11 +151,11 @@ export function extractLocalTableDefsFromText(bodyText: string | null): LocalTab
         const colName = nameMatch[1] || nameMatch[2] || nameMatch[3] || nameMatch[4];
         let rest = part.slice((nameMatch[0] || "").length).trim();
         rest = rest.replace(/\bPRIMARY\s+KEY\b/ig, "")
-                   .replace(/\bNOT\s+NULL\b/ig, "")
-                   .replace(/\bNULL\b/ig, "")
-                   .replace(/\bIDENTITY\s*\([^\)]*\)/ig, "")
-                   .trim();
-        const colType = rest ? rest.split(/\s+/).slice(0,3).join(" ") : undefined;
+          .replace(/\bNOT\s+NULL\b/ig, "")
+          .replace(/\bNULL\b/ig, "")
+          .replace(/\bIDENTITY\s*\([^\)]*\)/ig, "")
+          .trim();
+        const colType = rest ? rest.split(/\s+/).slice(0, 3).join(" ") : undefined;
         cols.push({ name: colName, type: colType });
       }
       map.set(varName.toLowerCase(), { name: varName, columns: cols });
@@ -174,11 +174,11 @@ export function extractLocalTableDefsFromText(bodyText: string | null): LocalTab
         const colName = nameMatch[1] || nameMatch[2] || nameMatch[3] || nameMatch[4];
         let rest = part.slice((nameMatch[0] || "").length).trim();
         rest = rest.replace(/\bPRIMARY\s+KEY\b/ig, "")
-                   .replace(/\bNOT\s+NULL\b/ig, "")
-                   .replace(/\bNULL\b/ig, "")
-                   .replace(/\bIDENTITY\s*\([^\)]*\)/ig, "")
-                   .trim();
-        const colType = rest ? rest.split(/\s+/).slice(0,3).join(" ") : undefined;
+          .replace(/\bNOT\s+NULL\b/ig, "")
+          .replace(/\bNULL\b/ig, "")
+          .replace(/\bIDENTITY\s*\([^\)]*\)/ig, "")
+          .trim();
+        const colType = rest ? rest.split(/\s+/).slice(0, 3).join(" ") : undefined;
         cols.push({ name: colName, type: colType });
       }
       map.set(tblName.toLowerCase(), { name: tblName, columns: cols });
@@ -247,34 +247,53 @@ export function extractLocalTableDefsFromText(bodyText: string | null): LocalTab
 export function collectCandidateTablesFromStatement(stmtText: string): Set<string> {
   const candidateTables = new Set<string>();
   try {
+    const stmtNoComments = stmtText.replace(/--.*$/gm, "");
+
     // UPDATE (allow @ / #)
-    const updateRe = /\bupdate\s+([@#]?[a-zA-Z0-9_\[\]\.]+)/i;
-    const upd = updateRe.exec(stmtText);
-    if (upd && upd[1]) { candidateTables.add(normalizeName(upd[1])); }
-
-    // INSERT (allow optional INTO and @ / # temp or table vars)
-    const insertRe = /\binsert\s+(?:into\s+)?([@#]?[a-zA-Z0-9_\[\]\.]+)/i;
-    const ins = insertRe.exec(stmtText);
-    if (ins && ins[1]) { candidateTables.add(normalizeName(ins[1])); }
-
-    // DELETE FROM (allow @ / #)
-    const deleteRe = /\bdelete\s+from\s+([@#]?[a-zA-Z0-9_\[\]\.]+)/i;
-    const del = deleteRe.exec(stmtText);
-    if (del && del[1]) { candidateTables.add(normalizeName(del[1])); }
-
-    // FROM / JOIN (allow optional alias; capture table token possibly prefixed with @/#)
-    const fromJoinRe = /\b(from|join)\s+([@#]?[a-zA-Z0-9_\[\]\.]+)(?:\s+(?:as\s+)?([a-zA-Z0-9_\[\]]+))?/gi;
-    let m: RegExpExecArray | null;
-    while ((m = fromJoinRe.exec(stmtText))) {
-      const tableTok = m[2];
-      candidateTables.add(normalizeName(tableTok));
+    const updateRe = /(?:^|[\s;])update\s+([@#]?[A-Za-z0-9_\[\]\."]+)/i;
+    const upd = updateRe.exec(stmtNoComments);
+    if (upd && upd[1]) {
+      const tn = normalizeName(upd[1]);
+      candidateTables.add(tn);
+      if (tn.includes(".")) {
+        candidateTables.add(tn.split(".").pop()!);
+      }
     }
 
+    // INSERT (allow INTO; collect table but handle locals separately)
+    const insertRe = /\binsert\s+(?:into\s+)?([@#]?[A-Za-z0-9_\[\]\."]+)/i;
+    const ins = insertRe.exec(stmtNoComments);
+    if (ins && ins[1]) {
+      const tn = ins[1];
+      const norm = normalizeName(tn);
+      candidateTables.add(norm);
+      if (norm.includes(".")) {
+        candidateTables.add(norm.split(".").pop()!);
+      }
+    }
+
+
+
+    // DELETE FROM
+    const deleteRe = /\bdelete\s+from\s+([@#]?[A-Za-z0-9_\[\]\."]+)/i;
+    const del = deleteRe.exec(stmtNoComments);
+    if (del && del[1]) {
+      candidateTables.add(normalizeName(del[1]));
+    }
+
+    // FROM / JOIN
+    const fromJoinRe = /\b(from|join)\s+([@#]?[A-Za-z0-9_\[\]\.]+)(?:\s+(?:as\s+)?([A-Za-z0-9_\[\]]+))?/gi;
+    let m: RegExpExecArray | null;
+    while ((m = fromJoinRe.exec(stmtNoComments))) {
+      candidateTables.add(normalizeName(m[2]));
+    }
   } catch {
-    // ignore
+    // ignore errors
   }
   return candidateTables;
 }
+
+
 
 // ---------- Alias resolution (map alias token to actual target using extractAliases) ----------
 export function resolveAliasTarget(stmtText: string, aliasToken: string): string | null {
@@ -291,15 +310,15 @@ export function resolveAliasTarget(stmtText: string, aliasToken: string): string
 
 // ---------- Combined builders used by hover/validate ----------
 
-export function buildParamMapForDocAtPos(doc: TextDocument, pos: Position): Map<string,string> {
+export function buildParamMapForDocAtPos(doc: TextDocument, pos: Position): Map<string, string> {
   const abs = getOffsetForPosition(doc, pos);
   const full = doc.getText();
   const header = getEnclosingProcedureHeader(full, abs);
   const body = getEnclosingProcedureBody(full, abs);
   const m = extractParamsFromHeader(header);
   const dm = extractDeclareVarsFromText(body);
-  for (const [k,v] of dm.entries()) {
-    if (!m.has(k)) {m.set(k, v);}
+  for (const [k, v] of dm.entries()) {
+    if (!m.has(k)) { m.set(k, v); }
   }
   return m;
 }
@@ -330,10 +349,10 @@ export function buildLocalTableMapForDocAtPos(doc: TextDocument, pos: Position):
  *   if (isTokenLocalTable(' @tv', localMap)) { ... } // true only if @tv exists
  */
 export function isTokenLocalTable(token: string | null | undefined, localMap?: LocalTableMap | null): boolean {
-  if (!token) {return false;}
+  if (!token) { return false; }
   // trim quotes/brackets but keep leading @ / #
   const cleaned = String(token).trim().replace(/^\[|\]$/g, "").replace(/^"|"$/g, "").replace(/`/g, "");
-  if (!cleaned) {return false;}
+  if (!cleaned) { return false; }
   if (!(cleaned.startsWith("@") || cleaned.startsWith("#"))) {
     // NOT a local table token by prefix, so false regardless of map contents
     return false;
