@@ -1,12 +1,61 @@
 import { TextDocument, Position, Range } from "vscode-languageserver-textdocument";
 
 const SQL_KEYWORDS = new Set([
-    "select", "from", "join", "on", "where", "and", "or", "insert", "update", "delete", "into", "as",
-    "count", "group", "by", "order", "create", "procedure", "function", "view", "table", "begin", "end",
-    "if", "else", "while", "case", "when", "then", "declare", "set", "values", "fetch", "next", "rows", "only",
-    "distinct", "union", "all", "outer", "inner", "left", "right", "full", "top", "limit", "offset",
-    "having", "over", "newid", "row_number", "desc", "asc", "sum", "min", "max", "null", "is", "exec", "not"
+  // DML
+  "select", "insert", "update", "delete", "merge", "into", "values", "output",
+
+  // DDL
+  "create", "alter", "drop", "truncate", "table", "view", "index", "schema",
+  "procedure", "function", "trigger", "sequence", "constraint", "default",
+  "primary", "key", "foreign", "references", "unique", "check", "clustered", "nonclustered",
+
+  // Query / joins
+  "from", "join", "inner", "outer", "left", "right", "full", "cross", "apply",
+  "on", "using",
+
+  // Clauses
+  "where", "group", "by", "having", "order", "asc", "desc", "distinct",
+  "top", "limit", "offset", "fetch", "next", "rows", "only",
+
+  // Set operations
+  "union", "intersect", "except", "all",
+
+  // Flow control
+  "begin", "end", "if", "else", "while", "case", "when", "then", "try", "catch",
+
+  // Variables / assignments
+  "declare", "set", "as",
+
+  // Functions / windowing
+  "over", "partition", "row_number", "rank", "dense_rank", "ntile",
+  "count", "sum", "min", "max", "avg", "coalesce", "nullif",
+
+  // Predicates / operators
+  "and", "or", "not", "between", "in", "exists", "like", "is", "null", "any", "some",
+
+  // Execution
+  "exec", "execute", "return", "returns",
+
+  // Transactions
+  "begin", "commit", "rollback", "savepoint", "transaction",
+
+  // Security / perms
+  "grant", "revoke", "deny",
+
+  // Data types (common)
+  "int", "bigint", "smallint", "tinyint", "decimal", "numeric", "money",
+  "float", "real", "bit", "char", "varchar", "nvarchar", "text", "ntext",
+  "date", "datetime", "smalldatetime", "datetime2", "time", "timestamp",
+  "binary", "varbinary", "xml", "json",
+
+  // Misc
+  "newid", "identity", "default", "with", "nolock", "readuncommitted",
+  "serializable", "repeatableread", "snapshot", "isolation", "level",
+
+  // Other
+  "cursor", "fetch", "open", "close", "deallocate", "print"
 ]);
+
 
 export function normalizeName(name: string): string {
     if (!name) { return ""; }
@@ -29,172 +78,187 @@ export function normalizeName(name: string): string {
     return n;
 }
 
-export function getCurrentStatement(doc: { getText: (range?: any) => string }, position: { line: number; character: number }): string {
-    try {
-        const full = doc.getText();
-        if (!full) { return ""; }
+export function getCurrentStatement(
+  doc: { getText: (range?: any) => string },
+  position: { line: number; character: number }
+): string {
+  try {
+    const full = doc.getText();
+    if (!full) {return "";}
 
-        // Build lines & compute absolute offset of position
-        const lines = full.split(/\r?\n/);
-        const lineIdx = Math.max(0, Math.min(position.line, lines.length - 1));
-        let offset = 0;
-        for (let i = 0; i < lineIdx; i++) { offset += lines[i].length + 1; } // +1 newline
-        offset += Math.max(0, Math.min(position.character, lines[lineIdx].length));
-
-        // Scanner that walks forward and records semicolons and WITH positions that are outside strings/comments.
-        let inSingle = false;
-        let inDouble = false;
-        let inBracket = false; // [ ... ]
-        let inLineComment = false;
-        let inBlockComment = false;
-
-        let lastStmtSep = -1;     // last semicolon index (outside quotes/comments) before offset
-        let lastWithIndex = -1;   // last 'WITH' (word) index before offset for CTEs (outside quotes/comments)
-
-        // Helper to check word boundaries for "WITH"
-        function isWordBoundaryChar(ch: string | undefined) {
-            if (!ch) { return true; }
-            return !(/[A-Za-z0-9_]/.test(ch));
-        }
-
-        // Helper to check if WITH is part of a CTE (WITH identifier AS ()
-        function isCteWith(full: string, index: number): boolean {
-            const rem = full.length - index;
-            if (rem < 4) { return false; }
-            const slice4 = full.substr(index, 4);
-            if (!/^with$/i.test(slice4)) { return false; }
-            const prev = full[index - 1];
-            const next = full[index + 4];
-            if (!isWordBoundaryChar(prev) || !isWordBoundaryChar(next)) { return false; }
-
-            // Check for CTE pattern: WITH identifier AS (
-            const afterWith = full.slice(index + 4).trim();
-            return /^\s*[A-Za-z0-9_]+\s+AS\s*\(/i.test(afterWith);
-        }
-
-        // Forward scan up to offset to record last semicolon and WITH occurrences
-        for (let i = 0; i < offset; i++) {
-            const ch = full[i];
-            const chNext = full[i + 1];
-
-            // Handle line comment start --
-            if (!inSingle && !inDouble && !inBlockComment && !inLineComment && ch === "-" && chNext === "-") {
-                inLineComment = true;
-                i++; // skip second '-'
-                continue;
-            }
-            // Handle block comment start /*
-            if (!inSingle && !inDouble && !inLineComment && !inBlockComment && ch === "/" && chNext === "*") {
-                inBlockComment = true;
-                i++;
-                continue;
-            }
-            // Handle block comment end */
-            if (inBlockComment && ch === "*" && chNext === "/") {
-                inBlockComment = false;
-                i++;
-                continue;
-            }
-            // End of line ends line comment
-            if (inLineComment && ch === "\n") {
-                inLineComment = false;
-                continue;
-            }
-            if (inLineComment || inBlockComment) {
-                continue;
-            }
-
-            // Bracketed identifier [ ... ]
-            if (!inSingle && !inDouble && ch === "[") { inBracket = true; continue; }
-            if (inBracket) {
-                if (ch === "]") { inBracket = false; }
-                continue;
-            }
-
-            // Single-quote string
-            if (!inDouble && ch === "'") {
-                if (!inSingle) { inSingle = true; continue; }
-                if (inSingle && full[i + 1] === "'") { i++; continue; }
-                inSingle = false;
-                continue;
-            }
-            if (inSingle) { continue; }
-
-            // Double-quote string (identifiers or strings)
-            if (!inSingle && ch === '"') {
-                if (!inDouble) { inDouble = true; continue; }
-                if (inDouble && full[i + 1] === '"') { i++; continue; }
-                inDouble = false;
-                continue;
-            }
-            if (inDouble) { continue; }
-
-            // Semicolon outside quotes/comments => statement separator
-            if (ch === ";") {
-                lastStmtSep = i;
-                continue;
-            }
-
-            // Check for 'WITH' token (case-insensitive) - only record if it's a CTE
-            const rem = full.length - i;
-            if (rem >= 4 && isCteWith(full, i)) {
-                lastWithIndex = i;
-            }
-        } // end forward scan to offset
-
-        // Determine start: prefer lastStmtSep+1, but if there is a CTE WITH after that, include it
-        let start = lastStmtSep + 1;
-        if (lastWithIndex > lastStmtSep) {
-            // Include leading whitespace/newlines before WITH
-            let wstart = lastWithIndex;
-            while (wstart > 0 && /\s/.test(full[wstart - 1])) { wstart--; }
-            start = wstart;
-        }
-        if (start < 0) { start = 0; }
-
-        // Find next semicolon after offset (end boundary)
-        let end = full.length;
-        inSingle = false; inDouble = false; inBracket = false; inLineComment = false; inBlockComment = false;
-        for (let i = offset; i < full.length; i++) {
-            const ch = full[i];
-            const chNext = full[i + 1];
-
-            if (!inSingle && !inDouble && !inBlockComment && !inLineComment && ch === "-" && chNext === "-") {
-                inLineComment = true; i++; continue;
-            }
-            if (!inSingle && !inDouble && !inLineComment && !inBlockComment && ch === "/" && chNext === "*") {
-                inBlockComment = true; i++; continue;
-            }
-            if (inBlockComment && ch === "*" && chNext === "/") { inBlockComment = false; i++; continue; }
-            if (inLineComment && ch === "\n") { inLineComment = false; continue; }
-            if (inLineComment || inBlockComment) { continue; }
-
-            if (!inSingle && !inDouble && ch === "[") { inBracket = true; continue; }
-            if (inBracket) { if (ch === "]") { inBracket = false; } continue; }
-
-            if (!inDouble && ch === "'") {
-                if (!inSingle) { inSingle = true; continue; }
-                if (inSingle && full[i + 1] === "'") { i++; continue; }
-                inSingle = false; continue;
-            }
-            if (inSingle) { continue; }
-
-            if (!inSingle && ch === '"') {
-                if (!inDouble) { inDouble = true; continue; }
-                if (inDouble && full[i + 1] === '"') { i++; continue; }
-                inDouble = false; continue;
-            }
-            if (inDouble) { continue; }
-
-            if (ch === ";") { end = i; break; }
-        }
-
-        const stmt = full.slice(start, end).trim();
-        return stmt;
-    } catch (e) {
-        return "";
+    // --- compute absolute offset by scanning full and counting newlines ---
+    // This method is robust for LF and CRLF because it scans the actual characters.
+    const targetLine = Math.max(0, position.line);
+    const targetChar = Math.max(0, position.character);
+    let line = 0;
+    let offset = 0;
+    const N = full.length;
+    // Walk until we've reached the start of targetLine
+    while (offset < N && line < targetLine) {
+      if (full[offset] === "\n") {line++;}
+      offset++;
     }
+    // Now offset is the index of the first char on targetLine (or N)
+    // Clamp the character position to the actual line length (up to next newline)
+    let lineEnd = offset;
+    while (lineEnd < N && full[lineEnd] !== "\n") {lineEnd++;}
+    const clampedChar = Math.min(targetChar, Math.max(0, lineEnd - offset));
+    offset += clampedChar;
+
+    // --- helper state for scanning outside strings/comments/brackets ---
+    let inSingle = false;
+    let inDouble = false;
+    let inBracket = false; // [ ... ]
+    let inLineComment = false;
+    let inBlockComment = false;
+
+    let lastStmtSep = -1;     // last semicolon index (outside quotes/comments) before offset
+    let lastWithIndex = -1;   // last 'WITH' (word) index before offset for CTEs (outside quotes/comments)
+
+    function isWordBoundaryChar(ch: string | undefined) {
+      if (ch === undefined || ch === null) {return true;}
+      return !(/[A-Za-z0-9_]/.test(ch));
+    }
+
+    function isCteWith(fullStr: string, index: number): boolean {
+      if (index + 4 > fullStr.length) {return false;}
+      const slice4 = fullStr.substr(index, 4);
+      if (!/^with$/i.test(slice4)) {return false;}
+      const prev = fullStr[index - 1];
+      const next = fullStr[index + 4];
+      if (!isWordBoundaryChar(prev) || !isWordBoundaryChar(next)) {return false;}
+
+      // Check for CTE pattern: WITH identifier AS (
+      // Look ahead a little without trimming (don't remove offsets); allow some whitespace.
+      const lookAhead = fullStr.slice(index + 4, index + 200); // limit lookahead
+      return /^\s*[A-Za-z0-9_]+\s+AS\s*\(/i.test(lookAhead);
+    }
+
+    // --- forward scan up to offset to find last semicolon / WITH before cursor ---
+    for (let i = 0; i < offset; i++) {
+      const ch = full[i];
+      const chNext = full[i + 1];
+
+      // Start of line comment --
+      if (!inSingle && !inDouble && !inBlockComment && !inLineComment && ch === "-" && chNext === "-") {
+        inLineComment = true;
+        i++; // skip second dash
+        continue;
+      }
+      // Start of block comment /*
+      if (!inSingle && !inDouble && !inLineComment && !inBlockComment && ch === "/" && chNext === "*") {
+        inBlockComment = true;
+        i++;
+        continue;
+      }
+      // End of block comment */
+      if (inBlockComment && ch === "*" && chNext === "/") {
+        inBlockComment = false;
+        i++;
+        continue;
+      }
+      // End of line comment at newline
+      if (inLineComment && ch === "\n") {
+        inLineComment = false;
+        continue;
+      }
+      if (inLineComment || inBlockComment) {continue;}
+
+      // Bracketed identifier [ ... ]
+      if (!inSingle && !inDouble && ch === "[") {
+        inBracket = true;
+        continue;
+      }
+      if (inBracket) {
+        if (ch === "]") {inBracket = false;}
+        continue;
+      }
+
+      // Single-quote string
+      if (!inDouble && ch === "'") {
+        if (!inSingle) { inSingle = true; continue; }
+        // handle escaped '' inside string
+        if (inSingle && full[i + 1] === "'") { i++; continue; }
+        inSingle = false;
+        continue;
+      }
+      if (inSingle) {continue;}
+
+      // Double-quote string
+      if (!inSingle && ch === '"') {
+        if (!inDouble) { inDouble = true; continue; }
+        if (inDouble && full[i + 1] === '"') { i++; continue; }
+        inDouble = false;
+        continue;
+      }
+      if (inDouble) {continue;}
+
+      // Semicolon => statement separator
+      if (ch === ";") {
+        lastStmtSep = i;
+        continue;
+      }
+
+      // Check for WITH (CTE)
+      const rem = full.length - i;
+      if (rem >= 4 && isCteWith(full, i)) {
+        lastWithIndex = i;
+      }
+    } // end forward scan
+
+    // Determine start: prefer lastStmtSep+1, but if a CTE WITH is after that, include it
+    let start = lastStmtSep + 1;
+    if (lastWithIndex > lastStmtSep) {
+      let wstart = lastWithIndex;
+      while (wstart > 0 && /\s/.test(full[wstart - 1])) {wstart--;}
+      start = wstart;
+    }
+    if (start < 0) {start = 0;}
+
+    // --- find end: scan forward from offset for next semicolon outside comments/strings/brackets ---
+    inSingle = false; inDouble = false; inBracket = false; inLineComment = false; inBlockComment = false;
+    let end = full.length;
+    for (let i = offset; i < full.length; i++) {
+      const ch = full[i];
+      const chNext = full[i + 1];
+
+      if (!inSingle && !inDouble && !inBlockComment && !inLineComment && ch === "-" && chNext === "-") {
+        inLineComment = true; i++; continue;
+      }
+      if (!inSingle && !inDouble && !inLineComment && !inBlockComment && ch === "/" && chNext === "*") {
+        inBlockComment = true; i++; continue;
+      }
+      if (inBlockComment && ch === "*" && chNext === "/") { inBlockComment = false; i++; continue; }
+      if (inLineComment && ch === "\n") { inLineComment = false; continue; }
+      if (inLineComment || inBlockComment) {continue;}
+
+      if (!inSingle && !inDouble && ch === "[") { inBracket = true; continue; }
+      if (inBracket) { if (ch === "]") {inBracket = false;} continue; }
+
+      if (!inDouble && ch === "'") {
+        if (!inSingle) { inSingle = true; continue; }
+        if (inSingle && full[i + 1] === "'") { i++; continue; }
+        inSingle = false; continue;
+      }
+      if (inSingle) {continue;}
+
+      if (!inSingle && ch === '"') {
+        if (!inDouble) { inDouble = true; continue; }
+        if (inDouble && full[i + 1] === '"') { i++; continue; }
+        inDouble = false; continue;
+      }
+      if (inDouble) {continue;}
+
+      if (ch === ";") { end = i; break; }
+    }
+
+    const stmt = full.slice(start, end).trim();
+    return stmt;
+  } catch (e) {
+    return "";
+  }
 }
+
 
 export function getWordRangeAtPosition(doc: TextDocument, pos: { line: number; character: number }) {
     const lineText = doc.getText({

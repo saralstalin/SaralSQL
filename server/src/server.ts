@@ -785,7 +785,9 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
 
     // get statement text and apply small cleaning for table hints
     const stmtText = getCurrentStatement(doc, pos) || "";
-    const cleanedStmt = stmtText.replace(/WITH\s*\((?:NOLOCK|READUNCOMMITTED|UPDLOCK|HOLDLOCK|ROWLOCK|FORCESEEK|INDEX\([^)]*\)|FASTFIRSTROW|XLOCK|REPEATABLEREAD|SERIALIZABLE|,)+?\s*\)/gi, ' ');
+    // 1) make a comment-free version (preserving offsets by replacing comments with spaces)
+    const stmtNoComments = stripComments(stmtText);
+    const cleanedStmt = stmtNoComments.replace(/WITH\s*\((?:NOLOCK|READUNCOMMITTED|UPDLOCK|HOLDLOCK|ROWLOCK|FORCESEEK|INDEX\([^)]*\)|FASTFIRSTROW|XLOCK|REPEATABLEREAD|SERIALIZABLE|,)+?\s*\)/gi, ' ');
     // build parameter map for this doc/position
     const paramMap = buildParamMapForDocAtPos(doc, pos);
 
@@ -888,7 +890,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
     // collect candidate tables from statement text
     const candidateTables = collectCandidateTablesFromStatement(cleanedStmt || "") || new Set<string>();
 
-    
+
     // include INSERT/MERGE/SELECT-...-INTO targets as candidates
     try {
       const insertIntoRe = /\binsert\s+into\s+([a-zA-Z0-9_\[\]\."]+)/gi;
