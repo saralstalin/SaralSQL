@@ -12,7 +12,7 @@ import {
 } from "./text-utils";
 import * as url from "url";
 import { isAstPoolReady, parseSqlWithWorker } from "./parser-pool";
-import { resolveColumnFromAst } from "./ast-utils";
+import { resolveColumnFromAst, walkAst, extractColumnName } from "./ast-utils";
 
 export interface ColumnDef {
     name: string;
@@ -223,108 +223,162 @@ export function indexText(uri: string, text: string): void {
 
         const sym: SymbolDef = { name: norm, rawName, uri: normUri, line: i, kind };
 
-        if (kind === "TABLE" || (kind === "TYPE" && /\bAS\s+TABLE\b/i.test(line))) {
+        if (kind === "TABLE" || kind === "VIEW" || (kind === "TYPE" && /\bAS\s+TABLE\b/i.test(line))) {
             // Build block from current line and parse columns (linear helper)
             const createBlock = lines.slice(i).join("\n");
-            const cols = parseColumnsFromCreateBlock(createBlock, 0);
+            let cols = parseColumnsFromCreateBlock(createBlock, 0);
+
+            // If this is a VIEW and the parenthesis-style extractor returned nothing,
+            // attempt to extract projected columns from the defining SELECT using AST.
+            if (kind === "VIEW" && (!cols || cols.length === 0)) {
+                try {
+                    if (isAstPoolReady()) {
+                        // fire-and-forget (keep indexText synchronous)
+                        parseColumnsFromCreateView(createBlock, i)
+                            .then((viewCols) => {
+                                if (viewCols && viewCols.length) {
+                                    // ensure cols is an array we can mutate
+                                    cols = Array.isArray(cols) ? cols : [];
+                                    // PUSH the returned columns (correct spread and identifier)
+                                    cols.push(...viewCols);
+                                    // also update columnsByTable & sym.columns so other async logic
+                                    // + hover/completions eventually see them (optional)
+                                    try {
+                                        const normSet = columnsByTable.get(norm) || new Set<string>();
+                                        for (const vc of viewCols) {
+                                            const n = normalizeName(vc.name);
+                                            if (!normSet.has(n)) {
+                                                normSet.add(n);
+                                            }
+                                            if (!sym.columns) { sym.columns = []; }
+                                            const already = (sym.columns as any[]).some((c: any) =>
+                                                normalizeName((c.rawName || c.name || "").replace(/^\[|\]$/g, "")) === n
+                                            );
+                                            if (!already) {
+                                                (sym.columns as any[]).push({
+                                                    name: n,
+                                                    rawName: vc.rawName || vc.name,
+                                                    line: i + (vc.line || 0) + 1,
+                                                    start: vc.start || 0,
+                                                    end: (vc.end && vc.end > 0) ? vc.end : (String(vc.rawName || vc.name || "").length)
+                                                });
+                                            }
+                                        }
+                                        columnsByTable.set(norm, normSet);
+                                    } catch {
+                                        // non-fatal; keep indexing resilient
+                                    }
+                                }
+                            })
+                            .catch(() => {
+                                /* ignore parse errors */
+                            });
+                    }
+                } catch {
+                    // keep indexer resilient on AST errors — swallow
+                }
+            }
+
 
             // Attempt optional AST parse for this CREATE block to discover any additional columns (pool-only)
-            try {
-                if (!isAstPoolReady()) {
-                    //Nothing
-                } else {
-                    // Fire-and-forget parse with short timeout so we don't block indexing
-                    parseSqlWithWorker(createBlock, { database: "mssql" }, 800)
-                        .then((ast) => {
-                            try {
-                                if (!ast) { return; }
-                                const astColsRaw: string[] = [];
-                                if (ast && (ast.type === "create" || (Array.isArray(ast) && ast.length && ast[0].type === "create"))) {
-                                    const node = Array.isArray(ast) ? ast[0] : ast;
-                                    const defs = node.create_definitions || node.createDefinitions || [];
-                                    for (const d of defs) {
-                                        try {
-                                            const cname = (d.column && (d.column.column || d.column.name)) || d.name || d.field;
-                                            if (cname) { astColsRaw.push(String(cname).trim()); }
-                                        } catch { /* ignore per-column errors */ }
-                                    }
-                                }
-
-                                if (astColsRaw.length) {
-                                    // prepare sets for dedupe
-                                    const existingCols = new Set<string>(cols.map(c => normalizeName(c.name)));
-                                    const existingSymCols = new Set<string>((sym.columns || []).map((c: any) => normalizeName((c.rawName || c.name || "").replace(/^\[|\]$/g, ""))));
-                                    const set = columnsByTable.get(norm) || new Set<string>();
-
-                                    // collect new local refs that we will add (deduped by pos)
-                                    const newLocalRefs: ReferenceDef[] = [];
-
-                                    for (const rawAc of astColsRaw) {
-                                        const acNorm = normalizeName(rawAc);
-                                        if (existingCols.has(acNorm) || existingSymCols.has(acNorm) || set.has(acNorm)) {
-                                            continue;
+            if (kind === "TABLE" || (kind === "TYPE" && /\bAS\s+TABLE\b/i.test(line))) {
+                try {
+                    if (!isAstPoolReady()) {
+                        //Nothing
+                    } else {
+                        // Fire-and-forget parse with short timeout so we don't block indexing
+                        parseSqlWithWorker(createBlock, { database: "mssql" }, 800)
+                            .then((ast) => {
+                                try {
+                                    if (!ast) { return; }
+                                    const astColsRaw: string[] = [];
+                                    if (ast && (ast.type === "create" || (Array.isArray(ast) && ast.length && ast[0].type === "create"))) {
+                                        const node = Array.isArray(ast) ? ast[0] : ast;
+                                        const defs = node.create_definitions || node.createDefinitions || [];
+                                        for (const d of defs) {
+                                            try {
+                                                const cname = (d.column && (d.column.column || d.column.name)) || d.name || d.field;
+                                                if (cname) { astColsRaw.push(String(cname).trim()); }
+                                            } catch { /* ignore per-column errors */ }
                                         }
+                                    }
 
-                                        // Add to cols list (keeps downstream logic compatible)
-                                        cols.push({ name: acNorm, rawName: rawAc, line: 0, start: 0, end: rawAc.length });
+                                    if (astColsRaw.length) {
+                                        // prepare sets for dedupe
+                                        const existingCols = new Set<string>(cols.map(c => normalizeName(c.name)));
+                                        const existingSymCols = new Set<string>((sym.columns || []).map((c: any) => normalizeName((c.rawName || c.name || "").replace(/^\[|\]$/g, ""))));
+                                        const set = columnsByTable.get(norm) || new Set<string>();
 
-                                        // Add to per-table set
-                                        set.add(acNorm);
+                                        // collect new local refs that we will add (deduped by pos)
+                                        const newLocalRefs: ReferenceDef[] = [];
 
-                                        // Add to sym.columns, avoiding duplicates
-                                        if (!sym.columns) { sym.columns = []; }
-                                        const alreadyInSym = (sym.columns as any[]).some((c: any) => normalizeName((c.rawName || c.name || "").replace(/^\[|\]$/g, "")) === acNorm);
-                                        if (!alreadyInSym) {
-                                            (sym.columns as any[]).push({
-                                                name: acNorm,
-                                                rawName: rawAc,
+                                        for (const rawAc of astColsRaw) {
+                                            const acNorm = normalizeName(rawAc);
+                                            if (existingCols.has(acNorm) || existingSymCols.has(acNorm) || set.has(acNorm)) {
+                                                continue;
+                                            }
+
+                                            // Add to cols list (keeps downstream logic compatible)
+                                            cols.push({ name: acNorm, rawName: rawAc, line: 0, start: 0, end: rawAc.length });
+
+                                            // Add to per-table set
+                                            set.add(acNorm);
+
+                                            // Add to sym.columns, avoiding duplicates
+                                            if (!sym.columns) { sym.columns = []; }
+                                            const alreadyInSym = (sym.columns as any[]).some((c: any) => normalizeName((c.rawName || c.name || "").replace(/^\[|\]$/g, "")) === acNorm);
+                                            if (!alreadyInSym) {
+                                                (sym.columns as any[]).push({
+                                                    name: acNorm,
+                                                    rawName: rawAc,
+                                                    line: i + 1,
+                                                    start: 0,
+                                                    end: rawAc.length
+                                                });
+                                            }
+
+                                            // prepare local ref
+                                            const newRef: ReferenceDef = {
+                                                name: `${norm}.${acNorm}`,
+                                                uri: normUri,
                                                 line: i + 1,
                                                 start: 0,
-                                                end: rawAc.length
-                                            });
+                                                end: rawAc.length,
+                                                kind: "column"
+                                            };
+                                            const posKey = `${newRef.line}:${newRef.start}:${newRef.end}`;
+                                            if (!newLocalRefs.some(r => `${r.line}:${r.start}:${r.end}` === posKey)) {
+                                                newLocalRefs.push(newRef);
+                                            }
                                         }
 
-                                        // prepare local ref
-                                        const newRef: ReferenceDef = {
-                                            name: `${norm}.${acNorm}`,
-                                            uri: normUri,
-                                            line: i + 1,
-                                            start: 0,
-                                            end: rawAc.length,
-                                            kind: "column"
-                                        };
-                                        const posKey = `${newRef.line}:${newRef.start}:${newRef.end}`;
-                                        if (!newLocalRefs.some(r => `${r.line}:${r.start}:${r.end}` === posKey)) {
-                                            newLocalRefs.push(newRef);
+                                        // persist set back
+                                        columnsByTable.set(norm, set);
+
+                                        // merge newLocalRefs into the per-file references (dedupe by position)
+                                        for (const ref of newLocalRefs) {
+                                            const key = ref.name;
+                                            const existingForKey = getRefs(key).filter(r => r.uri === normUri);
+
+                                            // mergedByPos will dedupe by line:start:end
+                                            const mergedByPos = new Map<string, ReferenceDef>();
+                                            for (const r of existingForKey) {
+                                                mergedByPos.set(`${r.line}:${r.start}:${r.end}`, r);
+                                            }
+                                            mergedByPos.set(`${ref.line}:${ref.start}:${ref.end}`, ref);
+
+                                            const merged = Array.from(mergedByPos.values());
+                                            setRefsForFile(key, normUri, merged);
                                         }
                                     }
-
-                                    // persist set back
-                                    columnsByTable.set(norm, set);
-
-                                    // merge newLocalRefs into the per-file references (dedupe by position)
-                                    for (const ref of newLocalRefs) {
-                                        const key = ref.name;
-                                        const existingForKey = getRefs(key).filter(r => r.uri === normUri);
-
-                                        // mergedByPos will dedupe by line:start:end
-                                        const mergedByPos = new Map<string, ReferenceDef>();
-                                        for (const r of existingForKey) {
-                                            mergedByPos.set(`${r.line}:${r.start}:${r.end}`, r);
-                                        }
-                                        mergedByPos.set(`${ref.line}:${ref.start}:${ref.end}`, ref);
-
-                                        const merged = Array.from(mergedByPos.values());
-                                        setRefsForFile(key, normUri, merged);
-                                    }
+                                } catch (mergeErr) {
                                 }
-                            } catch (mergeErr) {
-                            }
-                        })
-                        .catch((pErr) => {
-                        });
+                            })
+                            .catch((pErr) => {
+                            });
+                    }
+                } catch (e) {
                 }
-            } catch (e) {
             }
 
             // Keep columnsByTable in sync (normalized)
@@ -628,4 +682,64 @@ export function indexText(uri: string, text: string): void {
         }
     }
 }
+
+
+export async function parseColumnsFromCreateView(blockText: string, startLine: number) {
+    // Try parse with AST worker (timeout small so indexer stays snappy)
+    const ast = await parseSqlWithWorker(blockText, { database: "mssql" }, 800).catch(() => null);
+    if (!ast) { return []; }
+
+    const colsOut: Array<{ name: string; rawName: string; type?: string; line: number; start: number; end: number }> = [];
+
+    // find the first SELECT node in the AST (the view's defining select)
+    let foundSelect: any = null;
+    const roots = Array.isArray(ast) ? ast : [ast];
+    for (const root of roots) {
+        walkAst(root, (n: any) => {
+            if (foundSelect) { return; }
+            if (!n || typeof n !== "object") { return; }
+            if (n.type === "select" || n.ast === "select") {
+                foundSelect = n;
+            }
+        });
+        if (foundSelect) { break; }
+    }
+
+    if (!foundSelect) { return []; }
+
+    // node.columns or node.columns/ node.columns may be the list depending on parser output
+    const colNodes = (foundSelect.columns || foundSelect.columns || foundSelect.fields || []) as any[];
+
+    let lineGuess = startLine; // we don't have precise positions for each expr easily; use startLine as fallback
+    for (const c of colNodes) {
+        if (!c) { continue; }
+        // prefer alias / AS name
+        let alias = (c.as || c.alias || (c.as && c.as.value) || (c.alias && c.alias.value));
+        if (alias && typeof alias === "object") { alias = alias.value || alias.name; }
+        if (alias && typeof alias === "string") {
+            const n = normalizeName(alias);
+            colsOut.push({ name: n, rawName: alias, line: lineGuess, start: 0, end: 0 });
+            continue;
+        }
+
+        // no explicit alias → try to extract a referenced column name (e.g. d.DepartmentId)
+        // column node may be `c.expr` or `c` itself
+        const candidate = extractColumnName(c.expr ?? c);
+        if (candidate) {
+            colsOut.push({ name: candidate, rawName: candidate, line: lineGuess, start: 0, end: 0 });
+            continue;
+        }
+
+        // fallback: try to stringify expression minimally (strip whitespace) as rawName
+        try {
+            const raw = JSON.stringify(c).slice(0, 80);
+            colsOut.push({ name: normalizeName(raw), rawName: raw, line: lineGuess, start: 0, end: 0 });
+        } catch (e) {
+            // skip
+        }
+    }
+
+    return colsOut;
+}
+
 

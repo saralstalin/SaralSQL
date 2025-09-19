@@ -9,7 +9,7 @@
     "VS Code"
   ],
   "license": "MIT",
-  "version": "0.2.8",
+  "version": "0.2.10",
   "engines": {
     "vscode": "^1.103.0"
   },

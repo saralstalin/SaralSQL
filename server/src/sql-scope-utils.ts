@@ -136,19 +136,28 @@ function splitTopLevelCommas(s: string) {
 export function extractLocalTableDefsFromText(bodyText: string | null): LocalTableMap {
   const map = new Map<string, LocalTable>();
   if (!bodyText) { return map; }
+
+
+
+  const normalizeKey = (raw: string) => normalizeName(raw);
+
   try {
     let m: RegExpExecArray | null;
+
+    // name pattern: optional leading @ or #, then either bracketed/quoted or plain identifier (allow dots)
+    const namePattern = '[@#]?(?:\\[[^\\]]+\\]|"[^"]+"|`[^`]+`|[A-Za-z0-9_\\.]+)';
+
     // DECLARE @tv TABLE (...)
-    const declareTableRe = /\bdeclare\s+(@[A-Za-z0-9_]+)\s+table\s*\(([\s\S]*?)\)\s*(?:;|$)/ig;
+    const declareTableRe = new RegExp('\\bdeclare\\s+(' + namePattern + ')\\s+table\\s*\\(([\\s\\S]*?)\\)\\s*(?:;|$)', 'ig');
     while ((m = declareTableRe.exec(bodyText))) {
-      const varName = m[1];
+      const varNameRaw = m[1];
       const colsRaw = m[2];
       const colsParts = splitTopLevelCommas(colsRaw);
       const cols: Array<{ name: string; type?: string }> = [];
       for (const part of colsParts) {
-        const nameMatch = /^\s*(?:\[([^\]]+)\]|"([^"]+)"|`([^`]+)`|([A-Za-z0-9_]+))/i.exec(part);
+        const nameMatch = /^\s*(?:\[([^\]]+)\]|"([^"]+)"|`([^`]+)`|([A-Za-z0-9_\.]+))/i.exec(part);
         if (!nameMatch) { continue; }
-        const colName = nameMatch[1] || nameMatch[2] || nameMatch[3] || nameMatch[4];
+        const colNameRaw = nameMatch[1] || nameMatch[2] || nameMatch[3] || nameMatch[4];
         let rest = part.slice((nameMatch[0] || "").length).trim();
         rest = rest.replace(/\bPRIMARY\s+KEY\b/ig, "")
           .replace(/\bNOT\s+NULL\b/ig, "")
@@ -156,22 +165,23 @@ export function extractLocalTableDefsFromText(bodyText: string | null): LocalTab
           .replace(/\bIDENTITY\s*\([^\)]*\)/ig, "")
           .trim();
         const colType = rest ? rest.split(/\s+/).slice(0, 3).join(" ") : undefined;
-        cols.push({ name: colName, type: colType });
+        cols.push({ name: normalizeName(colNameRaw), type: colType });
       }
-      map.set(varName.toLowerCase(), { name: varName, columns: cols });
+      const key = normalizeKey(varNameRaw);
+      map.set(key, { name: normalizeName(varNameRaw), columns: cols });
     }
 
-    // CREATE TABLE #tmp (...)
-    const createTempRe = /\bcreate\s+table\s+(#?[A-Za-z0-9_]+)\s*\(([\s\S]*?)\)\s*(?:;|$)/ig;
+    // CREATE TABLE #tmp (...)  (allow leading @/# and quoted/bracketed names)
+    const createTempRe = new RegExp('\\bcreate\\s+table\\s+(' + namePattern + ')\\s*\\(([\\s\\S]*?)\\)\\s*(?:;|$)', 'ig');
     while ((m = createTempRe.exec(bodyText))) {
-      const tblName = m[1];
+      const tblNameRaw = m[1];
       const colsRaw = m[2];
       const colsParts = splitTopLevelCommas(colsRaw);
       const cols: Array<{ name: string; type?: string }> = [];
       for (const part of colsParts) {
-        const nameMatch = /^\s*(?:\[([^\]]+)\]|"([^"]+)"|`([^`]+)`|([A-Za-z0-9_]+))/i.exec(part);
+        const nameMatch = /^\s*(?:\[([^\]]+)\]|"([^"]+)"|`([^`]+)`|([A-Za-z0-9_\.]+))/i.exec(part);
         if (!nameMatch) { continue; }
-        const colName = nameMatch[1] || nameMatch[2] || nameMatch[3] || nameMatch[4];
+        const colNameRaw = nameMatch[1] || nameMatch[2] || nameMatch[3] || nameMatch[4];
         let rest = part.slice((nameMatch[0] || "").length).trim();
         rest = rest.replace(/\bPRIMARY\s+KEY\b/ig, "")
           .replace(/\bNOT\s+NULL\b/ig, "")
@@ -179,22 +189,25 @@ export function extractLocalTableDefsFromText(bodyText: string | null): LocalTab
           .replace(/\bIDENTITY\s*\([^\)]*\)/ig, "")
           .trim();
         const colType = rest ? rest.split(/\s+/).slice(0, 3).join(" ") : undefined;
-        cols.push({ name: colName, type: colType });
+        cols.push({ name: normalizeName(colNameRaw), type: colType });
       }
-      map.set(tblName.toLowerCase(), { name: tblName, columns: cols });
+      const key = normalizeKey(tblNameRaw);
+      map.set(key, { name: normalizeName(tblNameRaw), columns: cols });
     }
 
-    // INSERT INTO #tmp (col1, col2, ...)
-    const insertColsRe = /\binsert\s+into\s+(#?[A-Za-z0-9_]+)\s*\(([^)]+)\)/ig;
+    // INSERT INTO #tmp (col1, col2, ...)  — keep behavior but normalize & merge into existing
+    const insertColsRe = new RegExp('\\binsert\\s+into\\s+(' + namePattern + ')\\s*\\(([^)]+)\\)', 'ig');
     while ((m = insertColsRe.exec(bodyText))) {
-      const tblName = m[1];
+      const tblNameRaw = m[1];
       const colsList = m[2];
-      const colNames = colsList.split(",").map(s => s.trim().replace(/^\[|\]$/g, "").replace(/^"|"$/g, "").replace(/^`|`$/g, "")).filter(Boolean);
+      const colNames = colsList.split(",")
+        .map(s => normalizeName(s.trim()))
+        .filter(Boolean);
       if (colNames.length > 0) {
-        const key = tblName.toLowerCase();
+        const key = normalizeKey(tblNameRaw);
         const existing = map.get(key);
         if (!existing) {
-          map.set(key, { name: tblName, columns: colNames.map(n => ({ name: n })) });
+          map.set(key, { name: normalizeName(tblNameRaw), columns: colNames.map(n => ({ name: n })) });
         } else {
           const existingNames = new Set(existing.columns.map(c => c.name.toLowerCase()));
           for (const n of colNames) {
@@ -204,31 +217,31 @@ export function extractLocalTableDefsFromText(bodyText: string | null): LocalTab
       }
     }
 
-    // SELECT ... INTO #tmp
-    const selectIntoRe = /\bselect\s+([\s\S]*?)\binto\s+(#?[A-Za-z0-9_]+)\b/ig;
+    // SELECT ... INTO #tmp  — attempt to capture AS/alias names or final identifier
+    const selectIntoRe = new RegExp('\\bselect\\s+([\\s\\S]*?)\\binto\\s+(' + namePattern + ')\\b', 'ig');
     while ((m = selectIntoRe.exec(bodyText))) {
       const selectList = m[1];
-      const tblName = m[2];
+      const tblNameRaw = m[2];
       const parts = splitTopLevelCommas(selectList);
       const colNames: string[] = [];
       for (const p of parts) {
-        const asMatch = /\bas\s+(?:\[([^\]]+)\]|"([^"]+)"|`([^`]+)`|([A-Za-z0-9_]+))\b/i.exec(p);
+        const asMatch = /\bas\s+(?:\[([^\]]+)\]|"([^"]+)"|`([^`]+)`|([A-Za-z0-9_\.]+))\b/i.exec(p);
         if (asMatch) {
           const name = asMatch[1] || asMatch[2] || asMatch[3] || asMatch[4];
-          colNames.push(name);
+          colNames.push(normalizeName(name));
           continue;
         }
-        const endIdent = /(?:\[([^\]]+)\]|"([^"]+)"|`([^`]+)`|([A-Za-z0-9_]+))\s*$/i.exec(p);
+        const endIdent = /(?:\[([^\]]+)\]|"([^"]+)"|`([^`]+)`|([A-Za-z0-9_\.]+))\s*$/i.exec(p);
         if (endIdent) {
           const name = endIdent[1] || endIdent[2] || endIdent[3] || endIdent[4];
-          colNames.push(name);
+          colNames.push(normalizeName(name));
         }
       }
       if (colNames.length > 0) {
-        const key = tblName.toLowerCase();
+        const key = normalizeKey(tblNameRaw);
         const existing = map.get(key);
         if (!existing) {
-          map.set(key, { name: tblName, columns: colNames.map(n => ({ name: n })) });
+          map.set(key, { name: normalizeName(tblNameRaw), columns: colNames.map(n => ({ name: n })) });
         } else {
           const existingNames = new Set(existing.columns.map(c => c.name.toLowerCase()));
           for (const n of colNames) {
@@ -324,10 +337,10 @@ export function buildParamMapForDocAtPos(doc: TextDocument, pos: Position): Map<
 }
 
 export function buildLocalTableMapForDocAtPos(doc: TextDocument, pos: Position): LocalTableMap {
-  const abs = getOffsetForPosition(doc, pos);
+  //const abs = getOffsetForPosition(doc, pos);
   const full = doc.getText();
-  const body = getEnclosingProcedureBody(full, abs);
-  return extractLocalTableDefsFromText(body);
+  //const body = getEnclosingProcedureBody(full, abs);
+  return extractLocalTableDefsFromText(full);
 }
 
 

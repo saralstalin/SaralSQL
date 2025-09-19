@@ -893,9 +893,11 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
 
     // include INSERT/MERGE/SELECT-...-INTO targets as candidates
     try {
-      const insertIntoRe = /\binsert\s+into\s+([a-zA-Z0-9_\[\]\."]+)/gi;
-      const mergeIntoRe = /\bmerge\s+into\s+([a-zA-Z0-9_\[\]\."]+)/gi;
-      const selectIntoRe = /\bselect\b[\s\S]*?\binto\s+([a-zA-Z0-9_\[\]\."]+)/gi;
+      // allow leading @/# for temp tables and table variables
+      const insertIntoRe = /\binsert\s+into\s+([@#]?[a-zA-Z0-9_\[\]\."]+)/gi;
+      const mergeIntoRe = /\bmerge\s+into\s+([@#]?[a-zA-Z0-9_\[\]\."]+)/gi;
+      const selectIntoRe = /\bselect\b[\s\S]*?\binto\s+([@#]?[a-zA-Z0-9_\[\]\."]+)/gi;
+
 
       for (const m of cleanedStmt.matchAll(insertIntoRe)) {
         if (m && m[1]) {
@@ -947,7 +949,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
           const assignsText = cleanedStmt.slice(setRegionStart, setRegionEnd);
 
           // capture left-hand targets (allow qualified identifier)
-          const lhsRe = /([A-Za-z0-9_\[\]"`\.]+(?:\.[A-Za-z0-9_\[\]"`\.]+)*)\s*=/g;
+          const lhsRe = /([@#]?[A-Za-z0-9_\[\]"`\.]+(?:\.[@#]?[A-Za-z0-9_\[\]"`\.]+)*)\s*=/g;
           let m: RegExpExecArray | null;
           const hoverOffset = doc.offsetAt(range.start);
 
@@ -1247,7 +1249,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
     // final heuristic: if statement is UPDATE prefer its target table
     try {
       if (!handledUpdateLhs) {
-        const updateMatch = /\bupdate\s+([a-zA-Z0-9_\[\]\."]+)/i.exec(cleanedStmt);
+        const updateMatch = /\bupdate\s+([@#]?[a-zA-Z0-9_\[\]\."]+)/i.exec(cleanedStmt);
         if (updateMatch && updateMatch[1]) {
           const rawUpdateMatch = normalizeName(updateMatch[1]);
           const tnorm = normalizeName(rawUpdateMatch.replace(/^dbo\./i, ""));
