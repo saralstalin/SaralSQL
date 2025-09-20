@@ -699,20 +699,56 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
       const { colRaw, colType, containerRawName, containerIsType, aliasToken, range, suggestAlias, suggestionAlias } = opts;
       const kindLabel = containerIsType ? "table type" : "table";
 
+      // helpers
+      const isIdentifier = (s: string | undefined | null) => {
+        if (!s) { return false; }
+        return /^[A-Za-z_][A-Za-z0-9_]*$/.test(String(s).trim());
+      };
+      const stripDecorators = (s: string | undefined | null) => {
+        if (!s) { return ""; }
+        return String(s).replace(/^\s*dbo\./i, "").replace(/^\[|\]$/g, "").replace(/^"|"$/g, "").replace(/`/g, "").trim();
+      };
+
+      // validate aliasToken: must be a simple identifier, not a SQL keyword, and not equal to the container name
+      let aliasToUse: string | null = null;
+      try {
+        if (aliasToken) {
+          const candidate = String(aliasToken).trim();
+          const candidateId = stripDecorators(candidate);
+          if (isIdentifier(candidateId) && !isSqlKeyword(candidateId.toLowerCase())) {
+            if (normalizeName(candidateId) !== normalizeName(stripDecorators(containerRawName))) {
+              aliasToUse = candidate; // preserve original casing
+            } else {
+            }
+          } else {
+          }
+        }
+      } catch {
+        aliasToUse = null;
+      }
+
       // alias/parameter display
       let aliasPart = "";
-      if (aliasToken) {
-        if (String(aliasToken).startsWith("@") || String(aliasToken).startsWith("#")) {
-          aliasPart = ` (parameter \`${aliasToken}\`)`;
+      if (aliasToUse) {
+        if (String(aliasToUse).startsWith("@") || String(aliasToUse).startsWith("#")) {
+          aliasPart = ` (parameter \`${aliasToUse}\`)`;
         } else {
-          aliasPart = ` (alias \`${aliasToken}\`)`;
+          aliasPart = ` (alias \`${aliasToUse}\`)`;
         }
       }
 
       // suggestion line when token was unqualified but an alias is available
       let suggestionPart = "";
       if (suggestAlias && suggestionAlias) {
-        suggestionPart = `\n\n_Suggestion:_ qualify as \`${suggestionAlias}.${colRaw}\``;
+        try {
+          const sug = String(suggestionAlias).trim();
+          const sugId = stripDecorators(sug);
+          if (isIdentifier(sugId) && !isSqlKeyword(sugId.toLowerCase()) && normalizeName(sugId) !== normalizeName(stripDecorators(containerRawName))) {
+            suggestionPart = `\n\n_Suggestion:_ qualify as \`${sug}.${colRaw}\``;
+          } else {
+          }
+        } catch {
+        }
       }
 
       const typePart = colType ? ` — ${colType}` : "";
@@ -720,27 +756,59 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
       return { contents: { kind: MarkupKind.Markdown, value }, range };
     }
 
+
+    // REPLACEMENT: robust findAliasForDef with debug logging and strict validation
     const findAliasForDef = (def: any, stmtAliases?: Map<string, string>): string | null => {
       if (!stmtAliases || !def) { return null; }
+
+      // helper: strip decorators and schema prefix; keep minimal name for comparison
+      const stripDecoratorsAndSchema = (s: string | null | undefined) => {
+        if (!s) { return ""; }
+        // remove surrounding [] / "" / ``, remove leading dots, remove schema prefix like dbo.
+        let t = String(s);
+        t = t.replace(/^\.+/, ""); // leading dots
+        t = t.replace(/^\s*dbo\./i, ""); // common schema
+        t = t.replace(/^\[|\]$/g, ""); // brackets
+        t = t.replace(/^"|"$/g, "");
+        t = t.replace(/`/g, "");
+        return t.trim();
+      };
+
       try {
-        const defNameNorm = normalizeName(def.rawName ?? def.name);
+        const defNameRaw = def.rawName ?? def.name;
+        const defNameNorm = normalizeName(defNameRaw);
+
         for (const [aliasKey, mappedTable] of stmtAliases.entries()) {
-          const aliasTrim = String(aliasKey).trim();
+          try {
+            const aliasTrim = String(aliasKey).trim();
+            const aliasIdentifier = stripDecoratorsAndSchema(aliasTrim);
 
-          // only accept aliasKey that looks like an identifier and is not a SQL keyword
-          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(aliasTrim)) { continue; }
-          if (isSqlKeyword(aliasTrim.toLowerCase())) { continue; }
+            // Only accept simple identifier alias (no dots, no symbols)
+            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(aliasIdentifier)) { continue; }
 
-          if (normalizeName(mappedTable) === defNameNorm) {
-            // If alias is effectively the same as the table name, skip it
-            if (normalizeName(aliasTrim) === defNameNorm) { continue; }
+            // Reject SQL keywords
+            if (isSqlKeyword(aliasIdentifier.toLowerCase())) { continue; }
 
-            // return original-cased alias
+            // If mappedTable doesn't match this def, skip
+            if (normalizeName(mappedTable) !== defNameNorm) { continue; }
+
+            // If alias equals the table name (full or short), reject:
+            // alias "TransportRequests" for "dbo.TransportRequests" is considered same -> skip.
+            const mappedShort = stripDecoratorsAndSchema(mappedTable);
+            if (normalizeName(aliasIdentifier) === normalizeName(mappedShort)) {
+              // alias is same as table name -> not a real alias
+              continue;
+            }
+
+            // PASSED ALL CHECKS -> return original-cased aliasTrim
             return aliasTrim;
+          } catch (inner) {
+            // ignore this entry and continue
+            continue;
           }
         }
-      } catch {
-        // ignore errors and return null
+      } catch (ex) {
+        // ignore and return null
       }
       return null;
     };

@@ -279,29 +279,58 @@ export function getWordRangeAtPosition(doc: TextDocument, pos: { line: number; c
 }
 
 export function extractAliases(text: string): Map<string, string> {
-    const aliases = new Map<string, string>();
+  const aliases = new Map<string, string>();
 
-    // Table aliases: supports [dbo].[X] [a], dbo.[X] a, schema.X AS alias
-    // new: allow optional leading @ or # on the table token
-    const tableAliasRegex = /\b(from|join)\s+([@#]?(?:\[?[a-zA-Z0-9_]+\]?)(?:\.\[?[a-zA-Z0-9_]+\]?)?)\s+(?:as\s+)?(\[?[a-zA-Z0-9_]+\]?)/gi;
+  // helper validators
+  const isIdentifier = (s: string) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
+  const stripBrackets = (s: string) => String(s || "").replace(/^\[|\]$/g, "").replace(/^"|"$/g, "").replace(/`/g, "").trim();
+  const stripDecoratorsAndSchema = (s: string | null | undefined) => {
+    if (!s) {return "";}
+    let t = String(s);
+    t = t.replace(/^\s*dbo\./i, ""); // remove common schema
+    t = t.replace(/^\[|\]$/g, "");
+    t = t.replace(/^"|"$/g, "");
+    t = t.replace(/`/g, "");
+    return t.trim();
+  };
 
-    let m: RegExpExecArray | null;
-    while ((m = tableAliasRegex.exec(text))) {
-        const rawTable = m[2];
-        const alias = m[3].replace(/[\[\]]/g, "").toLowerCase(); // strip brackets
-        aliases.set(alias, normalizeName(rawTable));
+  // 1) Table aliases from FROM / JOIN: supports [dbo].[X] alias, dbo.X AS alias, allow optional @/# on table token
+  const tableAliasRegex = /\b(?:from|join)\s+([@#]?(?:\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z0-9_\.]+))(?:\s+(?:as\s+)?([A-Za-z_][A-Za-z0-9_]*|\[[A-Za-z0-9_]+\]))?/gi;
+
+  let m: RegExpExecArray | null;
+  while ((m = tableAliasRegex.exec(text))) {
+    const rawTable = m[1];
+    const aliasRaw = m[2];
+    if (!aliasRaw) {
+      continue; // no alias explicitly provided
     }
 
-    // Subquery aliases: FROM (SELECT ...) x or FROM (SELECT ...) AS x
-    const subqueryAliasRegex = /\)\s+(?:as\s+)?([a-zA-Z0-9_]+)/gi;
-    let sm: RegExpExecArray | null;
-    while ((sm = subqueryAliasRegex.exec(text))) {
-        const alias = sm[1].toLowerCase();
-        aliases.set(alias, "__subquery__");
-    }
+    const aliasKey = stripBrackets(aliasRaw).trim();
+    // Reject obviously invalid alias tokens
+    if (!isIdentifier(aliasKey)) { continue; }
+    if (isSqlKeyword(aliasKey.toLowerCase())) { continue; }
 
-    return aliases;
+    // Avoid alias that is identical to table name (e.g. FROM dbo.X X)
+    const tblShort = stripDecoratorsAndSchema(rawTable);
+    if (normalizeName(tblShort) === normalizeName(aliasKey)) { continue; }
+
+    aliases.set(aliasKey.toLowerCase(), normalizeName(rawTable));
+  }
+
+  // 2) Subquery aliases: only capture when preceded directly by FROM/JOIN (...) alias
+  const subqueryAliasRegex = /\b(?:from|join)\s*\(\s*([\s\S]*?)\s*\)\s*(?:as\s+)?([A-Za-z_][A-Za-z0-9_]*)/gi;
+  let sm: RegExpExecArray | null;
+  while ((sm = subqueryAliasRegex.exec(text))) {
+    const aliasRaw = sm[2];
+    const aliasKey = String(aliasRaw || "").trim();
+    if (!isIdentifier(aliasKey)) { continue; }
+    if (isSqlKeyword(aliasKey.toLowerCase())) { continue; }
+    aliases.set(aliasKey.toLowerCase(), "__subquery__");
+  }
+
+  return aliases;
 }
+
 
 export function getLineStarts(text: string): number[] {
     const starts: number[] = [0];
