@@ -13,6 +13,7 @@ import {
 import * as url from "url";
 import { isAstPoolReady, parseSqlWithWorker } from "./parser-pool";
 import { resolveColumnFromAst, walkAst, extractColumnName } from "./ast-utils";
+import { collectCandidateTablesFromStatement } from "./sql-scope-utils";
 
 export interface ColumnDef {
     name: string;
@@ -209,7 +210,12 @@ export function indexText(uri: string, text: string): void {
     }
 
     // Cache for statement scopes per line (avoids O(N²))
-    const stmtScopeByLine = new Map<number, { text: string; tablesInScope: string[] }>();
+    type StmtScope = {
+        text: string;
+        tablesInScope: string[];
+        stmtAliases?: Map<string, string>;
+    };
+    const stmtScopeByLine = new Map<number, StmtScope>();
 
     // --- scan for definitions ---
     for (let i = 0; i < lines.length; i++) {
@@ -472,8 +478,19 @@ export function indexText(uri: string, text: string): void {
         for (let m2 = aliasColRegexG.exec(clean); m2; m2 = aliasColRegexG.exec(clean)) {
             const alias = m2[1].toLowerCase();
             const col = normalizeName(m2[2].replace(/[\[\]]/g, ""));
-            const table = aliases.get(alias);
+
+            // prefer statement-scoped aliases (fall back to file-level aliases map)
+            const stmt = stmtScopeByLine.get(i);
+            const stmtAliases = stmt?.stmtAliases;
+            let table = stmtAliases?.get(alias) || aliases.get(alias);
+
             if (!table) { continue; }
+
+            // if alias maps to a subquery token (your extractAliases might mark it specially), skip mapping
+            if (typeof table === "string" && table.toLowerCase() === "__subquery__") {
+                // do not create a table-column ref for subquery aliases
+                continue;
+            }
 
             const key = `${normalizeName(table)}.${col}`;
             localRefs.push({
@@ -484,6 +501,7 @@ export function indexText(uri: string, text: string): void {
                 end: m2.index + m2[0].length,
                 kind: "column"
             });
+
         }
 
         // unaliased column usages (allow [Column])
@@ -504,17 +522,55 @@ export function indexText(uri: string, text: string): void {
             let scope = stmtScopeByLine.get(i);
             if (!scope) {
                 const stmtText = getCurrentStatement(
-                    { getText: () => text } as any,  // no documents needed
+                    { getText: () => text } as any,
                     { line: i, character: 0 }
                 );
 
-                const tablesInScope: string[] = [];
-                fromJoinRegexG.lastIndex = 0;
-                for (let fm = fromJoinRegexG.exec(stmtText); fm; fm = fromJoinRegexG.exec(stmtText)) {
-                    tablesInScope.push(normalizeName(fm[2]));
+                // Use robust helper to collect candidate tables for this statement.
+                // collectCandidateTablesFromStatement may return a Set<string> or string[]; normalize to string[]
+                let tablesInScopeArr: string[] = [];
+                try {
+                    const maybe = collectCandidateTablesFromStatement(stmtText);
+                    if (Array.isArray(maybe)) {
+                        tablesInScopeArr = maybe;
+                    } else if (maybe instanceof Set) {
+                        tablesInScopeArr = Array.from(maybe);
+                    } else if (maybe) {
+                        // fallback: try to coerce iterable
+                        try {
+                            tablesInScopeArr = Array.from(maybe as Iterable<string>);
+                        } catch {
+                            tablesInScopeArr = [];
+                        }
+                    } else {
+                        tablesInScopeArr = [];
+                    }
+                } catch (e) {
+                    // fallback to previous simple regex if helper fails
+                    const tmp: string[] = [];
+                    fromJoinRegexG.lastIndex = 0;
+                    for (let fm = fromJoinRegexG.exec(stmtText); fm; fm = fromJoinRegexG.exec(stmtText)) {
+                        tmp.push(normalizeName(fm[2]));
+                    }
+                    tablesInScopeArr = tmp;
                 }
 
-                scope = { text: stmtText, tablesInScope };
+                // Compute statement-scoped aliases from the statement text (important!)
+                let stmtAliasesMap: Map<string, string>;
+                try {
+                    stmtAliasesMap = extractAliases(stmtText) || new Map();
+                } catch (e) {
+                    stmtAliasesMap = new Map();
+                }
+
+                // Now build strongly-typed scope object
+                const newScope: StmtScope = {
+                    text: stmtText,
+                    tablesInScope: tablesInScopeArr,
+                    stmtAliases: stmtAliasesMap
+                };
+
+                scope = newScope;
                 stmtScopeByLine.set(i, scope);
             }
 
