@@ -61,7 +61,7 @@ import {
   buildParamMapForDocAtPos,
   buildLocalTableMapForDocAtPos,
   collectCandidateTablesFromStatement,
-  resolveAliasTarget, isTokenLocalTable
+  resolveAliasTarget, isTokenLocalTable, buildAliasToDefMap
 } from "./sql-scope-utils"; // adjust path to where you placed the utils    
 
 // ---------- Connection + Documents ----------
@@ -364,59 +364,38 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
 
     const items: CompletionItem[] = [];
 
-    // ---------- Case A: alias-dot completions, e.g. "t." or "[t]." ----------
-    // allow bracketed alias like [t]
-    const aliasDotMatch = /([a-zA-Z0-9_\[\]]+)\.$/.exec(linePrefix);
+    //alias-dot completions, e.g. "t." or "[t]."
+    const aliasDotMatch = /(?:\b|[\[\]"`])([A-Za-z0-9_\$#@]+)(?:\]|\")?\.?$/.exec(linePrefix);
     if (aliasDotMatch) {
-      // alias token typed (may be bracketed like [lw])
-      const aliasLower = normalizeName(aliasDotMatch[1]);
+      const aliasRaw = aliasDotMatch[1];
+      const alias = aliasRaw.replace(/^[\["`]+|[\]"`]+$/g, "").toLowerCase();
 
-      // 1) First try statement-scoped aliases (closest match)
-      let aliasesMap = new Map<string, string>();
-      try {
-        const stmtText = getCurrentStatement(doc, position);
-        aliasesMap = extractAliases(stmtText); // returns Map<alias, tableName>
-      } catch (e) {
-        // fall through to file-level alias map if something goes wrong
-        safeLog("[completion] extractAliases(statement) failed: " + String(e));
+      const aliasMap = buildAliasToDefMap(doc, position, tablesByName);
+      const resolved = aliasMap.get(alias);
+      if (!resolved) {
+        // strict behavior: show no alias-scoped columns (prevents mixing unrelated tables).
+        // Optionally: fall back to global columns if you prefer non-strict behavior.
+        return [];
       }
 
-      // 2) If alias not found in statement scope, fall back to file-level alias table
-      if (!aliasesMap.has(aliasLower)) {
-        const fileAliases = aliasesByUri.get(normUri) || aliasesByUri.get(rawUri) || new Map<string, string>();
-        // merge fileAliases into aliasesMap but keep statement-scoped precedence
-        for (const [k, v] of fileAliases.entries()) {
-          if (!aliasesMap.has(k)) { aliasesMap.set(k, v); }
-        }
+      const cols = (resolved as any).columns || [];
+      const items: CompletionItem[] = [];
+      const COL_LIMIT = 500;
+      let count = 0;
+      for (const c of cols) {
+        if (count++ > COL_LIMIT) {break;}
+        items.push({
+          label: c.rawName || c.name,
+          kind: CompletionItemKind.Field,
+          detail: c.type ? `Column in ${(resolved as any).name || (resolved as any).rawName} (${c.type})` : `Column in ${(resolved as any).name || (resolved as any).rawName}`,
+          insertText: c.rawName || c.name
+        });
       }
-
-      const tableName = aliasesMap.get(aliasLower);
-      if (tableName) {
-        const def = tablesByName.get(tableName);
-        if (def?.columns) {
-          // Deduplicate columns by normalized name to handle [Col] vs Col
-          const seenCols = new Set<string>();
-          const cols: CompletionItem[] = [];
-          for (const col of (def.columns as any[])) {
-            const normCol = normalizeName(col.rawName || col.name || "");
-            if (seenCols.has(normCol)) { continue; }
-            seenCols.add(normCol);
-            cols.push({
-              label: col.rawName,
-              kind: CompletionItemKind.Field,
-              detail: col.type ? `Column in ${def.rawName} (${col.type})` : `Column in ${def.rawName}`,
-              insertText: col.rawName
-            });
-          }
-          return cols;
-        }
-      } else {
-        // helpful debug log so we can see unresolved aliases in enterprise runs
-        safeLog(`[completion] alias '${aliasDotMatch}' not found in statement or file aliases for ${normUri}. linePrefix='${linePrefix.slice(-80)}'`);
-      }
+      return items;
     }
 
-    // ---------- Case B: after FROM / JOIN -> suggest table names ----------
+
+    // after FROM / JOIN -> suggest table names
     if (/\b(from|join)\s+[a-zA-Z0-9_\[\]]*$/i.test(linePrefix)) {
       for (const def of tablesByName.values()) {
         items.push({
@@ -428,10 +407,61 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
       return items;
     }
 
-    // ---------- Case C: inside SELECT -> suggest columns & tables (bounded) ----------
+    // inside SELECT -> suggest columns & tables (bounded)
     if (/\bselect\s+.*$/i.test(linePrefix)) {
       let colCount = 0;
       const COL_LIMIT = 500; // safety cap
+
+      // 1) gather candidate table names from the current statement (safer than whole file)
+      const stmtText = getCurrentStatement(doc, position) || doc.getText();
+      const candidateNames = collectCandidateTablesFromStatement(stmtText) || new Set<string>();
+
+      // 2) also include any local tables (temp tables / table variables / CREATE TABLE #tmp) known at this doc & pos
+      const localTableMap = buildLocalTableMapForDocAtPos(doc, position); // Map<string, LocalTable>
+      for (const localKey of localTableMap.keys()) {
+        candidateNames.add(localKey);
+      }
+
+      // 3) If we found candidate names, enumerate columns only from those; otherwise fall back to global
+      if (candidateNames.size > 0) {
+        // Convert normalized names -> candidate defs (if available in tablesByName)
+        for (const cand of candidateNames) {
+          // prefer exact match in tablesByName; allow short name if dotted name present
+          const def = tablesByName.get(cand) || tablesByName.get(cand.split(".").pop() || cand);
+          if (def && (def as any).columns) {
+            for (const col of (def as any).columns) {
+              if (colCount++ > COL_LIMIT) { break; }
+              items.push({
+                label: col.rawName,
+                kind: CompletionItemKind.Field,
+                detail: col.type ? `Column in ${def.rawName} (${col.type})` : `Column in ${def.rawName}`,
+                insertText: col.rawName
+              });
+            }
+          }
+        }
+
+        // include local table columns (from buildLocalTableMapForDocAtPos)
+        for (const [localName, localTbl] of localTableMap.entries()) {
+          for (const col of localTbl.columns) {
+            if (colCount++ > COL_LIMIT) { break; }
+            items.push({
+              label: col.rawName || col.name,
+              kind: CompletionItemKind.Field,
+              detail: col.type ? `Column in ${localTbl.name} (${col.type})` : `Column in ${localTbl.name}`,
+              insertText: col.rawName || col.name
+            });
+          }
+        }
+
+        // If items were added, return them (we scoped to statement)
+        if (items.length > 0) {
+          return items;
+        }
+      }
+
+      // Fallback: if no candidates (maybe very simple SELECT without FROM or heuristics failed),
+      // revert to the old behavior: enumerate all known table columns (bounded).
       for (const def of tablesByName.values()) {
         if ((def as any).columns) {
           for (const col of (def as any).columns) {
@@ -446,6 +476,8 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
         }
         if (colCount > COL_LIMIT) { break; }
       }
+
+      // Also include table names (unchanged)
       for (const def of tablesByName.values()) {
         items.push({
           label: def.rawName,

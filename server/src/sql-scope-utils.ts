@@ -2,7 +2,7 @@ import { TextDocument } from "vscode-languageserver-textdocument";
 import { Position } from "vscode-languageserver";
 import {
   normalizeName,
-  extractAliases,
+  extractAliases, getCurrentStatement
 } from "./text-utils";
 
 // Types
@@ -408,3 +408,120 @@ export function isTokenLocalTable(token: string | null | undefined, localMap?: L
   const key = cleaned.toLowerCase();
   return Boolean(localMap && localMap.has(key));
 }
+
+
+export function buildAliasToDefMap(
+  doc: TextDocument,
+  pos: Position,
+  tablesByName: Map<string, any>
+): Map<string, any> {
+  const aliasToDef = new Map<string, any>();
+  const text = doc.getText();
+  const stmtText = (typeof getCurrentStatement === "function") ? getCurrentStatement(doc, pos) || text : text;
+
+  // local tables (TVPs / #tmp / DECLARE TABLE / INSERT INTO ... )
+  const localTableMap: Map<string, any> = buildLocalTableMapForDocAtPos(doc, pos);
+
+  // build a set of local keys (normalized) for matching convenience
+  const localKeys = new Set<string>();
+  for (const k of localTableMap.keys()) {
+    localKeys.add(k.toLowerCase());
+    localKeys.add(k.replace(/^[@#]+/, "").toLowerCase());
+    localKeys.add(k.split(".").pop()!.toLowerCase());
+  }
+
+  const aliasMapRaw: unknown = extractAliases(stmtText);
+
+  // Safely get entries whether aliasMapRaw is a Map or a plain object
+  let entries: [string, string][] = [];
+  if (aliasMapRaw instanceof Map) {
+    entries = Array.from(aliasMapRaw.entries()) as [string, string][];
+  } else if (typeof aliasMapRaw === "object" && aliasMapRaw !== null) {
+    entries = Object.entries(aliasMapRaw as Record<string, string>);
+  }
+
+  for (const [aliasRaw, targetRaw] of entries) {
+    const alias = String(aliasRaw || "").toLowerCase();
+    const target = String(targetRaw || "").trim();
+    if (!alias || !target) {continue;}
+
+    // candidate normalized forms for lookup
+    const targetCandidates = [
+      normalizeName(target).toLowerCase(),
+      target.replace(/^[#@]+/, "").toLowerCase(),
+      target.split(".").pop()!.toLowerCase()
+    ];
+
+    // 1) Prefer local table resolution (e.g. FROM @tvp tsi -> localTableMap contains @tvp)
+    let resolvedLocal: any | undefined;
+    for (const cand of targetCandidates) {
+      if (localTableMap.has(cand)) {
+        resolvedLocal = localTableMap.get(cand);
+        break;
+      }
+      for (const k of localTableMap.keys()) {
+        if (
+          k.toLowerCase() === cand ||
+          k.replace(/^[@#]+/, "").toLowerCase() === cand ||
+          k.split(".").pop()!.toLowerCase() === cand
+        ) {
+          resolvedLocal = localTableMap.get(k);
+          break;
+        }
+      }
+      if (resolvedLocal) {break;}
+    }
+
+    if (resolvedLocal) {
+      aliasToDef.set(alias, resolvedLocal);
+      continue;
+    }
+
+    // 2) Try global tablesByName with a couple canonical name forms
+    const candidateGlobalNames = [
+      normalizeName(target),
+      target.split(".").pop() || target,
+      target.replace(/^\[|\]$/g, "")
+    ];
+
+    let foundGlobal: any | undefined;
+    for (const nm of candidateGlobalNames) {
+      if (!nm) {continue;}
+      if (tablesByName.has(nm)) { foundGlobal = tablesByName.get(nm); break; }
+      const nmLc = nm.toLowerCase();
+      if (tablesByName.has(nmLc)) { foundGlobal = tablesByName.get(nmLc); break; }
+    }
+
+    if (foundGlobal) {
+      aliasToDef.set(alias, foundGlobal);
+      continue;
+    }
+
+    // 3) Last resort: alias itself might be a local token (e.g., extractAliases missed it)
+    if (localTableMap.has(alias) || localKeys.has(alias)) {
+      for (const k of localTableMap.keys()) {
+        if (
+          k.toLowerCase() === alias ||
+          k.replace(/^[@#]+/, "").toLowerCase() === alias ||
+          k.split(".").pop()!.toLowerCase() === alias
+        ) {
+          aliasToDef.set(alias, localTableMap.get(k));
+          break;
+        }
+      }
+    }
+  }
+
+  // 4) Also expose locals by multiple canonical forms (so '@tvp', 'tvp', 'tvp' last segment are resolvable)
+  for (const k of localTableMap.keys()) {
+    const lc = k.toLowerCase();
+    if (!aliasToDef.has(lc)) {aliasToDef.set(lc, localTableMap.get(k));}
+    const stripped = k.replace(/^[@#]+/, "").toLowerCase();
+    if (!aliasToDef.has(stripped)) {aliasToDef.set(stripped, localTableMap.get(k));}
+    const last = k.split(".").pop()!.toLowerCase();
+    if (!aliasToDef.has(last)) {aliasToDef.set(last, localTableMap.get(k));}
+  }
+
+  return aliasToDef;
+}
+
