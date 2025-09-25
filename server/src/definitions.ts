@@ -20,8 +20,8 @@ export interface ColumnDef {
     rawName: string;
     type?: string;
     line: number;
-    start?: number; // ← add
-    end?: number;   // ← add
+    start?: number;
+    end?: number;
 }
 
 export interface SymbolDef {
@@ -178,26 +178,25 @@ export function indexText(uri: string, text: string): void {
     const fromJoinRegexG = /\b(from|join)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
     const procHeaderRegex = /create\s+(?:or\s+alter\s+)?(procedure|proc|function)\s+([\[\]\w\."']+(?:\.[\[\]\w\."']+)*)\s*\(([\s\S]*?)\)\s*(as|begin)/ig;
 
+    // parse procedure/function parameters into localRefs (unchanged)
     let m: RegExpExecArray | null;
     while ((m = procHeaderRegex.exec(cleanText)) !== null) {
         const wholeMatch = m[0];
         const paramsBlock = m[3];
         const matchIndex = m.index; // absolute offset of start of wholeMatch in clean
 
-        // safer: find the '(' inside the wholeMatch and compute paramsStartAbs from that
         const openParenInMatch = wholeMatch.indexOf('(');
-        // fallback: if something odd happens, fall back to paramsBlock index inside wholeMatch
         const paramsStartAbs = (openParenInMatch >= 0)
-            ? (matchIndex + openParenInMatch + 1)                 // right after '('
-            : (matchIndex + wholeMatch.indexOf(paramsBlock));    // less likely path
+            ? (matchIndex + openParenInMatch + 1)
+            : (matchIndex + wholeMatch.indexOf(paramsBlock));
 
         const paramTokenRegex = /@([A-Za-z_][A-Za-z0-9_]*)\b/g;
         let pm: RegExpExecArray | null;
         while ((pm = paramTokenRegex.exec(paramsBlock)) !== null) {
-            const raw = '@' + pm[1];                 // token text
-            const absOffset = paramsStartAbs + pm.index; // pm.index is relative to paramsBlock
+            const raw = '@' + pm[1];
+            const absOffset = paramsStartAbs + pm.index;
             const lineStarts = getLineStarts(cleanText);
-            const { line, character } = offsetToPosition(absOffset, lineStarts); // your helper
+            const { line, character } = offsetToPosition(absOffset, lineStarts);
             localRefs.push({
                 name: raw,
                 uri: normUri,
@@ -233,58 +232,43 @@ export function indexText(uri: string, text: string): void {
             // Build block from current line and parse columns (linear helper)
             const createBlock = lines.slice(i).join("\n");
             let cols = parseColumnsFromCreateBlock(createBlock, 0);
+            console.debug(`[indexText] ${rawName} parseColumnsFromCreateBlock -> ${cols?.length ?? 0}`);
 
-            // If this is a VIEW and the parenthesis-style extractor returned nothing,
-            // attempt to extract projected columns from the defining SELECT using AST.
-            if (kind === "VIEW" && (!cols || cols.length === 0)) {
+            if (kind === "VIEW") {
                 try {
-                    if (isAstPoolReady()) {
-                        // fire-and-forget (keep indexText synchronous)
-                        parseColumnsFromCreateView(createBlock, i)
-                            .then((viewCols) => {
-                                if (viewCols && viewCols.length) {
-                                    // ensure cols is an array we can mutate
-                                    cols = Array.isArray(cols) ? cols : [];
-                                    // PUSH the returned columns (correct spread and identifier)
-                                    cols.push(...viewCols);
-                                    // also update columnsByTable & sym.columns so other async logic
-                                    // + hover/completions eventually see them (optional)
-                                    try {
-                                        const normSet = columnsByTable.get(norm) || new Set<string>();
-                                        for (const vc of viewCols) {
-                                            const n = normalizeName(vc.name);
-                                            if (!normSet.has(n)) {
-                                                normSet.add(n);
-                                            }
-                                            if (!sym.columns) { sym.columns = []; }
-                                            const already = (sym.columns as any[]).some((c: any) =>
-                                                normalizeName((c.rawName || c.name || "").replace(/^\[|\]$/g, "")) === n
-                                            );
-                                            if (!already) {
-                                                (sym.columns as any[]).push({
-                                                    name: n,
-                                                    rawName: vc.rawName || vc.name,
-                                                    line: i + (vc.line || 0) + 1,
-                                                    start: vc.start || 0,
-                                                    end: (vc.end && vc.end > 0) ? vc.end : (String(vc.rawName || vc.name || "").length)
-                                                });
-                                            }
-                                        }
-                                        columnsByTable.set(norm, normSet);
-                                    } catch {
-                                        // non-fatal; keep indexing resilient
-                                    }
-                                }
-                            })
-                            .catch(() => {
-                                /* ignore parse errors */
-                            });
+                    const viewCols = parseColumnsFromCreateView(createBlock, i);
+                    console.debug(`[indexText] parseColumnsFromCreateView -> ${Array.isArray(viewCols) ? viewCols.length : "?"}`);
+
+                    if (viewCols && viewCols.length) {
+                        cols = Array.isArray(cols) ? cols : [];
+
+                        // map into the exact shape cols expects (start/end guaranteed numbers)
+                        const mapped = viewCols.map(v => {
+                            const raw = String(v.rawName ?? v.name ?? "")
+                                .replace(/^(?:\s*(?:\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][\w@#]*)\s*\.)+/g, "") // strip leading qualifiers like d. or [dbo].
+                                .replace(/^[\[\]`"]|[\[\]`"]$/g, "") // strip surrounding brackets/quotes from final token
+                                .trim();
+                            const normalizedName = normalizeName(raw);
+                            const lineNum = (typeof v.line === "number") ? v.line : i;
+                            const startNum = (typeof v.start === "number") ? v.start : 0;
+                            const endNum = (typeof v.end === "number") ? v.end : (raw.length);
+
+                            return {
+                                name: normalizedName,
+                                rawName: raw,
+                                type: v.type,
+                                line: lineNum,
+                                start: startNum,
+                                end: endNum
+                            } as { name: string; rawName: string; type?: string; line: number; start: number; end: number };
+                        });
+
+                        cols.push(...mapped);
                     }
-                } catch {
-                    // keep indexer resilient on AST errors — swallow
+                } catch (e) {
+                    console.debug("[indexText] parseColumnsFromCreateView failed:", e);
                 }
             }
-
 
             // Attempt optional AST parse for this CREATE block to discover any additional columns (pool-only)
             if (kind === "TABLE" || (kind === "TYPE" && /\bAS\s+TABLE\b/i.test(line))) {
@@ -325,7 +309,7 @@ export function indexText(uri: string, text: string): void {
                                             }
 
                                             // Add to cols list (keeps downstream logic compatible)
-                                            cols.push({ name: acNorm, rawName: rawAc, line: 0, start: 0, end: rawAc.length });
+                                            cols.push({ name: acNorm, rawName: rawAc, line: i /* fallback */, start: 0, end: rawAc.length });
 
                                             // Add to per-table set
                                             set.add(acNorm);
@@ -366,7 +350,6 @@ export function indexText(uri: string, text: string): void {
                                             const key = ref.name;
                                             const existingForKey = getRefs(key).filter(r => r.uri === normUri);
 
-                                            // mergedByPos will dedupe by line:start:end
                                             const mergedByPos = new Map<string, ReferenceDef>();
                                             for (const r of existingForKey) {
                                                 mergedByPos.set(`${r.line}:${r.start}:${r.end}`, r);
@@ -394,11 +377,18 @@ export function indexText(uri: string, text: string): void {
 
             // Definitions for columns with correct absolute positions
             (sym as any).columns = cols.map(c => {
-                const fileLine = i + c.line + 1;   // correct offset: skip CREATE line
+                // c.line is already absolute (0-based) because parseColumnsFromCreateView was passed `i`
+                const fileLine = c.line;
                 const sourceLineText = lines[fileLine] || "";
 
-                let startCol = sourceLineText.indexOf(c.rawName);
-                if (startCol < 0) { startCol = sourceLineText.indexOf(c.name); }
+                // improved start detection: try rawName, then name, then rawName without qualifier, then first non-space
+                let startCol = -1;
+                if (c.rawName) { startCol = sourceLineText.indexOf(String(c.rawName)); }
+                if (startCol < 0 && c.name) { startCol = sourceLineText.indexOf(String(c.name)); }
+                if (startCol < 0 && c.rawName) {
+                    const noQual = String(c.rawName).replace(/^[^.]+\./, "");
+                    startCol = sourceLineText.indexOf(noQual);
+                }
                 if (startCol < 0) { startCol = Math.max(0, sourceLineText.search(/\S/)); }
 
                 return {
@@ -407,17 +397,22 @@ export function indexText(uri: string, text: string): void {
                     type: c.type,
                     line: fileLine,
                     start: startCol,
-                    end: startCol + c.rawName.length
+                    end: startCol + (c.rawName ? String(c.rawName).length : String(c.name).length)
                 };
             }) as any;
 
             // Local column refs (definition locations)
             for (const c of cols) {
-                const fileLine = i + c.line + 1;
+                const fileLine = c.line;
                 const sourceLineText = lines[fileLine] || "";
 
-                let startCol = sourceLineText.indexOf(c.rawName);
-                if (startCol < 0) { startCol = sourceLineText.indexOf(c.name); }
+                let startCol = -1;
+                if (c.rawName) { startCol = sourceLineText.indexOf(String(c.rawName)); }
+                if (startCol < 0 && c.name) { startCol = sourceLineText.indexOf(String(c.name)); }
+                if (startCol < 0 && c.rawName) {
+                    const noQual = String(c.rawName).replace(/^[^.]+\./, "");
+                    startCol = sourceLineText.indexOf(noQual);
+                }
                 if (startCol < 0) { startCol = Math.max(0, sourceLineText.search(/\S/)); }
 
                 localRefs.push({
@@ -425,11 +420,12 @@ export function indexText(uri: string, text: string): void {
                     uri: normUri,
                     line: fileLine,
                     start: startCol,
-                    end: startCol + c.rawName.length,
+                    end: startCol + (c.rawName ? String(c.rawName).length : String(c.name).length),
                     kind: "column"
                 });
             }
-        }
+
+        } // end if table/view/type
 
         defs.push(sym);
 
@@ -445,7 +441,7 @@ export function indexText(uri: string, text: string): void {
                 kind: "table"
             });
         }
-    }
+    } // end for definitions
 
     // Aliases computed once and reused
     const aliases = extractAliases(text);
@@ -527,7 +523,6 @@ export function indexText(uri: string, text: string): void {
                 );
 
                 // Use robust helper to collect candidate tables for this statement.
-                // collectCandidateTablesFromStatement may return a Set<string> or string[]; normalize to string[]
                 let tablesInScopeArr: string[] = [];
                 try {
                     const maybe = collectCandidateTablesFromStatement(stmtText);
@@ -536,7 +531,6 @@ export function indexText(uri: string, text: string): void {
                     } else if (maybe instanceof Set) {
                         tablesInScopeArr = Array.from(maybe);
                     } else if (maybe) {
-                        // fallback: try to coerce iterable
                         try {
                             tablesInScopeArr = Array.from(maybe as Iterable<string>);
                         } catch {
@@ -563,7 +557,6 @@ export function indexText(uri: string, text: string): void {
                     stmtAliasesMap = new Map();
                 }
 
-                // Now build strongly-typed scope object
                 const newScope: StmtScope = {
                     text: stmtText,
                     tablesInScope: tablesInScopeArr,
@@ -740,62 +733,174 @@ export function indexText(uri: string, text: string): void {
 }
 
 
-export async function parseColumnsFromCreateView(blockText: string, startLine: number) {
-    // Try parse with AST worker (timeout small so indexer stays snappy)
-    const ast = await parseSqlWithWorker(blockText, { database: "mssql" }, 800).catch(() => null);
-    if (!ast) { return []; }
 
-    const colsOut: Array<{ name: string; rawName: string; type?: string; line: number; start: number; end: number }> = [];
+export function parseColumnsFromCreateView(viewText: string, fileStartLine = 0): ColumnDef[] {
+    const t = viewText;
+    const lower = t.toLowerCase();
 
-    // find the first SELECT node in the AST (the view's defining select)
-    let foundSelect: any = null;
-    const roots = Array.isArray(ast) ? ast : [ast];
-    for (const root of roots) {
-        walkAst(root, (n: any) => {
-            if (foundSelect) { return; }
-            if (!n || typeof n !== "object") { return; }
-            if (n.type === "select" || n.ast === "select") {
-                foundSelect = n;
+    // find "create" then the next "view"
+    const createIdx = lower.indexOf("create");
+    const viewIdx = lower.indexOf("view", createIdx === -1 ? 0 : createIdx);
+    if (viewIdx === -1) { return []; }
+
+    // find "AS" token (word boundary, robust to newlines)
+    const afterView = t.substring(viewIdx + "view".length);
+    const asMatch = /\bas\b/i.exec(afterView);
+    const asIdx = asMatch ? viewIdx + "view".length + asMatch.index : -1;
+
+    // find SELECT token after AS (or after view if no AS)
+    const selectSearchStart = asIdx !== -1 ? asIdx + 2 : viewIdx + "view".length;
+    const afterSelectSearch = t.substring(selectSearchStart);
+    const selectMatch = /\bselect\b/i.exec(afterSelectSearch);
+    if (!selectMatch) { return []; }
+    const selectIdx = selectSearchStart + selectMatch.index;
+
+    // scan forward to find the top-level FROM (respecting parentheses, quotes, bracket identifiers)
+    let i = selectIdx + "select".length;
+    let paren = 0;
+    let inSingle = false;
+    let inDouble = false;
+    let inBracket = false;
+    let fromIdx = -1;
+    const isWordChar = (c: string) => /[a-zA-Z0-9_]/.test(c);
+
+    while (i < t.length) {
+        const ch = t[i];
+
+        // handle quoting/brackets
+        if (!inDouble && ch === "'" && !inBracket) {
+            if (inSingle && t[i + 1] === "'") { i += 2; continue; }
+            inSingle = !inSingle; i++; continue;
+        }
+        if (!inSingle && ch === '"' && !inBracket) {
+            if (inDouble && t[i + 1] === '"') { i += 2; continue; }
+            inDouble = !inDouble; i++; continue;
+        }
+        if (!inSingle && !inDouble) {
+            if (ch === "[") { inBracket = true; i++; continue; }
+            if (ch === "]") { inBracket = false; i++; continue; }
+        }
+        if (inSingle || inDouble || inBracket) { i++; continue; }
+
+        // parentheses
+        if (ch === "(") { paren++; i++; continue; }
+        if (ch === ")") { if (paren > 0) { paren--; } i++; continue; }
+
+        // potential top-level 'from'
+        if (paren === 0) {
+            // check for 'from' word at i
+            const maybe = lower.substr(i, 4);
+            if (maybe === "from") {
+                const before = i - 1 >= 0 ? lower[i - 1] : " ";
+                const after = lower[i + 4] || " ";
+                if (!isWordChar(before) && !isWordChar(after)) {
+                    fromIdx = i;
+                    break;
+                }
             }
+        }
+
+        i++;
+    }
+
+    // fallback: use regex word-boundary search for "from" after select
+    if (fromIdx === -1) {
+        const afterSelect = t.substring(selectIdx + "select".length);
+        const fallback = /\bfrom\b/i.exec(afterSelect);
+        fromIdx = fallback ? selectIdx + "select".length + fallback.index : t.length;
+    }
+
+    const projStart = selectIdx + "select".length;
+    const projText = t.substring(projStart, fromIdx);
+
+    // split top-level commas (respect quotes/brackets/parens)
+    const segments: { text: string; relStart: number; relEnd: number }[] = [];
+    let j = 0;
+    let segStart = 0;
+    paren = 0; inSingle = false; inDouble = false; inBracket = false;
+    while (j < projText.length) {
+        const ch = projText[j];
+
+        if (!inDouble && ch === "'" && !inBracket) {
+            if (inSingle && projText[j + 1] === "'") { j += 2; continue; }
+            inSingle = !inSingle; j++; continue;
+        }
+        if (!inSingle && ch === '"' && !inBracket) {
+            if (inDouble && projText[j + 1] === '"') { j += 2; continue; }
+            inDouble = !inDouble; j++; continue;
+        }
+        if (!inSingle && !inDouble) {
+            if (ch === "[") { inBracket = true; j++; continue; }
+            if (ch === "]") { inBracket = false; j++; continue; }
+        }
+        if (inSingle || inDouble || inBracket) { j++; continue; }
+
+        if (ch === "(") { paren++; j++; continue; }
+        if (ch === ")") { if (paren > 0) { paren--; } j++; continue; }
+
+        if (paren === 0 && ch === ",") {
+            const seg = projText.substring(segStart, j).trim();
+            if (seg.length > 0) { segments.push({ text: seg, relStart: segStart, relEnd: j }); }
+            segStart = j + 1;
+        }
+        j++;
+    }
+    const last = projText.substring(segStart).trim();
+    if (last.length > 0) { segments.push({ text: last, relStart: segStart, relEnd: projText.length }); }
+
+    // produce ColumnDef[]
+    const lineStarts = getLineStarts(t);
+    const out: ColumnDef[] = [];
+    for (const seg of segments) {
+        const rawSegment = seg.text;
+        const cleaned = rawSegment.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/--.*$/m, "").trim();
+
+        let alias: string | null = null;
+        let exprPart = cleaned;
+
+        const asMatch2 = cleaned.match(/\s+as\s+([\[\]`"]?[@A-Za-z_][\w@#]*[\]\"]?)/i);
+        if (asMatch2) {
+            alias = asMatch2[1].trim();
+            exprPart = cleaned.substring(0, asMatch2.index).trim();
+        } else {
+            const tokens = cleaned.split(/\s+/);
+            if (tokens.length >= 2) {
+                const last = tokens[tokens.length - 1];
+                if (/^[\[\]`"]?[@A-Za-z_][\w@#]*[\]\"]?$/.test(last) && !last.includes(".") && !last.includes("(")) {
+                    alias = last;
+                    exprPart = tokens.slice(0, -1).join(" ");
+                }
+            }
+        }
+
+        const rawName = alias ?? exprPart;
+        const segAbsStart = projStart + seg.relStart;
+
+        let foundOffsetInSeg = -1;
+        if (alias) {
+            const idx = projText.indexOf(alias, seg.relStart);
+            if (idx >= 0) { foundOffsetInSeg = idx; }
+        }
+        if (foundOffsetInSeg === -1) {
+            const idx2 = projText.indexOf(rawName, seg.relStart);
+            if (idx2 >= 0) { foundOffsetInSeg = idx2; }
+        }
+        if (foundOffsetInSeg === -1) { foundOffsetInSeg = seg.relStart; }
+
+        const absStart = projStart + foundOffsetInSeg;
+        const absEnd = absStart + String(rawName).length;
+        const posStart = offsetToPosition(absStart, lineStarts);
+
+        const normalized = String(rawName).replace(/^[\[\]`"]|[\[\]`"]$/g, "");
+
+        out.push({
+            name: normalized,
+            rawName: String(rawName),
+            line: posStart.line + fileStartLine,
+            start: absStart,
+            end: absEnd,
         });
-        if (foundSelect) { break; }
     }
 
-    if (!foundSelect) { return []; }
-
-    // node.columns or node.columns/ node.columns may be the list depending on parser output
-    const colNodes = (foundSelect.columns || foundSelect.columns || foundSelect.fields || []) as any[];
-
-    let lineGuess = startLine; // we don't have precise positions for each expr easily; use startLine as fallback
-    for (const c of colNodes) {
-        if (!c) { continue; }
-        // prefer alias / AS name
-        let alias = (c.as || c.alias || (c.as && c.as.value) || (c.alias && c.alias.value));
-        if (alias && typeof alias === "object") { alias = alias.value || alias.name; }
-        if (alias && typeof alias === "string") {
-            const n = normalizeName(alias);
-            colsOut.push({ name: n, rawName: alias, line: lineGuess, start: 0, end: 0 });
-            continue;
-        }
-
-        // no explicit alias → try to extract a referenced column name (e.g. d.DepartmentId)
-        // column node may be `c.expr` or `c` itself
-        const candidate = extractColumnName(c.expr ?? c);
-        if (candidate) {
-            colsOut.push({ name: candidate, rawName: candidate, line: lineGuess, start: 0, end: 0 });
-            continue;
-        }
-
-        // fallback: try to stringify expression minimally (strip whitespace) as rawName
-        try {
-            const raw = JSON.stringify(c).slice(0, 80);
-            colsOut.push({ name: normalizeName(raw), rawName: raw, line: lineGuess, start: 0, end: 0 });
-        } catch (e) {
-            // skip
-        }
-    }
-
-    return colsOut;
+    return out;
 }
-
-
