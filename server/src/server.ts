@@ -236,18 +236,16 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
     return null;
   }
 
-  // --- 1) Alias.column case (unchanged) ---
-  if (rawWord.includes(".")) {
-    const parts = rawWord.split(".");
-    if (parts.length === 2) {
-      const alias = parts[0].toLowerCase();
-      const colName = normalizeName(parts[1]);
-      const aliases = extractAliases(fullText);
-      const tableName = aliases.get(alias);
-      if (tableName) {
-        return findColumnInTable(tableName, colName);
-      }
-    }
+  // --- 1) Alias.column case ---
+  const qmatch = /^(@|#)?(?:\[(?<q1>[^\]]+)\]|"(?<q2>[^"]+)"|`(?<q3>[^`]+)`|(?<q4>[A-Za-z_][A-Za-z0-9_]*))\.(?:\[(?<c1>[^\]]+)\]|"(?<c2>[^"]+)"|`(?<c3>[^`]+)`|(?<c4>[A-Za-z_][A-Za-z0-9_]*))$/.exec(rawWord);
+  if (qmatch) {
+    const aliasRaw = qmatch.groups?.q1 ?? qmatch.groups?.q2 ?? qmatch.groups?.q3 ?? qmatch.groups?.q4 ?? "";
+    const colRaw = qmatch.groups?.c1 ?? qmatch.groups?.c2 ?? qmatch.groups?.c3 ?? qmatch.groups?.c4 ?? "";
+    const aliasKey = aliasRaw.toLowerCase();
+    const colName = normalizeName(colRaw);
+    const aliases = extractAliases(fullText);
+    const tableName = aliases.get(aliasKey);
+    if (tableName) { return findColumnInTable(tableName, colName); }
   }
 
   // --- 2) Bare column semantic resolution (with optional AST disambiguation) ---
@@ -313,26 +311,26 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
   // --- 3) Table-level keywords (INSERT, FROM, JOIN, UPDATE) ---
   const insertMatch = /insert\s+into\s+([a-zA-Z0-9_\[\]\.]+)/i.exec(fullText);
   if (insertMatch) {
-    const res = findColumnInTable(insertMatch[1], word);
+    const res = findColumnInTable(normalizeName(insertMatch[1]), word);
     if (res.length > 0) { return res; }
   }
 
   const fromMatch = /\bfrom\s+([a-zA-Z0-9_\[\]\.]+)(?!\s+[a-zA-Z0-9_]+)/i.exec(fullText);
   if (fromMatch) {
-    const res = findColumnInTable(fromMatch[1], word);
+    const res = findColumnInTable(normalizeName(fromMatch[1]), word);
     if (res.length > 0) { return res; }
   }
 
   const joinRegex = /\bjoin\s+([a-zA-Z0-9_\[\]\.]+)(?!\s+[a-zA-Z0-9_]+)/gi;
   let joinMatch: RegExpExecArray | null;
   while ((joinMatch = joinRegex.exec(fullText))) {
-    const res = findColumnInTable(joinMatch[1], word);
+    const res = findColumnInTable(normalizeName(joinMatch[1]), word);
     if (res.length > 0) { return res; }
   }
 
   const updateMatch = /\bupdate\s+([a-zA-Z0-9_\[\]\.]+)/i.exec(fullText);
   if (updateMatch) {
-    const res = findColumnInTable(updateMatch[1], word);
+    const res = findColumnInTable(normalizeName(updateMatch[1]), word);
     if (res.length > 0) { return res; }
   }
 
@@ -383,7 +381,7 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
       const COL_LIMIT = 500;
       let count = 0;
       for (const c of cols) {
-        if (count++ > COL_LIMIT) {break;}
+        if (count++ > COL_LIMIT) { break; }
         items.push({
           label: c.rawName || c.name,
           kind: CompletionItemKind.Field,
@@ -1023,12 +1021,141 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
       return { contents: { kind: MarkupKind.Markdown, value: body }, range } as Hover;
     };
 
+    // -----------------------
+    // Helper: early-resolve qualified column (e.g., "tsi.EmployeeId")
+    // returns Hover or null
+    // -----------------------
+    const tryResolveQualifiedColumn = (qualifier: string | null, columnToken: string): Hover | null => {
+      if (!qualifier || isSqlKeyword(qualifier)) { return null; }
+      const qualNorm = normalizeName(String(qualifier));
+      try {
+        // map alias -> target using existing resolveAliasTarget; we capture raw/resolved forms
+        let mappedRaw: string | null = null;
+        let mappedNorm: string | null = null;
+        try {
+          const resolved = resolveAliasTarget(cleanedStmt || "", qualNorm);
+          if (resolved) {
+            mappedRaw = String(resolved); // preserve original casing of resolved target
+            mappedNorm = normalizeName(mappedRaw);
+          }
+        } catch {
+          mappedRaw = qualNorm;
+          mappedNorm = qualNorm;
+        }
+
+        // 1) If mappedKey looks like a parameter-backed TVP or local, prefer local
+        if (mappedNorm && (mappedNorm.startsWith("@") || mappedNorm.startsWith("#"))) {
+          const pval = paramMap.get(mappedNorm.toLowerCase());
+          if (pval) {
+            const typeToken = String(pval).split(/\s+/).find(t => t && t.toLowerCase() !== "readonly");
+            const typeKey = typeToken ? normalizeName(typeToken.replace(/^dbo\./i, "")) : null;
+            const typeDef = typeKey ? (tableTypesByName.get(typeKey) || tablesByName.get(typeKey)) : null;
+            if (typeDef && typeDef.columns) {
+              const aliasColNorm = normalizeName(columnToken);
+              const c = (typeDef.columns as any[]).find(cc =>
+                (cc.rawName ?? cc.name) === columnToken ||
+                normalizeName(cc.name) === aliasColNorm
+              );
+              if (c) {
+                // show parameter using mappedRaw (original case) if available, fallback to mappedNorm
+                return formatColumnHover({
+                  colRaw: c.rawName ?? c.name,
+                  colType: c.type,
+                  containerRawName: typeDef.rawName ?? typeDef.name,
+                  containerIsType: typeDef === tableTypesByName.get(typeKey!),
+                  aliasToken: mappedRaw ?? mappedNorm,
+                  range,
+                  suggestAlias: false,
+                  suggestionAlias: null
+                }) as Hover;
+              }
+            }
+          }
+
+          // if localTableMap has this mappedKey, use that
+          const local = lookupLocalByKey(localTableMap, mappedNorm!);
+          if (local && isLocalEntryValid(local, mappedNorm!) && local.columns) {
+            const aliasColNorm = normalizeName(columnToken);
+            const cLocal = asCols(local.columns).find(cc => normalizeName(cc.name) === aliasColNorm || (cc.rawName ?? cc.name) === columnToken);
+            if (cLocal) {
+              return formatColumnHover({
+                colRaw: cLocal.rawName ?? cLocal.name,
+                colType: (cLocal as any).type,
+                containerRawName: local.rawName ?? local.name,
+                containerIsType: false,
+                aliasToken: mappedRaw ?? mappedNorm,
+                range,
+                suggestAlias: false,
+                suggestionAlias: null
+              }) as Hover;
+            }
+          }
+        }
+
+        // 2) Otherwise check catalog tables / table types by mappedKey
+        const candKeys = tableKeyCandidates((mappedNorm || qualNorm).replace(/^dbo\./i, ""));
+        for (const k of candKeys) {
+          let def = tablesByName.get(k);
+          let isType = false;
+          if (!def) {
+            const tdef = tableTypesByName.get(k);
+            if (tdef) { isType = true; def = tdef; }
+          }
+          if (!def || !def.columns) { continue; }
+          const aliasColNorm = normalizeName(columnToken);
+          const c = (def.columns as any[]).find(cc =>
+            (cc.rawName ?? cc.name) === columnToken ||
+            normalizeName(cc.name) === aliasColNorm
+          );
+          if (c) {
+            const aliasTokenForDef = findAliasForDef(def, stmtAliases);
+            return formatColumnHover({
+              colRaw: c.rawName ?? c.name,
+              colType: c.type,
+              containerRawName: def.rawName ?? def.name,
+              containerIsType: isType,
+              // prefer showing mappedRaw (original case) if it looks param/var, otherwise show alias found
+              aliasToken: (mappedRaw && (mappedRaw.startsWith("@") || mappedRaw.startsWith("#"))) ? mappedRaw : aliasTokenForDef,
+              range,
+              suggestAlias: false,
+              suggestionAlias: null
+            }) as Hover;
+          }
+        }
+      } catch (ex) {
+        // ignore and fall through to null
+      }
+      return null;
+    };
+
     // get word range at cursor and bail if none
     const range = getWordRangeAtPosition(doc, pos);
     if (!range) { return null; }
 
     // read hovered token and normalized forms
     const rawWord = doc.getText(range);
+
+    // Recognize [alias].Col / "alias".Col / `alias`.Col / alias.Col
+    const qmatch = /^(@|#)?(?:\[(?<q1>[^\]]+)\]|"(?<q2>[^"]+)"|`(?<q3>[^`]+)`|(?<q4>[A-Za-z_][A-Za-z0-9_]*))\.(?:\[(?<c1>[^\]]+)\]|"(?<c2>[^"]+)"|`(?<c3>[^`]+)`|(?<c4>[A-Za-z_][A-Za-z0-9_]*))$/.exec(rawWord);
+    let hoveredQualifier: string | null = null;
+    let hoveredColumnToken: string = rawWord;
+
+    if (qmatch) {
+      // Preserve original case for display, strip only decorators for lookups
+      const aliasRaw = qmatch.groups?.q1 ?? qmatch.groups?.q2 ?? qmatch.groups?.q3 ?? qmatch.groups?.q4 ?? "";
+      const colRaw = qmatch.groups?.c1 ?? qmatch.groups?.c2 ?? qmatch.groups?.c3 ?? qmatch.groups?.c4 ?? "";
+
+      hoveredQualifier = aliasRaw;               // e.g. "e" from "[e]"
+      hoveredColumnToken = colRaw;               // e.g. "FirstName"
+    } else {
+      // fallback to old behavior for single tokens (unqualified)
+      hoveredColumnToken = normalizeName(rawWord);
+    }
+
+    // later code uses:
+    const isQualifiedToken = !!qmatch;
+    const wordNorm = normalizeName(hoveredColumnToken);
+
     const rawWordStripped = normalizeName(rawWord);
     const rawWordDisplay = rawWord;
     let handledUpdateLhs = false;
@@ -1036,27 +1163,20 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
 
 
     // identifier check
-    const isIdentifierLike = (s: string) =>
-      /^[A-Za-z_][A-Za-z0-9_$.]*$/.test(String(s).replace(/^\.+/, ""));
+    const isIdentifierLike = (s: string) => /^[A-Za-z_][A-Za-z0-9_$.]*$/.test(String(s).replace(/^\.+/, ""));
+    const stripId = (s: string) => s.replace(/^\[|\]$/g, "").replace(/^"|"$/g, "").replace(/`/g, "");
 
-    // decide if token is qualified (alias.column) and split into qualifier + column token
-    const isQualifiedToken = rawWordStripped.includes(".");
+
 
     // Only skip if the hovered token is a pure SQL keyword and *not* part of a qualified identifier.
     if (isSqlKeyword(rawWordStripped) && !isQualifiedToken) {
       return null;
     }
 
-    let hoveredQualifier: string | null = null;
-    let hoveredColumnToken = rawWordStripped;
-    if (isQualifiedToken) {
-      const parts = rawWordStripped.split(".");
-      hoveredQualifier = parts.slice(0, -1).join(".");
-      hoveredColumnToken = parts[parts.length - 1];
+    if (isQualifiedToken && hoveredQualifier) {
+      const early = tryResolveQualifiedColumn(stripId(hoveredQualifier), hoveredColumnToken);
+      if (early) { return early; }
     }
-
-    // normalized column token for lookups
-    const wordNorm = normalizeName(hoveredColumnToken);
 
     // get statement text and apply small cleaning for table hints
     const stmtText = getCurrentStatement(doc, pos) || "";
@@ -1242,112 +1362,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
 
 
 
-    // -----------------------
-    // Helper: early-resolve qualified column (e.g., "tsi.EmployeeId")
-    // returns Hover or null
-    // -----------------------
-    const tryResolveQualifiedColumn = (qualifier: string | null, columnToken: string): Hover | null => {
-      if (!qualifier || isSqlKeyword(qualifier)) { return null; }
-      const qualNorm = normalizeName(String(qualifier));
-      try {
-        // map alias -> target using existing resolveAliasTarget; we capture raw/resolved forms
-        let mappedRaw: string | null = null;
-        let mappedNorm: string | null = null;
-        try {
-          const resolved = resolveAliasTarget(cleanedStmt || "", qualNorm);
-          if (resolved) {
-            mappedRaw = String(resolved); // preserve original casing of resolved target
-            mappedNorm = normalizeName(mappedRaw);
-          }
-        } catch {
-          mappedRaw = qualNorm;
-          mappedNorm = qualNorm;
-        }
 
-        // 1) If mappedKey looks like a parameter-backed TVP or local, prefer local
-        if (mappedNorm && (mappedNorm.startsWith("@") || mappedNorm.startsWith("#"))) {
-          const pval = paramMap.get(mappedNorm.toLowerCase());
-          if (pval) {
-            const typeToken = String(pval).split(/\s+/).find(t => t && t.toLowerCase() !== "readonly");
-            const typeKey = typeToken ? normalizeName(typeToken.replace(/^dbo\./i, "")) : null;
-            const typeDef = typeKey ? (tableTypesByName.get(typeKey) || tablesByName.get(typeKey)) : null;
-            if (typeDef && typeDef.columns) {
-              const aliasColNorm = normalizeName(columnToken);
-              const c = (typeDef.columns as any[]).find(cc =>
-                (cc.rawName ?? cc.name) === columnToken ||
-                normalizeName(cc.name) === aliasColNorm
-              );
-              if (c) {
-                // show parameter using mappedRaw (original case) if available, fallback to mappedNorm
-                return formatColumnHover({
-                  colRaw: c.rawName ?? c.name,
-                  colType: c.type,
-                  containerRawName: typeDef.rawName ?? typeDef.name,
-                  containerIsType: typeDef === tableTypesByName.get(typeKey!),
-                  aliasToken: mappedRaw ?? mappedNorm,
-                  range,
-                  suggestAlias: false,
-                  suggestionAlias: null
-                }) as Hover;
-              }
-            }
-          }
-
-          // if localTableMap has this mappedKey, use that
-          const local = lookupLocalByKey(localTableMap, mappedNorm!);
-          if (local && isLocalEntryValid(local, mappedNorm!) && local.columns) {
-            const aliasColNorm = normalizeName(columnToken);
-            const cLocal = asCols(local.columns).find(cc => normalizeName(cc.name) === aliasColNorm || (cc.rawName ?? cc.name) === columnToken);
-            if (cLocal) {
-              return formatColumnHover({
-                colRaw: cLocal.rawName ?? cLocal.name,
-                colType: (cLocal as any).type,
-                containerRawName: local.rawName ?? local.name,
-                containerIsType: false,
-                aliasToken: mappedRaw ?? mappedNorm,
-                range,
-                suggestAlias: false,
-                suggestionAlias: null
-              }) as Hover;
-            }
-          }
-        }
-
-        // 2) Otherwise check catalog tables / table types by mappedKey
-        const candKeys = tableKeyCandidates((mappedNorm || qualNorm).replace(/^dbo\./i, ""));
-        for (const k of candKeys) {
-          let def = tablesByName.get(k);
-          let isType = false;
-          if (!def) {
-            const tdef = tableTypesByName.get(k);
-            if (tdef) { isType = true; def = tdef; }
-          }
-          if (!def || !def.columns) { continue; }
-          const aliasColNorm = normalizeName(columnToken);
-          const c = (def.columns as any[]).find(cc =>
-            (cc.rawName ?? cc.name) === columnToken ||
-            normalizeName(cc.name) === aliasColNorm
-          );
-          if (c) {
-            const aliasTokenForDef = findAliasForDef(def, stmtAliases);
-            return formatColumnHover({
-              colRaw: c.rawName ?? c.name,
-              colType: c.type,
-              containerRawName: def.rawName ?? def.name,
-              containerIsType: isType,
-              // prefer showing mappedRaw (original case) if it looks param/var, otherwise show alias found
-              aliasToken: (mappedRaw && (mappedRaw.startsWith("@") || mappedRaw.startsWith("#"))) ? mappedRaw : aliasTokenForDef,
-              range,
-              suggestAlias: false,
-              suggestionAlias: null
-            }) as Hover;
-          }
-        }
-      } catch (ex) {
-        // ignore and fall through to null
-      }
-      return null;
-    };
 
     // collect candidate tables from statement text
     const candidateTables = collectCandidateTablesFromStatement(cleanedStmt || "") || new Set<string>();
@@ -1981,7 +1996,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
       const candidateTables = collectCandidateTablesFromStatement(statementText);
 
       // alias.column pattern - allow bracketed right side
-      const colRegex = /([a-zA-Z0-9_]+)\.(\[[^\]]+\]|[a-zA-Z_][a-zA-Z0-9_]*)/g;
+      const colRegex = /(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)\.(\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)/g;
       let m: RegExpExecArray | null;
       while ((m = colRegex.exec(cleanNoStr))) {
         const aliasToken = m[1].toLowerCase();

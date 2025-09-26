@@ -173,7 +173,7 @@ export function indexText(uri: string, text: string): void {
 
     // Precompile regexes once (reset lastIndex before each use)
     const tableRegexG = /\b(from|join|update|into)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
-    const aliasColRegexG = /([a-zA-Z0-9_]+)\.(\[[^\]]+\]|[a-zA-Z_][a-zA-Z0-9_]*)/g;
+    const aliasColRegexG =/(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)\.(\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)/g;
     const bareColRegexG = /\[([a-zA-Z0-9_ ]+)\]|(?<!@)\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
     const fromJoinRegexG = /\b(from|join)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
     const procHeaderRegex = /create\s+(?:or\s+alter\s+)?(procedure|proc|function)\s+([\[\]\w\."']+(?:\.[\[\]\w\."']+)*)\s*\(([\s\S]*?)\)\s*(as|begin)/ig;
@@ -230,8 +230,8 @@ export function indexText(uri: string, text: string): void {
 
         if (kind === "TABLE" || kind === "VIEW" || (kind === "TYPE" && /\bAS\s+TABLE\b/i.test(line))) {
             // Build block from current line and parse columns (linear helper)
-            const createBlock = lines.slice(i).join("\n");
-            let cols = parseColumnsFromCreateBlock(createBlock, 0);
+            const createBlock = text;
+            let cols = parseColumnsFromCreateBlock(createBlock, i);
             console.debug(`[indexText] ${rawName} parseColumnsFromCreateBlock -> ${cols?.length ?? 0}`);
 
             if (kind === "VIEW") {
@@ -472,7 +472,7 @@ export function indexText(uri: string, text: string): void {
         // alias.column usages
         aliasColRegexG.lastIndex = 0;
         for (let m2 = aliasColRegexG.exec(clean); m2; m2 = aliasColRegexG.exec(clean)) {
-            const alias = m2[1].toLowerCase();
+            const alias = String(m2[1]).replace(/^\[|\]$/g, "").replace(/^"|"$/g, "").replace(/`/g, "").toLowerCase();
             const col = normalizeName(m2[2].replace(/[\[\]]/g, ""));
 
             // prefer statement-scoped aliases (fall back to file-level aliases map)
@@ -731,8 +731,6 @@ export function indexText(uri: string, text: string): void {
         }
     }
 }
-
-
 
 export function parseColumnsFromCreateView(viewText: string, fileStartLine = 0): ColumnDef[] {
     const t = viewText;

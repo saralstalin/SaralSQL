@@ -43,8 +43,7 @@
 ![Table Hover](Images/TableHover.png)
 
 - **Workspace Indexing**  
-  - Automatically indexes all `.sql` files in the workspace  
-  - **Indexes large codebases (1000+ files) in < 1 minute**  
+  - Automatically indexes all `.sql` files in the workspace when workspace is opened in VS code
   - Updates instantly as you type or save
 
 - **Hybrid Regex + Parser Engine**  
@@ -65,7 +64,7 @@
 
 ## ⚡ Performance
 
-- Tested on real-world projects with **1000+ SQL files — full index in under 1 minute**  
+- Tested on real-world projects
 - Designed to stay responsive even on large codebases
 
 ---

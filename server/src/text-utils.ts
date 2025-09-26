@@ -266,7 +266,9 @@ export function getWordRangeAtPosition(doc: TextDocument, pos: { line: number; c
         end: { line: pos.line, character: Number.MAX_VALUE }
     });
 
-    const regex = /[@#]?(?:\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z0-9_\.]+)/g;
+    const ident = '(?:\\[[^\\]]+\\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)';
+    const token = `(?:@|#)?${ident}(?:\\.${ident})*`;   // supports [e].FirstName, dbo.Table.Col, e.Col, etc.
+    const regex = new RegExp(token, 'g');
     let match: RegExpExecArray | null;
     while ((match = regex.exec(lineText))) {
         const start = match.index;
@@ -514,9 +516,7 @@ function splitCreateBodyIntoRowsWithPositions(
 ): Array<{ text: string; line: number; col: number }> {
     const lines = text.split(/\r?\n/);
 
-
-
-    // find first '(' from the definition line onwards
+    // Find first '(' from the definition line onwards
     let startLine = defLineIndex, parenIdx = -1;
     for (let i = defLineIndex; i < lines.length; i++) {
         const j = lines[i].indexOf("(");
@@ -526,41 +526,53 @@ function splitCreateBodyIntoRowsWithPositions(
 
     const rows: Array<{ text: string; line: number; col: number }> = [];
     let buf = "";
-    let depth = 0;
+    let depth = 1; // Start at 1 since we begin inside '('
     let inQuote: '"' | "'" | null = null;
-
-    // The start position of the *current* row we are building:
+    let inBracket = false; // Track bracketed identifiers
     let rowStartLine = startLine;
     let rowStartCol = parenIdx + 1;
+    let rowStartSet = false; // Track if row start position is set
 
     const flushRow = () => {
         const trimmed = buf.trim();
         if (trimmed) { rows.push({ text: trimmed, line: rowStartLine, col: rowStartCol }); }
         buf = "";
+        rowStartSet = false; // Reset for next row
     };
 
     for (let i = startLine; i < lines.length; i++) {
         const line = lines[i];
         const kStart = (i === startLine ? parenIdx + 1 : 0);
 
-        // If we are at a new physical line and buffer is empty, reset the row start to here.
-        if (kStart === 0 && buf.length === 0) {
-            rowStartLine = i;
-            rowStartCol = 0;
-        }
-
         for (let k = kStart; k < line.length; k++) {
             const ch = line[k];
             const next = k + 1 < line.length ? line[k + 1] : "";
 
-            // line comment
-            if (!inQuote && ch === "-" && next === "-") {
-                break; // ignore the rest of the line
+            // Line comment
+            if (!inQuote && !inBracket && ch === "-" && next === "-") {
+                break; // Ignore the rest of the line
+            }
+
+            // Block comment
+            if (!inQuote && !inBracket && ch === "/" && next === "*") {
+                k += 2;
+                while (k < line.length && !(line[k] === "*" && line[k + 1] === "/")) {
+                    k++;
+                }
+                if (k < line.length) {k++;} // Skip closing */
+                continue;
             }
 
             if (inQuote) {
                 buf += ch;
-                if (ch === inQuote) { inQuote = null; }
+                if (ch === inQuote && next !== inQuote) { inQuote = null; }
+                else if (ch === inQuote && next === inQuote) { k++; } // Skip escaped quote
+                continue;
+            }
+
+            if (inBracket) {
+                buf += ch;
+                if (ch === "]") { inBracket = false; }
                 continue;
             }
 
@@ -570,32 +582,59 @@ function splitCreateBodyIntoRowsWithPositions(
                 continue;
             }
 
-            if (ch === "(") { depth++; buf += ch; continue; }
+            if (ch === "[") {
+                inBracket = true;
+                buf += ch;
+                continue;
+            }
+
+            if (ch === "(") {
+                depth++;
+                buf += ch;
+                continue;
+            }
+
             if (ch === ")") {
+                depth--;
+                buf += ch;
                 if (depth === 0) {
                     flushRow();
                     return rows;
                 }
-                depth--; buf += ch; continue;
+                continue;
             }
 
-            if (ch === "," && depth === 0) {
-                // current row ends before this comma
+            if (ch === "," && depth === 1 && !inQuote && !inBracket) {
                 flushRow();
-
-                // next row starts after this comma (possibly same line)
+                // Set start of next row to first non-whitespace after comma
                 rowStartLine = i;
-
-                // Find the first non-space after the comma to set a precise col
                 let nextCol = k + 1;
-                while (nextCol < line.length && /\s/.test(line[nextCol])) { nextCol++; }
+                while (nextCol < line.length && /\s/.test(line[nextCol])) {
+                    nextCol++;
+                }
                 rowStartCol = nextCol;
-
-                continue; // do not include comma in buf
+                if (nextCol >= line.length && i + 1 < lines.length) {
+                    // Move to next line if comma is at end of line
+                    rowStartLine = i + 1;
+                    rowStartCol = 0;
+                    // Skip leading whitespace on next line
+                    while (rowStartLine < lines.length && lines[rowStartLine].trim() === "") {
+                        rowStartLine++;
+                    }
+                    if (rowStartLine < lines.length) {
+                        let tempCol = 0;
+                        while (tempCol < lines[rowStartLine].length && /\s/.test(lines[rowStartLine][tempCol])) {
+                            tempCol++;
+                        }
+                        rowStartCol = tempCol;
+                    }
+                }
+                continue; // Do not include comma in buf
             }
 
-            // If buf is empty and we just hit the first non-space char, lock start col precisely
-            if (buf.length === 0 && !/\s/.test(ch)) {
+            // Set row start at first non-whitespace character
+            if (!rowStartSet && !/\s/.test(ch)) {
+                rowStartSet = true;
                 rowStartLine = i;
                 rowStartCol = k;
             }
@@ -603,11 +642,11 @@ function splitCreateBodyIntoRowsWithPositions(
             buf += ch;
         }
 
-        // keep line separation (helps when rows span multiple lines)
+        // Keep line separation for multi-line rows
         buf += "\n";
     }
 
-    // Fallback: if closing ')' not seen, flush what we collected
+    // Flush any remaining content
     const trimmed = buf.trim();
     if (trimmed) { rows.push({ text: trimmed, line: rowStartLine, col: rowStartCol }); }
     return rows;
@@ -629,38 +668,64 @@ export function parseColumnsFromCreateBlock(
         const m = /^\s*(\[([^\]]+)\]|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))/.exec(r.text);
         if (!m) { continue; }
 
-        const raw = m[1]; // preserves brackets/quotes
+        const raw = m[1]; // preserves brackets/quotes for insertText
         const tokenName = (m[2] ?? m[3] ?? m[4] ?? "").trim();
 
-        // Only skip if the *first* token is an unquoted/unbracketed constraint keyword
-        const isConstraint =
-            !m[2] && !m[3] && /^(?:constraint|primary|foreign|check|unique|index)$/i.test(tokenName);
+        // Skip only if the first token is an unquoted constraint keyword
+        const isConstraint = !m[2] && !m[3] && /^(?:constraint|primary|foreign|check|unique|index)$/i.test(tokenName);
         if (isConstraint) { continue; }
 
         const name = normalizeName(tokenName);
 
-        // Try to grab the data type: the word(s) immediately after the column name
-        // Example: "Salary INT NOT NULL" → colType = "INT"
+        // Type immediately after the name (e.g., "INT", "varchar(50)")
         let colType: string | undefined;
         const afterName = r.text.slice(m[0].length).trim();
         const typeMatch = /^([A-Za-z0-9_]+(?:\s*\([^)]*\))?)/.exec(afterName);
-        if (typeMatch) {
-            colType = typeMatch[1].trim();
+        if (typeMatch) { colType = typeMatch[1].trim(); }
+
+        // Work out absolute line and which line inside blockText to read for columns
+        // r.line may be relative-to-block or already absolute; handle both.
+        let absLine: number;
+        let blockLineIdx: number;
+
+        if (typeof r.line === "number") {
+            // If r.line looks absolute (>= startLine) or exceeds block length, treat as absolute.
+            if (r.line >= startLine || r.line >= allLines.length) {
+                absLine = r.line;
+                blockLineIdx = r.line - startLine;
+            } else {
+                // r.line is relative to the block
+                absLine = startLine + r.line;
+                blockLineIdx = r.line;
+            }
+        } else {
+            // Fallback: assume current row maps to the first line of the block
+            absLine = startLine;
+            blockLineIdx = 0;
         }
 
-        // Compute true start column by searching this raw token on the actual source line.
-        const sourceLine = allLines[r.line] ?? "";
+        // Clamp to valid range inside the block
+        if (blockLineIdx < 0) { blockLineIdx = 0; }
+        if (blockLineIdx >= allLines.length) { blockLineIdx = allLines.length - 1; }
+
+        // Compute precise character range on the source line
+        const sourceLine = allLines[blockLineIdx] ?? "";
         let startCol = sourceLine.indexOf(raw);
         if (startCol < 0) {
-            startCol = sourceLine.search(new RegExp(`\\b${tokenName.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}\\b`));
+            // fallback: search for unquoted token
+            const esc = tokenName.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+            startCol = sourceLine.search(new RegExp(`\\b${esc}\\b`));
         }
-        if (startCol < 0) { startCol = r.col; }
+        if (startCol < 0) {
+            // ultimate fallback: use provided column from splitter if present
+            startCol = typeof r.col === "number" ? r.col : 0;
+        }
 
         out.push({
             name,
             rawName: raw,
             type: colType,
-            line: r.line,
+            line: absLine,                    // <<< absolute document line
             start: startCol,
             end: startCol + raw.length
         });
