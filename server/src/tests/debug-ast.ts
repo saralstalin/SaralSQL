@@ -1,21 +1,13 @@
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { indexText, definitions, findColumnInTable } from "../definitions";
-import { Parser } from "node-sql-parser";
+import { analyze } from "@saralsql/tsql-parser";
 
 function cleanForAst(sql: string): string {
   return sql
     // Strip CREATE/ALTER PROC headers + params up to AS BEGIN
     .replace(/CREATE\s+(OR\s+ALTER\s+)?PROCEDURE[\s\S]*?AS\s+BEGIN/i, "")
     // Strip trailing END
-    .replace(/END\s*;?$/i, "")
-    // Normalize variables like @EmployeeId → 1
-    .replace(/@\w+/g, "1")
-    // Handle TOP (n) or TOP n
-    .replace(/\bTOP\s*(\(\s*\d+\s*\)|\d+)/gi, "")
-    // Replace NEWID() → 1
-    .replace(/\bNEWID\s*\(\s*\)/gi, "1")
-    // Replace GETDATE() → literal date
-    .replace(/\bGETDATE\s*\(\s*\)/gi, "'2024-01-01'");
+    .replace(/END\s*;?$/i, "");
 }
 
 async function run() {
@@ -42,11 +34,11 @@ END;`;
   indexText(doc.uri, sql);
 
   // Debug: print AST using cleaned SQL
-  const parser = new Parser();
   const cleaned = cleanForAst(sql);
-  const ast = parser.astify(cleaned, { database: "transactsql" });
+  const result = analyze(cleaned);
   console.log("=== AST ===");
-  console.log(JSON.stringify(ast, null, 2));
+  console.log(JSON.stringify(result.ast, null, 2));
+
 
   // Debug: try finding a column
   const col = findColumnInTable("TransportRequests", "EmployeeId");

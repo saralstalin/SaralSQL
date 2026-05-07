@@ -38,8 +38,11 @@ import {
   , stripComments
   , stripStrings
   , offsetAt
+  , getLineStarts
+  , offsetToPosition
 } from "./text-utils";
 import { parseSqlWithWorker, isAstPoolReady } from "./parser-pool";
+import { parseDiagnostics } from "./sql-parser";
 import { resolveColumnFromAst, normalizeAstTableName, walkAst } from "./ast-utils";
 import {
   setIndexReady
@@ -67,7 +70,7 @@ import {
 // ---------- Connection + Documents ----------
 const connection = createConnection(ProposedFeatures.all);
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
-let enableValidation = false;
+let enableValidation = true;
 const DEBUG = true; // set to false after debugging
 const dbg = (...args: any[]) => { if (DEBUG) { console.debug('[HOVER]', ...args); } };
 
@@ -1926,6 +1929,35 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
   const diagnostics: Diagnostic[] = [];
   const text = doc.getText();
   const lines = text.split(/\r?\n/);
+
+  // Add parser diagnostics
+  try {
+    const parserDiags = parseDiagnostics(text);
+    const lineStarts = getLineStarts(text);
+    for (const diag of parserDiags) {
+      let range: Range;
+      if (typeof diag.range.start === 'number') {
+        // Offset-based range
+        const startPos = offsetToPosition(diag.range.start, lineStarts);
+        const endPos = offsetToPosition(diag.range.end, lineStarts);
+        range = {
+          start: { line: startPos.line, character: startPos.character },
+          end: { line: endPos.line, character: endPos.character }
+        };
+      } else {
+        // Position-based range
+        range = diag.range;
+      }
+      diagnostics.push({
+        severity: diag.severity || DiagnosticSeverity.Error,
+        range,
+        message: diag.message,
+        source: "SaralSQL Parser"
+      });
+    }
+  } catch (e) {
+    safeLog(`[validate] Parser diagnostics failed: ${String(e)}`);
+  }
 
   // file-level aliases (fallback)
   let fileAliases = new Map<string, string>();

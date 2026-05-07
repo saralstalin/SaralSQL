@@ -10,9 +10,9 @@
 
 - **Offline-friendly** – works entirely from your source code, no live DB needed  
 - **Privacy-friendly** – **no tracking; all code and actions stay in your workspace**  
-- **Lightweight & fast** – hybrid regex + parser engine keeps typing latency low  
+- **Lightweight & fast** – hybrid regex + advanced T-SQL parser engine keeps typing latency low  
 - **Code-centric** – ideal for projects that version-control schema scripts  
-- **Zero-config** – open a folder of `.sql` files and start coding  
+- **Zero-config** – open a folder of `.sql` files and start coding with real-time diagnostics  
 - **Scales to large projects** – indexes **2000+ SQL files in under 1 minute**
 
 ---
@@ -42,13 +42,17 @@
 
 ![Table Hover](Images/TableHover.png)
 
+- **Diagnostics & Error Checking**  
+  Real-time syntax validation and semantic error detection using advanced T-SQL parsing.  
+  Automatically highlights undefined tables, columns, and syntax errors.
+
 - **Workspace Indexing**  
   - Automatically indexes all `.sql` files in the workspace when workspace is opened in VS code
   - Updates instantly as you type or save
 
 - **Hybrid Regex + Parser Engine**  
   - Regex-based indexer ensures fast responses  
-  - Lightweight SQL parser (`node-sql-parser`) adds accuracy in `FROM`/`JOIN` contexts and complex queries
+  - Advanced T-SQL parser (`@saralsql/tsql-parser`) provides accurate semantic analysis, diagnostics, and complex query handling
 
 ---
 
@@ -72,9 +76,10 @@
 ## ⚠️ Preview Notice
 
 This is an **Early-Access Preview**:
-- Optimized for **T-SQL / SQL Server** DDL & DML  
+- Optimized for **T-SQL / SQL Server** DDL & DML with advanced `@saralsql/tsql-parser`  
 - Dialects like Postgres or MySQL may partially work but are not fully supported yet  
-- Column and reference detection is heuristic — complex scripts may have misses or false positives  
+- Real-time diagnostics now available for syntax and semantic validation  
+- Column and reference detection uses both regex indexing and full parser analysis  
 - Certain constructs (e.g. `TOP(@Variable)`, `MERGE`, `OUTPUT INTO`) are still being improved
 
 We’re releasing early to gather real-world feedback before expanding the feature set.
@@ -85,11 +90,10 @@ We’re releasing early to gather real-world feedback before expanding the featu
 
 - **Outline View** for procedures, tables, and columns  
 - **Workspace Symbol Search** (`Ctrl+T`) across SQL objects  
-- **Diagnostics** for undefined tables/columns and duplicate definitions  
 - **Better handling** of parameterised constructs like `TOP(@var)` and `OUTPUT INTO`  
 - **Schema-aware resolution** for databases with duplicate table names across schemas  
 - **Incremental indexing** for even faster performance on very large workspaces  
-- **Custom T-SQL parser** if there’s enough user interest for full dialect coverage
+- **Enhanced dialect support** for Postgres, MySQL, and other SQL variants
 
 ---
 
@@ -104,9 +108,9 @@ Be aware of these trade-offs:
   Teams using explicit names like `EmployeeId`, `DepartmentId` are less affected.
 
 - **Bare Columns**  
-  Bare columns (`SELECT EmployeeId`) resolve to their table only if the statement parses successfully.  
-  In fallback (regex-only) mode, they’re treated as global and may be ambiguous.  
-  Aliased usage (`e.EmployeeId`) is always more reliable.
+  Bare columns (`SELECT EmployeeId`) resolve to their table using advanced T-SQL parsing.  
+  In complex cases, they may fall back to regex mode and be treated as global.  
+  Aliased usage (`e.EmployeeId`) is always most reliable.
 
 - **Schemas**  
   `dbo.TableName` and `TableName` are treated the same.  
