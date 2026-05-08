@@ -240,7 +240,7 @@ Large query (>2KB):         Still cached
 - [x] AST utilities rewritten
 - [x] Test files updated
 - [x] Project builds without errors
-- [ ] **MANUAL:** Delete `server/src/sqlAstWorker.js`
+- [x] **MANUAL:** Delete `server/src/sqlAstWorker.js`
 - [ ] Run full test suite
 - [ ] Test LSP features end-to-end:
   - [ ] Hover information

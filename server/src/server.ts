@@ -66,6 +66,7 @@ import {
   collectCandidateTablesFromStatement,
   resolveAliasTarget, isTokenLocalTable, buildAliasToDefMap
 } from "./sql-scope-utils"; // adjust path to where you placed the utils    
+import { parseSql } from "./sql-parser";
 
 // ---------- Connection + Documents ----------
 const connection = createConnection(ProposedFeatures.all);
@@ -75,12 +76,36 @@ const DEBUG = true; // set to false after debugging
 const dbg = (...args: any[]) => { if (DEBUG) { console.debug('[HOVER]', ...args); } };
 
 // Call this after building the definitions index
-function markIndexReady() {
+async function markIndexReady() {
+  connection.console.error("[index] markIndexReady start");
+
   setIndexReady();
-  // Re-validate all open documents once we have a full index
-  for (const doc of documents.all()) {
-    validateTextDocument(doc);
+
+  connection.console.error(
+    `[index] getIndexReady=${getIndexReady()}`
+  );
+
+  const docs = documents.all();
+  connection.console.error(`[index] open docs=${docs.length}`);
+
+  for (const doc of docs) {
+    connection.console.error(`[index] validating ${doc.uri}`);
+
+    try {
+      const p = validateTextDocument(doc);
+      connection.console.error("[index] validate returned promise");
+
+      await p;
+
+      connection.console.error("[index] validate completed");
+    } catch (e) {
+      connection.console.error(
+        `[index] validate threw: ${String(e)}`
+      );
+    }
   }
+
+  connection.console.error("[index] markIndexReady end");
 }
 
 function toNormUri(rawUri: string) {
@@ -160,16 +185,26 @@ connection.onInitialize((_params: InitializeParams): InitializeResult => {
 
 connection.onInitialized(async () => {
   try {
+    connection.console.error("[init] start");
+
     await indexWorkspace();
-    markIndexReady();
+
+    connection.console.error("[init] workspace indexed");
+
+    await markIndexReady();
+
+    connection.console.error("[init] markIndexReady done");
   } catch (err) {
     safeError("Indexing failed", err);
   }
 });
 
-documents.onDidOpen((e) => {
+documents.onDidOpen(async (e) => {
   indexText(e.document.uri, e.document.getText());
-  if (enableValidation) { validateTextDocument(e.document); }
+
+  if (enableValidation) {
+    await validateTextDocument(e.document);
+  }
 });
 
 documents.onDidClose((e) => {
@@ -184,14 +219,44 @@ documents.onDidClose((e) => {
 });
 
 const pending = new Map<string, NodeJS.Timeout>();
+
 documents.onDidChangeContent((e) => {
+  connection.console.error("[change] fired");
+
   const uri = e.document.uri;
-  const tmr = pending.get(uri); if (tmr) { clearTimeout(tmr); }
-  pending.set(uri, setTimeout(() => {
-    indexText(uri, e.document.getText());
-    if (enableValidation) { validateTextDocument(e.document); }
-    pending.delete(uri);
-  }, 200));
+  const tmr = pending.get(uri);
+
+  if (tmr) {
+    clearTimeout(tmr);
+  }
+
+  pending.set(
+    uri,
+    setTimeout(async () => {
+      try {
+        connection.console.error("[change] debounce run");
+
+        indexText(uri, e.document.getText());
+        connection.console.error("[change] indexed");
+
+        connection.console.error(
+          `[change] enableValidation=${enableValidation}`
+        );
+
+        connection.console.error("[change] before validate");
+
+        await validateTextDocument(e.document);
+
+        connection.console.error("[change] after validate");
+      } catch (err) {
+        connection.console.error(
+          `[change] ERROR: ${String(err)}`
+        );
+      } finally {
+        pending.delete(uri);
+      }
+    }, 200)
+  );
 });
 
 // --- Definitions ---
@@ -1916,40 +1981,66 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
 
 // Full validator with @-skip and SELECT-alias skip
 export async function validateTextDocument(doc: TextDocument): Promise<void> {
-  // gating: if validation disabled or index not ready, clear diagnostics and return
   if (typeof enableValidation !== "undefined" && !enableValidation) {
     connection.sendDiagnostics({ uri: doc.uri, diagnostics: [] });
     return;
   }
-  if (typeof getIndexReady === "function" && !getIndexReady()) {
-    connection.sendDiagnostics({ uri: doc.uri, diagnostics: [] });
-    return;
-  }
+
+  connection.console.error("[validate] ENTER");
+  connection.console.error(`[validate] indexReady=${getIndexReady()}`);
 
   const diagnostics: Diagnostic[] = [];
   const text = doc.getText();
-  const lines = text.split(/\r?\n/);
+  const lineStarts = getLineStarts(text);
 
-  // Add parser diagnostics
+  let parsed: any = null;
+
+  // ---------------- Parse once ----------------
   try {
-    const parserDiags = parseDiagnostics(text);
-    const lineStarts = getLineStarts(text);
+    parsed = parseSql(text);
+
+    const parserDiags = [
+      ...(parsed?.diagnostics ?? []),
+      ...(parsed?.semanticDiagnostics ?? [])
+    ];
+
     for (const diag of parserDiags) {
       let range: Range;
-      if (typeof diag.range.start === 'number') {
-        // Offset-based range
+
+      if (typeof diag.start === "number") {
+        const startPos = offsetToPosition(diag.start, lineStarts);
+        const endPos = offsetToPosition(diag.end ?? diag.start, lineStarts);
+
+        range = {
+          start: {
+            line: startPos.line,
+            character: startPos.character
+          },
+          end: {
+            line: endPos.line,
+            character: endPos.character
+          }
+        };
+      } else if (diag.range && typeof diag.range.start === "number") {
         const startPos = offsetToPosition(diag.range.start, lineStarts);
         const endPos = offsetToPosition(diag.range.end, lineStarts);
+
         range = {
-          start: { line: startPos.line, character: startPos.character },
-          end: { line: endPos.line, character: endPos.character }
+          start: {
+            line: startPos.line,
+            character: startPos.character
+          },
+          end: {
+            line: endPos.line,
+            character: endPos.character
+          }
         };
       } else {
-        // Position-based range
-        range = diag.range;
+        continue;
       }
+
       diagnostics.push({
-        severity: diag.severity || DiagnosticSeverity.Error,
+        severity: mapSeverity(diag.severity),
         range,
         message: diag.message,
         source: "SaralSQL Parser"
@@ -1959,229 +2050,190 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
     safeLog(`[validate] Parser diagnostics failed: ${String(e)}`);
   }
 
-  // file-level aliases (fallback)
-  let fileAliases = new Map<string, string>();
-  try {
-    fileAliases = extractAliases(text);
-  } catch {
-    fileAliases = new Map();
+  // Stop only if parse failed
+  if (!parsed?.scope?.root) {
+    connection.sendDiagnostics({
+      uri: doc.uri,
+      diagnostics
+    });
+    return;
   }
 
-  // declared cursors detection (skip)
-  const cursorRegex = /\bdeclare\s+([a-zA-Z0-9_]+)\s+cursor/gi;
-  const cursors = new Set<string>();
-  {
-    let cm: RegExpExecArray | null;
-    while ((cm = cursorRegex.exec(text))) { cursors.add(cm[1].toLowerCase()); }
+  // ---------------- Schema validation ----------------
+  if (typeof getIndexReady !== "function" || getIndexReady()) {
+    connection.console.error("[validate] entered schema block");
+
+    try {
+      const seenTables = new Set<string>();
+      const seenColumns = new Set<string>();
+      const aliasMap = new Map<string, string>();
+
+      function makeRange(start: number, end: number): Range {
+        const startPos = offsetToPosition(start, lineStarts);
+        const endPos = offsetToPosition(end, lineStarts);
+
+        return {
+          start: {
+            line: startPos.line,
+            character: startPos.character
+          },
+          end: {
+            line: endPos.line,
+            character: endPos.character
+          }
+        };
+      }
+
+      function addUnknownTable(name: string, start: number, end: number) {
+        if (!name) return;
+
+        const clean = normalizeName(name);
+
+        if (clean.startsWith("#") || clean.startsWith("@")) return;
+        if (tableExists(clean)) return;
+
+        if (seenTables.has(clean)) return;
+        seenTables.add(clean);
+
+        diagnostics.push({
+          severity: DiagnosticSeverity.Error,
+          range: makeRange(start, end),
+          message: `Unknown table '${name}'`,
+          source: "SaralSQL"
+        });
+      }
+
+      function addWrongColumn(
+        table: string,
+        column: string,
+        start: number,
+        end: number
+      ) {
+        const key = `${table}.${column}:${start}`;
+        if (seenColumns.has(key)) return;
+        seenColumns.add(key);
+
+        diagnostics.push({
+          severity: DiagnosticSeverity.Error,
+          range: makeRange(start, end),
+          message: `Column '${column}' not found in table '${table}'`,
+          source: "SaralSQL"
+        });
+      }
+
+      function visitScope(scope: any) {
+        for (const sym of Object.values(scope.symbols ?? {}) as any[]) {
+          // Alias -> backing table
+          if (sym.kind === "Alias" && sym.location?.table) {
+            const t = sym.location.table;
+            const tableName = normalizeName(
+              sym.metadata?.tableName ?? t.name
+            );
+
+            aliasMap.set(normalizeName(sym.name), tableName);
+
+            if (
+              typeof t.start === "number" &&
+              typeof t.end === "number"
+            ) {
+              addUnknownTable(t.name, t.start, t.end);
+            }
+
+            // Validate alias.column references
+            for (const ref of sym.references ?? []) {
+              const loc = ref.location;
+
+              if (
+                loc?.type === "Identifier" &&
+                Array.isArray(loc.parts) &&
+                loc.parts.length === 2
+              ) {
+                const alias = normalizeName(loc.parts[0]);
+                const column = normalizeName(loc.parts[1]);
+
+                const resolvedTable = aliasMap.get(alias);
+                if (!resolvedTable) continue;
+                if (!tableExists(resolvedTable)) continue;
+
+                const cols = columnsByTable.get(resolvedTable);
+                if (cols && !cols.has(column)) {
+                  addWrongColumn(
+                    resolvedTable,
+                    column,
+                    loc.start,
+                    loc.end
+                  );
+                }
+              }
+            }
+          }
+
+          // Direct table symbol
+          if (sym.kind === "Table" && sym.location?.nameNode) {
+            const n = sym.location.nameNode;
+
+            if (
+              typeof n.start === "number" &&
+              typeof n.end === "number"
+            ) {
+              addUnknownTable(n.name, n.start, n.end);
+            }
+          }
+        }
+
+        for (const child of scope.children ?? []) {
+          visitScope(child);
+        }
+      }
+
+      visitScope(parsed.scope.root);
+    } catch (e) {
+      safeLog(`[validate] Schema validation failed: ${String(e)}`);
+    }
   }
 
+  connection.console.error(
+    `[validate] sending diagnostics count=${diagnostics.length}`
+  );
 
+  connection.sendDiagnostics({
+    uri: doc.uri,
+    diagnostics
+  });
+}
 
-  // iterate over lines
-  for (let i = 0; i < lines.length; i++) {
-    const rawLine = lines[i];
-    // remove comments but preserve offsets for diagnostics
-    const noComments = stripComments(rawLine);
-    const cleanNoStr = stripStrings(noComments); // remove strings to avoid false positives
-    const trimmedLc = cleanNoStr.trim().toLowerCase();
+function tableExists(tableName: string): boolean {
+  const norm = normalizeName(tableName);
 
-    // ---------- Table existence checks (from/join/update/into) ----------
-    // allow table-like tokens to include # and @ so we can detect temp / table-variables
-    const tableRegex = /\b(from|join|update|into)\s+([a-zA-Z0-9_\[\]\.#@]+)/gi;
-    {
-      let m: RegExpExecArray | null;
-      while ((m = tableRegex.exec(cleanNoStr))) {
-        const rawTable = m[2];
+  if (columnsByTable.has(norm)) { return true; }
 
-        // skip declared cursor names
-        if (cursors.has(rawTable.toLowerCase())) { continue; }
+  const stripped = norm.replace(/^dbo\./, "");
+  if (columnsByTable.has(stripped)) { return true; }
 
-        // if it's temp (#) or table-variable (@) then we skip "unknown table" diagnostic here,
-        // because they aren't in global index; validator will check columns later using local map
-        if (rawTable.startsWith("#") || rawTable.startsWith("@")) { continue; }
+  return false;
+}
 
-        const normRaw = normalizeName(rawTable);
-        if (!columnsByTable.has(normRaw)) {
-          diagnostics.push({
-            severity: DiagnosticSeverity.Error,
-            range: {
-              start: { line: i, character: m.index },
-              end: { line: i, character: m.index + rawTable.length }
-            },
-            message: `Unknown table '${rawTable}'`,
-            source: "SaralSQL"
-          });
-        }
-      }
-    }
+function mapSeverity(severity: unknown): DiagnosticSeverity {
+  const s = String(severity ?? "").toLowerCase();
 
-    // ---------- Alias.column validation (statement-scoped) ----------
-    // Do alias.column checks only in SQL expression contexts (select/where/on/having/group/order)
-    const looksLikeColumnContext = /(^|\b)(select|where|having|on|group\s+by|order\s+by)\b/.test(trimmedLc);
-    if (looksLikeColumnContext) {
-      // Use statement-scoped data for best accuracy
-      const statementText = getCurrentStatement(doc, { line: i, character: 0 }) || "";
-      const stmtAliases = extractAliases(statementText);
-      // local table map for this statement/proc body (temp/table-vars)
-      const localTableMap = buildLocalTableMapForDocAtPos(doc, { line: i, character: 0 } as Position);
-      // candidate tables from statement
-      const candidateTables = collectCandidateTablesFromStatement(statementText);
+  switch (s) {
+    case "error":
+      return DiagnosticSeverity.Error;
 
-      // alias.column pattern - allow bracketed right side
-      const colRegex = /(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)\.(\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)/g;
-      let m: RegExpExecArray | null;
-      while ((m = colRegex.exec(cleanNoStr))) {
-        const aliasToken = m[1].toLowerCase();
-        const rightRaw = m[2];
+    case "warning":
+    case "warn":
+      return DiagnosticSeverity.Warning;
 
-        // skip variable references
-        if (aliasToken.startsWith("@")) { continue; }
-        if (rightRaw.startsWith("@")) { continue; }
+    case "info":
+    case "information":
+      return DiagnosticSeverity.Information;
 
-        // treat common schemas as schemas, not aliases
-        if (/^(dbo|sys|information_schema|pg_catalog|public)$/.test(aliasToken)) { continue; }
+    case "hint":
+      return DiagnosticSeverity.Hint;
 
-        const col = normalizeName(rightRaw.replace(/[\[\]]/g, ""));
-
-        // resolve alias -> target via stmtAliases, else fallback to fileAliases
-        let target = stmtAliases.get(aliasToken) ?? fileAliases.get(aliasToken);
-
-        if (!target) {
-          // Unknown alias - report
-          diagnostics.push({
-            severity: DiagnosticSeverity.Error,
-            range: {
-              start: { line: i, character: m.index },
-              end: { line: i, character: m.index + m[0].length }
-            },
-            message: `Unknown alias '${aliasToken}'`,
-            source: "SaralSQL"
-          });
-          continue;
-        }
-
-        // If alias points to a subquery placeholder like "__subquery__", skip column existence check
-        if (target === "__subquery__") { continue; }
-
-        // If target is temp table or table-variable (starts with # or @) then consult localTableMap
-        const targetStr = String(target);
-        const key = normalizeName(targetStr.replace(/^dbo\./i, ""));
-        const isTempOrVar = targetStr.startsWith("#") || targetStr.startsWith("@");
-        if (isTempOrVar) {
-          const localDef = localTableMap.get(key);
-          if (!localDef) {
-            // no local info -> skip validation (better UX than false positive)
-            continue;
-          }
-          const hasCol = localDef.columns.some(c => normalizeName(c.name) === col);
-          if (!hasCol) {
-            diagnostics.push({
-              severity: DiagnosticSeverity.Error,
-              range: {
-                start: { line: i, character: m.index },
-                end: { line: i, character: m.index + m[0].length }
-              },
-              message: `Column '${col}' not found in local table '${localDef.name}'`,
-              source: "SaralSQL"
-            });
-          }
-        } else {
-          // Normal catalog table -> check index
-          const normTable = normalizeName(String(target).replace(/^dbo\./i, ""));
-          const colSet = columnsByTable.get(normTable);
-          if (!colSet || !colSet.has(col)) {
-            diagnostics.push({
-              severity: DiagnosticSeverity.Error,
-              range: {
-                start: { line: i, character: m.index },
-                end: { line: i, character: m.index + m[0].length }
-              },
-              message: `Column '${col}' not found in table '${target}'`,
-              source: "SaralSQL"
-            });
-          }
-        }
-      }
-    }
-
-    // ---------- Bare column checks (when not qualified by alias) ----------
-    // Skip structural lines (FROM/UPDATE/INSERT/INTO/MERGE/APPLY) to avoid false positives
-    const isStructuralLine =
-      /^((left|right|full|inner|cross)\s+join|join|from|update|insert|into|merge|apply|cross\s+apply|outer\s+apply)\b/
-        .test(trimmedLc);
-    if (isStructuralLine) { continue; }
-
-    const looksLikeColumnContext2 = /(^|\b)(select|where|having|on|group\s+by|order\s+by)\b/.test(trimmedLc);
-    if (!looksLikeColumnContext2) { continue; }
-
-    // Build the set of tables in-scope for the current statement
-    const stmtTextForScope = getCurrentStatement(doc, { line: i, character: 0 }) || "";
-    const tablesInScope: string[] = [];
-    {
-      const fromJoinRegex = /\b(from|join)\s+([a-zA-Z0-9_\[\]\.#@]+)/gi;
-      let fm: RegExpExecArray | null;
-      while ((fm = fromJoinRegex.exec(stmtTextForScope))) {
-        const tk = fm[2];
-        // skip temp / table-var from global scope list (we'll validate them separately)
-        if (tk.startsWith("#") || tk.startsWith("@")) { continue; }
-        tablesInScope.push(normalizeName(tk));
-      }
-    }
-
-    // select list aliases to avoid marking them as missing columns
-    const selectAliases = extractSelectAliasesFromStatement(stmtTextForScope);
-
-    // Detect bare identifiers (bracketed or not). This regex approximates tokens in the line.
-    const bareColRegex = /\[([a-zA-Z0-9_ ]+)\]|([a-zA-Z_][a-zA-Z0-9_]*)/g;
-    {
-      let m: RegExpExecArray | null;
-      while ((m = bareColRegex.exec(cleanNoStr))) {
-        const rawToken = (m[1] || m[2] || "");
-        const tokenStart = m.index;
-
-        // skip tokens that are actually part of a variable reference, e.g. "@var"
-        const beforeChar = cleanNoStr.charAt(Math.max(0, tokenStart - 1));
-        if (beforeChar === "@") { continue; }
-
-        // skip SQL keywords
-        const col = normalizeName(rawToken.replace(/[\[\]]/g, ""));
-        if (isSqlKeyword(col)) { continue; }
-
-        // skip tokens that are alias members (we'll validate those in alias.column block)
-        const beforeSlice = cleanNoStr.slice(Math.max(0, tokenStart - 3), tokenStart);
-        if (beforeSlice.endsWith(".")) { continue; }
-
-        // skip "AS alias" patterns (alias definitions)
-        const leftSlice = cleanNoStr.slice(0, tokenStart).toLowerCase();
-        if (/\bas\s*$/.test(leftSlice)) { continue; }
-
-        // skip select-list aliases
-        if (selectAliases.has(col)) { continue; }
-
-        // Now, check whether any table in-scope contains this column
-        let found = false;
-        for (const t of tablesInScope) {
-          const set = columnsByTable.get(t);
-          if (set && set.has(col)) { found = true; break; }
-        }
-
-        if (!found && tablesInScope.length > 0) {
-          diagnostics.push({
-            severity: DiagnosticSeverity.Error,
-            range: {
-              start: { line: i, character: m.index },
-              end: { line: i, character: m.index + (m[0] ? m[0].length : rawToken.length) }
-            },
-            message: `Column '${col}' not found in any table in scope`,
-            source: "SaralSQL"
-          });
-        }
-      }
-    }
-  } // end for lines
-
-  // send diagnostics
-  connection.sendDiagnostics({ uri: doc.uri, diagnostics });
+    default:
+      return DiagnosticSeverity.Error;
+  }
 }
 
 connection.onDocumentSymbol((params): DocumentSymbol[] => {
@@ -2519,19 +2571,24 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
 // --- Capture configuration updates ---
 connection.onDidChangeConfiguration(change => {
   const settings = (change.settings || {}) as any;
-  // expect setting under "saralsql.enableValidation"
-  enableValidation = !!settings.saralsql?.enableValidation;
-  safeLog(`Validation ${enableValidation ? "enabled" : "disabled"}`);
 
-  // re-run validation if it just got enabled
+  enableValidation =
+    settings.saralsql?.enableValidation ?? true;
+
+  safeLog(
+    `Validation ${enableValidation ? "enabled" : "disabled"}`
+  );
+
   if (enableValidation) {
     for (const doc of documents.all()) {
       validateTextDocument(doc);
     }
   } else {
-    // clear diagnostics if disabled
     for (const doc of documents.all()) {
-      connection.sendDiagnostics({ uri: doc.uri, diagnostics: [] });
+      connection.sendDiagnostics({
+        uri: doc.uri,
+        diagnostics: []
+      });
     }
   }
 });
