@@ -42,7 +42,6 @@ import {
   , offsetToPosition
 } from "./text-utils";
 import { parseSqlWithWorker, isAstPoolReady } from "./parser-pool";
-import { parseDiagnostics } from "./sql-parser";
 import { resolveColumnFromAst, normalizeAstTableName, walkAst } from "./ast-utils";
 import {
   setIndexReady
@@ -72,6 +71,7 @@ import { parseSql } from "./sql-parser";
 const connection = createConnection(ProposedFeatures.all);
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
 let enableValidation = true;
+let showParseIssues = false;
 const DEBUG = true; // set to false after debugging
 const dbg = (...args: any[]) => { if (DEBUG) { console.debug('[HOVER]', ...args); } };
 
@@ -140,6 +140,21 @@ function safeError(msg: string, err?: unknown): void {
   connection.console.error(`[SaralSQL] ${msg}: ${err instanceof Error ? err.stack || err.message : String(err)}`);
 }
 
+function applySaralSqlSettings(settings: any): void {
+  enableValidation =
+    settings?.saralsql?.showDiagnostics ??
+    settings?.showDiagnostics ??
+    settings?.saralsql?.enableValidation ??
+    settings?.enableValidation ??
+    true;
+  showParseIssues =
+    settings?.saralsql?.showParseIssues ?? settings?.showParseIssues ?? false;
+
+  safeLog(
+    `Validation ${enableValidation ? "enabled" : "disabled"}, parse issues ${showParseIssues ? "enabled" : "disabled"}`
+  );
+}
+
 async function indexWorkspace(): Promise<void> {
   try {
     const folders = await connection.workspace.getWorkspaceFolders?.();
@@ -186,6 +201,9 @@ connection.onInitialize((_params: InitializeParams): InitializeResult => {
 connection.onInitialized(async () => {
   try {
     connection.console.error("[init] start");
+
+    const settings = await connection.workspace.getConfiguration("saralsql");
+    applySaralSqlSettings(settings);
 
     await indexWorkspace();
 
@@ -1994,57 +2012,96 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
   const lineStarts = getLineStarts(text);
 
   let parsed: any = null;
+  let hasParseIssues = false;
+
+  function toDiagnostic(diag: any, source: string): Diagnostic | null {
+    let range: Range;
+
+    if (typeof diag.start === "number") {
+      const startPos = offsetToPosition(diag.start, lineStarts);
+      const endPos = offsetToPosition(diag.end ?? diag.start, lineStarts);
+
+      range = {
+        start: {
+          line: startPos.line,
+          character: startPos.character
+        },
+        end: {
+          line: endPos.line,
+          character: endPos.character
+        }
+      };
+    } else if (diag.range && typeof diag.range.start === "number") {
+      const startPos = offsetToPosition(diag.range.start, lineStarts);
+      const endPos = offsetToPosition(diag.range.end, lineStarts);
+
+      range = {
+        start: {
+          line: startPos.line,
+          character: startPos.character
+        },
+        end: {
+          line: endPos.line,
+          character: endPos.character
+        }
+      };
+    } else {
+      return null;
+    }
+
+    return {
+      severity: mapSeverity(diag.severity),
+      range,
+      message: String(diag.message ?? "SQL diagnostic"),
+      source
+    };
+  }
 
   // ---------------- Parse once ----------------
   try {
     parsed = parseSql(text);
 
-    const parserDiags = [
-      ...(parsed?.diagnostics ?? []),
-      ...(parsed?.semanticDiagnostics ?? [])
-    ];
+    const combinedDiagnostics = parsed?.diagnostics ?? [];
+    const parserIssues = (parsed?.issues?.length
+      ? parsed.issues
+      : combinedDiagnostics.filter((diag: any) => {
+          const source = String(diag.source ?? "").toLowerCase();
+          const code = String(diag.code ?? "").toUpperCase();
+          return source === "parser" || code.startsWith("PARSE_");
+        })) ?? [];
 
-    for (const diag of parserDiags) {
-      let range: Range;
+    hasParseIssues = parserIssues.length > 0;
 
-      if (typeof diag.start === "number") {
-        const startPos = offsetToPosition(diag.start, lineStarts);
-        const endPos = offsetToPosition(diag.end ?? diag.start, lineStarts);
-
-        range = {
-          start: {
-            line: startPos.line,
-            character: startPos.character
-          },
-          end: {
-            line: endPos.line,
-            character: endPos.character
+    if (hasParseIssues) {
+      if (showParseIssues) {
+        for (const issue of parserIssues) {
+          const diagnostic = toDiagnostic(issue, "SaralSQL Parser");
+          if (diagnostic) {
+            diagnostics.push(diagnostic);
           }
-        };
-      } else if (diag.range && typeof diag.range.start === "number") {
-        const startPos = offsetToPosition(diag.range.start, lineStarts);
-        const endPos = offsetToPosition(diag.range.end, lineStarts);
-
-        range = {
-          start: {
-            line: startPos.line,
-            character: startPos.character
-          },
-          end: {
-            line: endPos.line,
-            character: endPos.character
-          }
-        };
-      } else {
-        continue;
+        }
       }
 
-      diagnostics.push({
-        severity: mapSeverity(diag.severity),
-        range,
-        message: diag.message,
-        source: "SaralSQL Parser"
+      connection.sendDiagnostics({
+        uri: doc.uri,
+        diagnostics
       });
+      return;
+    }
+
+    const semanticDiags = parsed?.semanticDiagnostics?.length
+      ? parsed.semanticDiagnostics
+      : combinedDiagnostics.filter((diag: any) => {
+          const source = String(diag.source ?? "").toLowerCase();
+          const code = String(diag.code ?? "").toUpperCase();
+          return source !== "parser" && !code.startsWith("PARSE_");
+        });
+
+    for (const diag of semanticDiags) {
+      const diagnostic = toDiagnostic(diag, "SaralSQL Parser");
+      if (diagnostic) {
+        diagnostics.push(diagnostic);
+      }
     }
   } catch (e) {
     safeLog(`[validate] Parser diagnostics failed: ${String(e)}`);
@@ -2572,12 +2629,7 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
 connection.onDidChangeConfiguration(change => {
   const settings = (change.settings || {}) as any;
 
-  enableValidation =
-    settings.saralsql?.enableValidation ?? true;
-
-  safeLog(
-    `Validation ${enableValidation ? "enabled" : "disabled"}`
-  );
+  applySaralSqlSettings(settings);
 
   if (enableValidation) {
     for (const doc of documents.all()) {

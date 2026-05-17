@@ -7,7 +7,7 @@
  * - Full semantic analysis (scope, diagnostics, lineage, column info)
  */
 
-import { analyze, Parser, Lexer } from '@saralsql/tsql-parser';
+import { analyze } from '@saralsql/tsql-parser';
 
 export interface ParseResult {
     ast: any;
@@ -35,14 +35,24 @@ export function parseSql(sql: string, opts: any = {}): ParseResult | null {
 
         return result;
     } catch (e: any) {
+        const message = e?.message || "SQL parse error";
         return {
             ast: null,
-            diagnostics: [
+            issues: [
                 {
-                    message: e?.message || "SQL parse error",
+                    message,
                     severity: "error",
                     start: 0,
-                    end: 1
+                    end: Math.min(sql.length, 1)
+                }
+            ],
+            diagnostics: [
+                {
+                    source: "parser",
+                    message,
+                    severity: "error",
+                    start: 0,
+                    end: Math.min(sql.length, 1)
                 }
             ]
         };
