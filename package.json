@@ -6,7 +6,13 @@
   "keywords": [
     "SQL",
     "language server",
-    "VS Code"
+    "VS Code",
+    "T-SQL",
+    "SQL Server",
+    "Azure SQL",
+    "SQL Database Projects",
+    "SSDT",
+    "database development"
   ],
   "license": "MIT",
   "version": "0.3.1",

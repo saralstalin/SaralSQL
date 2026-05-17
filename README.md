@@ -1,7 +1,7 @@
 # SaralSQL — SQL IntelliSense & LSP for VS Code
 
 > **Instant “Go to Definition” & IntelliSense for SQL — no database connection required.**  
-> Built for teams that keep their schema in `.sql` files.  
+> Built for teams that keep their entire schema in `.sql` files.  
 > ⚡ **Indexes large projects (2000+ files) within a minute, and stays updated as you type**
 
 ---
@@ -77,8 +77,8 @@
 
 This is an **Early-Access Preview**:
 - Optimized for **T-SQL / SQL Server** DDL & DML with advanced `@saralsql/tsql-parser`  
-- Dialects like Postgres or MySQL may partially work but are not fully supported yet  
-- Real-time diagnostics now available for syntax and semantic validation  
+- Dialects like Postgres or MySQL may partially work but are not officially supported.  
+- Real-time diagnostics now available for syntax and semantic validation, if you enable it from settings
 - Column and reference detection uses both regex indexing and full parser analysis  
 - Certain constructs (e.g. `TOP(@Variable)`, `MERGE`, `OUTPUT INTO`) are still being improved
 
