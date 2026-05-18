@@ -232,12 +232,12 @@ export function indexText(uri: string, text: string): void {
             // Build block from current line and parse columns (linear helper)
             const createBlock = text;
             let cols = parseColumnsFromCreateBlock(createBlock, i);
-            console.debug(`[indexText] ${rawName} parseColumnsFromCreateBlock -> ${cols?.length ?? 0}`);
+            //console.debug(`[indexText] ${rawName} parseColumnsFromCreateBlock -> ${cols?.length ?? 0}`);
 
             if (kind === "VIEW") {
                 try {
                     const viewCols = parseColumnsFromCreateView(createBlock, i);
-                    console.debug(`[indexText] parseColumnsFromCreateView -> ${Array.isArray(viewCols) ? viewCols.length : "?"}`);
+                    //console.debug(`[indexText] parseColumnsFromCreateView -> ${Array.isArray(viewCols) ? viewCols.length : "?"}`);
 
                     if (viewCols && viewCols.length) {
                         cols = Array.isArray(cols) ? cols : [];

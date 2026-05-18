@@ -77,7 +77,7 @@ const dbg = (...args: any[]) => { if (DEBUG) { console.debug('[HOVER]', ...args)
 
 // Call this after building the definitions index
 async function markIndexReady() {
-  connection.console.error("[index] markIndexReady start");
+  //connection.console.error("[index] markIndexReady start");
 
   setIndexReady();
 
@@ -86,18 +86,18 @@ async function markIndexReady() {
   );
 
   const docs = documents.all();
-  connection.console.error(`[index] open docs=${docs.length}`);
+  //connection.console.error(`[index] open docs=${docs.length}`);
 
   for (const doc of docs) {
-    connection.console.error(`[index] validating ${doc.uri}`);
+    //connection.console.error(`[index] validating ${doc.uri}`);
 
     try {
       const p = validateTextDocument(doc);
-      connection.console.error("[index] validate returned promise");
+      //connection.console.error("[index] validate returned promise");
 
       await p;
 
-      connection.console.error("[index] validate completed");
+      //connection.console.error("[index] validate completed");
     } catch (e) {
       connection.console.error(
         `[index] validate threw: ${String(e)}`
@@ -105,7 +105,7 @@ async function markIndexReady() {
     }
   }
 
-  connection.console.error("[index] markIndexReady end");
+  //connection.console.error("[index] markIndexReady end");
 }
 
 function toNormUri(rawUri: string) {
@@ -2142,14 +2142,14 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
       }
 
       function addUnknownTable(name: string, start: number, end: number) {
-        if (!name) return;
+        if (!name) {return;}
 
         const clean = normalizeName(name);
 
-        if (clean.startsWith("#") || clean.startsWith("@")) return;
-        if (tableExists(clean)) return;
+        if (clean.startsWith("#") || clean.startsWith("@")) {return;}
+        if (tableExists(clean)) {return;}
 
-        if (seenTables.has(clean)) return;
+        if (seenTables.has(clean)) {return;}
         seenTables.add(clean);
 
         diagnostics.push({
@@ -2167,7 +2167,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         end: number
       ) {
         const key = `${table}.${column}:${start}`;
-        if (seenColumns.has(key)) return;
+        if (seenColumns.has(key)) {return;}
         seenColumns.add(key);
 
         diagnostics.push({
@@ -2209,8 +2209,8 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
                 const column = normalizeName(loc.parts[1]);
 
                 const resolvedTable = aliasMap.get(alias);
-                if (!resolvedTable) continue;
-                if (!tableExists(resolvedTable)) continue;
+                if (!resolvedTable) {continue;}
+                if (!tableExists(resolvedTable)) {continue;}
 
                 const cols = columnsByTable.get(resolvedTable);
                 if (cols && !cols.has(column)) {
