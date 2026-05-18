@@ -53,11 +53,11 @@
 
   Diagnostics are enabled by default with `saralsql.showDiagnostics`. Parser issues are hidden by default with `saralsql.showParseIssues`; when parser issues are hidden, SaralSQL only shows other diagnostics after the document parses successfully.
 
-![Self-comparison diagnostic](Images/DiagnosticsSelfComparison.svg)
+![Self-comparison diagnostic](Images/DiagnosticsSelfComparison.png)
 
-![UPDATE without WHERE diagnostic](Images/DiagnosticsUnsafeUpdate.svg)
+![UPDATE without WHERE diagnostic](Images/DiagnosticsUnsafeUpdate.png)
 
-![Unused variable diagnostic](Images/DiagnosticsUnusedVariable.svg)
+![Unused variable diagnostic](Images/DiagnosticsUnusedVariable.png)
 
 - **Workspace Indexing**  
   - Automatically indexes all `.sql` files in the workspace when workspace is opened in VS code
