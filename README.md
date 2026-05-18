@@ -43,8 +43,21 @@
 ![Table Hover](Images/TableHover.png)
 
 - **Diagnostics & Error Checking**  
-  Real-time syntax validation and semantic error detection using advanced T-SQL parsing.  
-  Automatically highlights undefined tables, columns, and syntax errors.
+  Real-time parser-backed diagnostics using `@saralsql/tsql-parser`.  
+  SaralSQL can highlight schema issues, unsafe statements, and semantic warnings as you type:
+  - Unknown tables and columns
+  - Conditions that compare a column to itself, such as `e.DepartmentId = e.DepartmentId`
+  - `UPDATE` statements without a `WHERE` clause
+  - Variables or parameters that are declared but never used
+  - Parser issues, when enabled from settings
+
+  Diagnostics are enabled by default with `saralsql.showDiagnostics`. Parser issues are hidden by default with `saralsql.showParseIssues`; when parser issues are hidden, SaralSQL only shows other diagnostics after the document parses successfully.
+
+![Self-comparison diagnostic](Images/DiagnosticsSelfComparison.svg)
+
+![UPDATE without WHERE diagnostic](Images/DiagnosticsUnsafeUpdate.svg)
+
+![Unused variable diagnostic](Images/DiagnosticsUnusedVariable.svg)
 
 - **Workspace Indexing**  
   - Automatically indexes all `.sql` files in the workspace when workspace is opened in VS code

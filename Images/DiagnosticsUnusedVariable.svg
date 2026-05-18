@@ -1,0 +1,17 @@
+<svg width="1280" height="430" viewBox="0 0 1280 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">SaralSQL diagnostic for an unused variable</title>
+  <desc id="desc">A declared SQL variable is not used and SaralSQL reports it as a diagnostic.</desc>
+  <rect width="1280" height="430" fill="#1e1e1e"/>
+  <text x="36" y="78" fill="#7db2f2" font-family="Consolas, monospace" font-size="34">SET NOCOUNT ON;</text>
+  <text x="36" y="144" fill="#7db2f2" font-family="Consolas, monospace" font-size="34">DECLARE</text>
+  <text x="202" y="144" fill="#d4d4d4" font-family="Consolas, monospace" font-size="34">@EmployeeDepartmentId</text>
+  <text x="626" y="144" fill="#7db2f2" font-family="Consolas, monospace" font-size="34">INT;</text>
+  <path d="M202 158 q8 -10 16 0 t16 0 t16 0 t16 0 t16 0 t16 0 t16 0 t16 0 t16 0 t16 0 t16 0 t16 0 t16 0 t16 0 t16 0 t16 0 t16 0 t16 0" fill="none" stroke="#d7ba39" stroke-width="3"/>
+  <rect x="150" y="18" width="1060" height="182" rx="14" fill="#252526" stroke="#454545" stroke-width="2"/>
+  <text x="174" y="72" fill="#d4d4d4" font-family="Consolas, monospace" font-size="32">Variable '@EmployeeDepartmentId' is declared but never used</text>
+  <text x="912" y="72" fill="#858585" font-family="Consolas, monospace" font-size="28">SaralSQL Parser</text>
+  <line x1="150" y1="104" x2="1210" y2="104" stroke="#333"/>
+  <text x="174" y="154" fill="#d4d4d4" font-family="Consolas, monospace" font-size="28" font-weight="700">Parameter</text>
+  <rect x="346" y="126" width="374" height="44" rx="6" fill="#1b1b1b"/>
+  <text x="362" y="158" fill="#d4d4d4" font-family="Consolas, monospace" font-size="28">@EmployeeDepartmentId</text>
+</svg>

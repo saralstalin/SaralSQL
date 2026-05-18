@@ -1,0 +1,17 @@
+<svg width="1280" height="430" viewBox="0 0 1280 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">SaralSQL diagnostic for an UPDATE without a WHERE clause</title>
+  <desc id="desc">An UPDATE statement has its WHERE clause commented out and SaralSQL warns that all rows will be affected.</desc>
+  <rect width="1280" height="430" fill="#1e1e1e"/>
+  <text x="36" y="132" fill="#7db2f2" font-family="Consolas, monospace" font-size="34">UPDATE</text>
+  <text x="182" y="132" fill="#d4d4d4" font-family="Consolas, monospace" font-size="34">HackathonWinners</text>
+  <text x="36" y="190" fill="#7db2f2" font-family="Consolas, monospace" font-size="34">SET</text>
+  <text x="126" y="190" fill="#d4d4d4" font-family="Consolas, monospace" font-size="34">Prize = @GoodieName</text>
+  <text x="36" y="250" fill="#6a9955" font-family="Consolas, monospace" font-size="34">--WHERE WinnerId = @WinnerId;</text>
+  <path d="M36 144 q8 -10 16 0 t16 0 t16 0 t16 0 t16 0 t16 0" fill="none" stroke="#d7ba39" stroke-width="3"/>
+  <rect x="40" y="26" width="1160" height="150" rx="14" fill="#252526" stroke="#454545" stroke-width="2"/>
+  <text x="62" y="80" fill="#d4d4d4" font-family="Consolas, monospace" font-size="32">UPDATE statement has no WHERE clause - all rows will be affected</text>
+  <text x="982" y="80" fill="#858585" font-family="Consolas, monospace" font-size="28">SaralSQL Parser</text>
+  <line x1="40" y1="108" x2="1200" y2="108" stroke="#333"/>
+  <text x="62" y="154" fill="#6ca0ff" font-family="Consolas, monospace" font-size="26">View Problem</text>
+  <text x="264" y="154" fill="#6ca0ff" font-family="Consolas, monospace" font-size="26">Quick Fix...</text>
+</svg>
