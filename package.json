@@ -9,13 +9,12 @@
     "VS Code",
     "T-SQL",
     "SQL Server",
-    "Azure SQL",
     "SQL Database Projects",
     "SSDT",
     "database development"
   ],
   "license": "MIT",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "engines": {
     "vscode": "^1.103.0"
   },
@@ -97,7 +96,7 @@
     "typescript": "^5.8.3"
   },
   "dependencies": {
-    "@saralsql/tsql-parser": "^0.2.5",
+    "@saralsql/tsql-parser": "^0.2.6",
     "vscode-languageclient": "^9.0.1",
     "vscode-languageserver": "^9.0.1",
     "vscode-languageserver-textdocument": "^1.0.12"

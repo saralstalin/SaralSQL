@@ -70,6 +70,7 @@ import { parseSql } from "./sql-parser";
 // ---------- Connection + Documents ----------
 const connection = createConnection(ProposedFeatures.all);
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
+const workspaceDocuments = new Map<string, TextDocument>();
 let enableValidation = true;
 let showParseIssues = false;
 const DEBUG = true; // set to false after debugging
@@ -85,27 +86,74 @@ async function markIndexReady() {
     `[index] getIndexReady=${getIndexReady()}`
   );
 
-  const docs = documents.all();
-  //connection.console.error(`[index] open docs=${docs.length}`);
+  if (enableValidation) {
+    await validateWorkspaceDocuments();
+  } else {
+    clearWorkspaceDiagnostics();
+  }
 
-  for (const doc of docs) {
-    //connection.console.error(`[index] validating ${doc.uri}`);
+  //connection.console.error("[index] markIndexReady end");
+}
 
+async function validateWorkspaceDocuments(): Promise<void> {
+  const openDocs = new Map(documents.all().map(doc => [doc.uri, doc]));
+  const validatedUris = new Set<string>();
+
+  for (const doc of openDocs.values()) {
     try {
-      const p = validateTextDocument(doc);
-      //connection.console.error("[index] validate returned promise");
-
-      await p;
-
-      //connection.console.error("[index] validate completed");
+      await validateTextDocument(doc);
+      validatedUris.add(doc.uri);
     } catch (e) {
       connection.console.error(
-        `[index] validate threw: ${String(e)}`
+        `[validateWorkspace] open document validate threw: ${String(e)}`
       );
     }
   }
 
-  //connection.console.error("[index] markIndexReady end");
+  let validatedCount = validatedUris.size;
+
+  for (const doc of workspaceDocuments.values()) {
+    if (validatedUris.has(doc.uri)) {
+      continue;
+    }
+
+    try {
+      await validateTextDocument(doc);
+      validatedUris.add(doc.uri);
+      validatedCount++;
+
+      if (validatedCount % 25 === 0) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+    } catch (e) {
+      connection.console.error(
+        `[validateWorkspace] workspace document validate threw for ${doc.uri}: ${String(e)}`
+      );
+    }
+  }
+
+  connection.console.error(
+    `[validateWorkspace] validated ${validatedUris.size} workspace SQL documents`
+  );
+}
+
+function clearWorkspaceDiagnostics(): void {
+  const uris = new Set<string>();
+
+  for (const doc of workspaceDocuments.values()) {
+    uris.add(doc.uri);
+  }
+
+  for (const doc of documents.all()) {
+    uris.add(doc.uri);
+  }
+
+  for (const uri of uris) {
+    connection.sendDiagnostics({
+      uri,
+      diagnostics: []
+    });
+  }
 }
 
 function toNormUri(rawUri: string) {
@@ -169,6 +217,7 @@ async function indexWorkspace(): Promise<void> {
         try {
           const text = fs.readFileSync(file, "utf8");
           const uri = url.pathToFileURL(file).toString();
+          workspaceDocuments.set(uri, TextDocument.create(uri, "sql", 0, text));
           indexText(uri, text);
         } catch (err) {
           safeError(`Failed to index ${file}`, err);
@@ -218,6 +267,7 @@ connection.onInitialized(async () => {
 });
 
 documents.onDidOpen(async (e) => {
+  workspaceDocuments.set(e.document.uri, e.document);
   indexText(e.document.uri, e.document.getText());
 
   if (enableValidation) {
@@ -254,6 +304,7 @@ documents.onDidChangeContent((e) => {
       try {
         connection.console.error("[change] debounce run");
 
+        workspaceDocuments.set(uri, e.document);
         indexText(uri, e.document.getText());
         connection.console.error("[change] indexed");
 
@@ -2632,16 +2683,9 @@ connection.onDidChangeConfiguration(change => {
   applySaralSqlSettings(settings);
 
   if (enableValidation) {
-    for (const doc of documents.all()) {
-      validateTextDocument(doc);
-    }
+    void validateWorkspaceDocuments();
   } else {
-    for (const doc of documents.all()) {
-      connection.sendDiagnostics({
-        uri: doc.uri,
-        diagnostics: []
-      });
-    }
+    clearWorkspaceDiagnostics();
   }
 });
 

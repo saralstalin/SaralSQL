@@ -14,6 +14,7 @@ import * as url from "url";
 import { isAstPoolReady, parseSqlWithWorker } from "./parser-pool";
 import { resolveColumnFromAst, walkAst, extractColumnName } from "./ast-utils";
 import { collectCandidateTablesFromStatement } from "./sql-scope-utils";
+import { parseSql } from "./sql-parser";
 
 export interface ColumnDef {
     name: string;
@@ -141,6 +142,141 @@ export function findTableOrColumn(word: string): Location[] {
     return results;
 }
 
+function indexDefinitionsFromParser(
+    text: string,
+    normUri: string,
+    defs: SymbolDef[],
+    localRefs: ReferenceDef[]
+): Set<string> {
+    const indexedNames = new Set<string>();
+    const parsed = parseSql(text);
+    const lineStarts = getLineStarts(text);
+
+    if (!parsed?.ast) {
+        return indexedNames;
+    }
+
+    walkAst(parsed.ast, (node: any) => {
+        if (!node || node.type !== "CreateStatement" || !node.name) {
+            return;
+        }
+
+        const kind = String(node.objectType ?? "").toUpperCase();
+        if (!["TABLE", "VIEW", "TYPE", "PROCEDURE", "FUNCTION"].includes(kind)) {
+            return;
+        }
+
+        const rawName = String(node.name);
+        const norm = normalizeName(rawName);
+        if (!norm || indexedNames.has(norm)) {
+            return;
+        }
+
+        const nameStart = typeof node.nameNode?.start === "number" ? node.nameNode.start : node.start ?? 0;
+        const nameEnd = typeof node.nameNode?.end === "number" ? node.nameNode.end : nameStart + rawName.length;
+        const namePos = offsetToPosition(nameStart, lineStarts);
+        const sym: SymbolDef = {
+            name: norm,
+            rawName,
+            uri: normUri,
+            line: namePos.line,
+            kind
+        };
+
+        localRefs.push({
+            name: norm,
+            uri: normUri,
+            line: namePos.line,
+            start: namePos.character,
+            end: namePos.character + Math.max(1, nameEnd - nameStart),
+            kind: "table"
+        });
+
+        const columns = getParserColumns(node, text, lineStarts);
+        if (columns.length > 0) {
+            sym.columns = columns;
+            columnsByTable.set(norm, new Set(columns.map(col => normalizeName(col.name))));
+
+            for (const col of columns) {
+                localRefs.push({
+                    name: `${norm}.${col.name}`,
+                    uri: normUri,
+                    line: col.line,
+                    start: col.start ?? 0,
+                    end: col.end ?? ((col.start ?? 0) + col.rawName.length),
+                    kind: "column"
+                });
+            }
+        }
+
+        defs.push(sym);
+        indexedNames.add(norm);
+    });
+
+    return indexedNames;
+}
+
+function getParserColumns(node: any, text: string, lineStarts: number[]): ColumnDef[] {
+    const kind = String(node.objectType ?? "").toUpperCase();
+
+    if (kind === "TABLE" || (kind === "TYPE" && node.isTableType)) {
+        return (node.columns ?? [])
+            .map((col: any) => parserColumnDefinition(col, text, lineStarts))
+            .filter(Boolean) as ColumnDef[];
+    }
+
+    if (kind === "VIEW" && Array.isArray(node.body?.columns)) {
+        return node.body.columns
+            .filter((col: any) => !col?.wildcard)
+            .map((col: any) => parserViewColumnDefinition(col, text, lineStarts))
+            .filter(Boolean) as ColumnDef[];
+    }
+
+    return [];
+}
+
+function parserColumnDefinition(col: any, text: string, lineStarts: number[]): ColumnDef | null {
+    const rawName = String(col?.name ?? "").trim();
+    if (!rawName) {
+        return null;
+    }
+
+    const startOffset = typeof col.start === "number" ? col.start : text.indexOf(rawName);
+    const endOffset = typeof col.end === "number" ? col.end : startOffset + rawName.length;
+    const pos = offsetToPosition(Math.max(0, startOffset), lineStarts);
+
+    return {
+        name: normalizeName(rawName),
+        rawName,
+        type: col.dataType ? String(col.dataType) : undefined,
+        line: pos.line,
+        start: pos.character,
+        end: pos.character + Math.max(rawName.length, endOffset - startOffset)
+    };
+}
+
+function parserViewColumnDefinition(col: any, text: string, lineStarts: number[]): ColumnDef | null {
+    const rawName = String(col?.outputName ?? col?.alias ?? col?.sourceName ?? "").trim();
+    if (!rawName) {
+        return null;
+    }
+
+    const colStart = typeof col.start === "number" ? col.start : 0;
+    const colEnd = typeof col.end === "number" ? col.end : colStart + rawName.length;
+    const columnText = text.slice(colStart, colEnd);
+    const rawIndex = columnText.toLowerCase().lastIndexOf(rawName.toLowerCase());
+    const startOffset = rawIndex >= 0 ? colStart + rawIndex : colStart;
+    const pos = offsetToPosition(startOffset, lineStarts);
+
+    return {
+        name: normalizeName(rawName),
+        rawName,
+        line: pos.line,
+        start: pos.character,
+        end: pos.character + rawName.length
+    };
+}
+
 // ---------- Indexing ----------
 export function indexText(uri: string, text: string): void {
     const normUri = uri.startsWith("file://") ? uri : url.pathToFileURL(uri).toString();
@@ -170,6 +306,7 @@ export function indexText(uri: string, text: string): void {
     const cleanLines = lines.map(stripComments); // <-- compute once
     const localRefs: ReferenceDef[] = [];
     const cleanText = cleanLines.join("\n");
+    const parserIndexedDefinitions = indexDefinitionsFromParser(text, normUri, defs, localRefs);
 
     // Precompile regexes once (reset lastIndex before each use)
     const tableRegexG = /\b(from|join|update|into)\s+([a-zA-Z0-9_\[\]\.]+)/gi;
@@ -225,6 +362,7 @@ export function indexText(uri: string, text: string): void {
         const kind = match[1].toUpperCase();
         const rawName = match[2];
         const norm = normalizeName(rawName);
+        if (parserIndexedDefinitions.has(norm)) { continue; }
 
         const sym: SymbolDef = { name: norm, rawName, uri: normUri, line: i, kind };
 
