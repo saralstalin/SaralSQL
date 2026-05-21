@@ -14,7 +14,7 @@
     "database development"
   ],
   "license": "MIT",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "engines": {
     "vscode": "^1.103.0"
   },
@@ -41,11 +41,6 @@
     "configuration": {
       "title": "SaralSQL",
       "properties": {
-        "saralsql.enableValidation": {
-          "type": "boolean",
-          "default": true,
-          "description": "Enable SaralSQL diagnostics. Kept for compatibility; prefer saralsql.showDiagnostics."
-        },
         "saralsql.showDiagnostics": {
           "type": "boolean",
           "default": true,
@@ -60,6 +55,302 @@
           "type": "boolean",
           "default": false,
           "description": "Enable schema diagnostics such as unknown table/column and ambiguous bare columns."
+        },
+        "saralsql.diagnostics.unknownTable": {
+          "type": "boolean",
+          "default": true,
+          "description": "LSP001: Show unknown table diagnostics.",
+          "order": 100
+        },
+        "saralsql.diagnostics.unknownTableSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "error",
+          "description": "LSP001: Set the severity for unknown table diagnostics.",
+          "order": 101
+        },
+        "saralsql.diagnostics.unknownColumn": {
+          "type": "boolean",
+          "default": true,
+          "description": "LSP002: Show unknown column diagnostics.",
+          "order": 102
+        },
+        "saralsql.diagnostics.unknownColumnSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "error",
+          "description": "LSP002: Set the severity for unknown column diagnostics.",
+          "order": 103
+        },
+        "saralsql.diagnostics.ambiguousColumn": {
+          "type": "boolean",
+          "default": true,
+          "description": "LSP003: Show ambiguous bare column diagnostics.",
+          "order": 104
+        },
+        "saralsql.diagnostics.ambiguousColumnSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "warning",
+          "description": "LSP003: Set the severity for ambiguous bare column diagnostics.",
+          "order": 105
+        },
+        "saralsql.diagnostics.readabilityHint": {
+          "type": "boolean",
+          "default": true,
+          "description": "LSP004: Show the readability hint that suggests qualifying a uniquely owned bare column.",
+          "order": 106
+        },
+        "saralsql.diagnostics.readabilityHintSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "information",
+          "description": "LSP004: Set the severity for the readability hint diagnostic.",
+          "order": 107
+        },
+        "saralsql.diagnostics.stringComparison": {
+          "type": "boolean",
+          "default": true,
+          "description": "LSP005: Show warnings for direct varchar and nvarchar comparisons.",
+          "order": 108
+        },
+        "saralsql.diagnostics.stringComparisonSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "warning",
+          "description": "LSP005: Set the severity for varchar and nvarchar comparison warnings.",
+          "order": 109
+        },
+        "saralsql.diagnostics.unnamedKeyConstraint": {
+          "type": "boolean",
+          "default": true,
+          "description": "DDL002: Show warnings for unnamed PRIMARY KEY and UNIQUE constraints.",
+          "order": 110
+        },
+        "saralsql.diagnostics.unnamedKeyConstraintSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "warning",
+          "description": "DDL002: Set the severity for unnamed key constraint diagnostics.",
+          "order": 111
+        },
+        "saralsql.diagnostics.unnamedDefaultConstraint": {
+          "type": "boolean",
+          "default": true,
+          "description": "DDL003: Show warnings for unnamed DEFAULT constraints.",
+          "order": 112
+        },
+        "saralsql.diagnostics.unnamedDefaultConstraintSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "warning",
+          "description": "DDL003: Set the severity for unnamed default constraint diagnostics.",
+          "order": 113
+        },
+        "saralsql.diagnostics.undeclaredVariable": {
+          "type": "boolean",
+          "default": true,
+          "description": "VAR001: Show diagnostics for undeclared variables.",
+          "order": 114
+        },
+        "saralsql.diagnostics.undeclaredVariableSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "error",
+          "description": "VAR001: Set the severity for undeclared variable diagnostics.",
+          "order": 115
+        },
+        "saralsql.diagnostics.unusedVariable": {
+          "type": "boolean",
+          "default": true,
+          "description": "VAR002: Show diagnostics for declared variables that are never used.",
+          "order": 116
+        },
+        "saralsql.diagnostics.unusedVariableSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "warning",
+          "description": "VAR002: Set the severity for unused variable diagnostics.",
+          "order": 117
+        },
+        "saralsql.diagnostics.unusedParameter": {
+          "type": "boolean",
+          "default": true,
+          "description": "VAR003: Show diagnostics for declared parameters that are never used.",
+          "order": 118
+        },
+        "saralsql.diagnostics.unusedParameterSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "warning",
+          "description": "VAR003: Set the severity for unused parameter diagnostics.",
+          "order": 119
+        },
+        "saralsql.diagnostics.variableUsedBeforeSet": {
+          "type": "boolean",
+          "default": true,
+          "description": "VAR004: Show diagnostics for variables that are used before being set.",
+          "order": 120
+        },
+        "saralsql.diagnostics.variableUsedBeforeSetSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "warning",
+          "description": "VAR004: Set the severity for variable-used-before-set diagnostics.",
+          "order": 121
+        },
+        "saralsql.diagnostics.selfComparison": {
+          "type": "boolean",
+          "default": true,
+          "description": "LOG001: Show diagnostics for self-comparisons such as column = column.",
+          "order": 122
+        },
+        "saralsql.diagnostics.selfComparisonSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "warning",
+          "description": "LOG001: Set the severity for self-comparison diagnostics.",
+          "order": 123
+        },
+        "saralsql.diagnostics.updateWithoutWhere": {
+          "type": "boolean",
+          "default": true,
+          "description": "DML001: Show warnings for UPDATE statements without a WHERE clause.",
+          "order": 124
+        },
+        "saralsql.diagnostics.updateWithoutWhereSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "warning",
+          "description": "DML001: Set the severity for UPDATE without WHERE diagnostics.",
+          "order": 125
+        },
+        "saralsql.diagnostics.deleteWithoutWhere": {
+          "type": "boolean",
+          "default": true,
+          "description": "DML002: Show warnings for DELETE statements without a WHERE clause.",
+          "order": 126
+        },
+        "saralsql.diagnostics.deleteWithoutWhereSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "warning",
+          "description": "DML002: Set the severity for DELETE without WHERE diagnostics.",
+          "order": 127
+        },
+        "saralsql.diagnostics.insertWithoutColumnList": {
+          "type": "boolean",
+          "default": true,
+          "description": "DML003: Show warnings for INSERT statements that omit a column list.",
+          "order": 128
+        },
+        "saralsql.diagnostics.insertWithoutColumnListSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "warning",
+          "description": "DML003: Set the severity for INSERT without column list diagnostics.",
+          "order": 129
+        },
+        "saralsql.diagnostics.updateTargetNoLock": {
+          "type": "boolean",
+          "default": true,
+          "description": "DML004: Show errors when an UPDATE target uses WITH (NOLOCK).",
+          "order": 130
+        },
+        "saralsql.diagnostics.updateTargetNoLockSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "error",
+          "description": "DML004: Set the severity for UPDATE target NOLOCK diagnostics.",
+          "order": 131
+        },
+        "saralsql.disabledDiagnostics": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Advanced. Disable specific diagnostics by code, such as LSP001, LSP003, LSP004, DML001, VAR002, or LOG001."
         },
         "saralsql.exclude": {
           "type": "array",

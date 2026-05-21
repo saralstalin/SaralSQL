@@ -57,7 +57,7 @@ import {
   , tableTypesByName
 } from "./definitions";
 import { parseSql, type ParseResult } from "./sql-parser";
-import { buildReadableBareColumnCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues } from "./diagnostic-helpers";
+import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, normalizeSaralSqlSettings, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "./diagnostic-helpers";
 import { getCteColumns, resolveAliasTableName, resolveSymbolCaseInsensitive, normalizeAstTableName, resolveDerivedAliasColumn, resolveAliasFromAst, getDisplaySymbolName } from "./ast-utils";
 import { LruCache } from "./lru-cache";
 
@@ -69,6 +69,8 @@ const parsedDocumentCache = new LruCache();
 let enableValidation = true;
 let showParseIssues = false;
 let enableSchemaValidation = false;
+let disabledDiagnosticCodes = new Set<string>();
+let diagnosticSeverityOverrides = new Map<string, DiagnosticSeverity>();
 const DEBUG = process.env.SARALSQL_DEBUG === "1";
 const dbg = (...args: any[]) => { if (DEBUG) { console.debug("[SaralSQL]", ...args); } };
 
@@ -191,21 +193,17 @@ function getParsedDocument(doc: TextDocument): ParseResult | null {
 }
 
 function applySaralSqlSettings(settings: any): void {
-  enableValidation =
-    settings?.saralsql?.showDiagnostics ??
-    settings?.showDiagnostics ??
-    settings?.saralsql?.enableValidation ??
-    settings?.enableValidation ??
-    true;
+  settings = normalizeSaralSqlSettings(settings);
+  disabledDiagnosticCodes = buildDisabledDiagnosticCodes(settings);
+  diagnosticSeverityOverrides = buildDiagnosticSeverityOverrides(settings);
+
+  enableValidation = settings?.showDiagnostics ?? settings?.enableValidation ?? true;
   showParseIssues =
-    settings?.saralsql?.showParseIssues ?? settings?.showParseIssues ?? false;
-  enableSchemaValidation =
-    settings?.saralsql?.enableSchemaValidation ??
-    settings?.enableSchemaValidation ??
-    false;
+    settings?.showParseIssues ?? false;
+  enableSchemaValidation = settings?.enableSchemaValidation ?? false;
 
   safeLog(
-    `Validation ${enableValidation ? "enabled" : "disabled"}, parse issues ${showParseIssues ? "enabled" : "disabled"}, schema validation ${enableSchemaValidation ? "enabled" : "disabled"}`
+    `Validation ${enableValidation ? "enabled" : "disabled"}, parse issues ${showParseIssues ? "enabled" : "disabled"}, schema validation ${enableSchemaValidation ? "enabled" : "disabled"}, disabled diagnostics ${disabledDiagnosticCodes.size}`
   );
 }
 
@@ -1908,7 +1906,8 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
     }
 
     return {
-      severity: mapSeverity(diag.severity),
+      code: String(diag.code ?? ""),
+      severity: mapSeverity(diag.severity, String(diag.code ?? "")),
       range,
       message: String(diag.message ?? "SQL diagnostic"),
       source
@@ -1933,7 +1932,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
       if (showParseIssues) {
         for (const issue of parserIssues) {
           const diagnostic = toDiagnostic(issue, "SaralSQL Parser");
-          if (diagnostic) {
+          if (diagnostic && !shouldSuppressDiagnosticCode(String((issue as any).code ?? diagnostic.code ?? ""), disabledDiagnosticCodes)) {
             diagnostics.push(diagnostic);
           }
         }
@@ -1956,7 +1955,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
 
     for (const diag of semanticDiags) {
       const diagnostic = toDiagnostic(diag, "SaralSQL Parser");
-      if (diagnostic) {
+      if (diagnostic && !shouldSuppressDiagnosticCode(String((diag as any).code ?? diagnostic.code ?? ""), disabledDiagnosticCodes)) {
         diagnostics.push(diagnostic);
       }
     }
@@ -2006,6 +2005,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
 
       function addUnknownTableAt(name: string, startLine: number, startChar: number, endLine: number, endChar: number) {
         if (!name) {return;}
+        if (shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.UnknownTable, disabledDiagnosticCodes)) {return;}
 
         const clean = normalizeName(name);
 
@@ -2017,7 +2017,8 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         seenTables.add(clean);
 
         diagnostics.push({
-          severity: DiagnosticSeverity.Error,
+          code: SARAL_DIAGNOSTIC_CODES.UnknownTable,
+          severity: resolveDiagnosticSeverity(SARAL_DIAGNOSTIC_CODES.UnknownTable, DiagnosticSeverity.Error, diagnosticSeverityOverrides),
           range: {
             start: { line: startLine, character: startChar },
             end: { line: endLine, character: endChar }
@@ -2035,12 +2036,15 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         end: number,
         tableDisplay?: string
       ) {
+        if (shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.UnknownColumn, disabledDiagnosticCodes)) {return;}
+
         const key = `${table}.${column}:${line}:${start}`;
         if (seenColumns.has(key)) {return;}
         seenColumns.add(key);
 
         diagnostics.push({
-          severity: DiagnosticSeverity.Error,
+          code: SARAL_DIAGNOSTIC_CODES.UnknownColumn,
+          severity: resolveDiagnosticSeverity(SARAL_DIAGNOSTIC_CODES.UnknownColumn, DiagnosticSeverity.Error, diagnosticSeverityOverrides),
           range: {
             start: { line, character: start },
             end: { line, character: end }
@@ -2248,16 +2252,22 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
 
       visitScope(parsed.scope.root);
 
-      for (const diag of collectAmbiguousColumnDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL")) {
-        diagnostics.push(diag);
+      for (const diag of collectAmbiguousColumnDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL", diagnosticSeverityOverrides)) {
+        if (!shouldSuppressDiagnosticCode(String((diag as any).code ?? ""), disabledDiagnosticCodes)) {
+          diagnostics.push(diag);
+        }
       }
 
-      for (const diag of collectReadableBareColumnDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL")) {
-        diagnostics.push(diag);
+      for (const diag of collectReadableBareColumnDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL", diagnosticSeverityOverrides)) {
+        if (!shouldSuppressDiagnosticCode(String((diag as any).code ?? ""), disabledDiagnosticCodes)) {
+          diagnostics.push(diag);
+        }
       }
 
-      for (const diag of collectStringComparisonDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL")) {
-        diagnostics.push(diag);
+      for (const diag of collectStringComparisonDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL", diagnosticSeverityOverrides)) {
+        if (!shouldSuppressDiagnosticCode(String((diag as any).code ?? ""), disabledDiagnosticCodes)) {
+          diagnostics.push(diag);
+        }
       }
     } catch (e) {
       safeLog(`[validate] Schema validation failed: ${String(e)}`);
@@ -2330,27 +2340,35 @@ function isSystemTableReference(tableName: string): boolean {
   return systemObjectPrefixes.some(prefix => norm.startsWith(prefix));
 }
 
-function mapSeverity(severity: unknown): DiagnosticSeverity {
+function mapSeverity(severity: unknown, code?: string): DiagnosticSeverity {
   const s = String(severity ?? "").toLowerCase();
+  let mapped: DiagnosticSeverity;
 
   switch (s) {
     case "error":
-      return DiagnosticSeverity.Error;
+      mapped = DiagnosticSeverity.Error;
+      break;
 
     case "warning":
     case "warn":
-      return DiagnosticSeverity.Warning;
+      mapped = DiagnosticSeverity.Warning;
+      break;
 
     case "info":
     case "information":
-      return DiagnosticSeverity.Information;
+      mapped = DiagnosticSeverity.Information;
+      break;
 
     case "hint":
-      return DiagnosticSeverity.Hint;
+      mapped = DiagnosticSeverity.Hint;
+      break;
 
     default:
-      return DiagnosticSeverity.Error;
+      mapped = DiagnosticSeverity.Error;
+      break;
   }
+
+  return resolveDiagnosticSeverity(code, mapped, diagnosticSeverityOverrides);
 }
 
 connection.onDidChangeConfiguration(change => {

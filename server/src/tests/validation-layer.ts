@@ -1,7 +1,8 @@
 import * as assert from "assert";
+import { DiagnosticSeverity } from "vscode-languageserver/node";
 import { parseSql } from "../sql-parser";
 import { getLineStarts } from "../text-utils";
-import { buildReadableBareColumnCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues } from "../diagnostic-helpers";
+import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "../diagnostic-helpers";
 import { indexText, definitions, referencesIndex, columnsByTable, tablesByName, tableTypesByName, aliasesByUri } from "../definitions";
 
 function resetState(): void {
@@ -39,6 +40,91 @@ runCase("parse-gating-error-blocks-validation", () => {
 runCase("parse-gating-no-ast-blocks-validation", () => {
   const parsed = { ast: null };
   assert.strictEqual(hasBlockingParseIssues(parsed, []), true, "Missing AST should block validation");
+});
+
+runCase("disabled-diagnostic-codes-suppress-matching-diagnostics", () => {
+  const disabled = new Set([SARAL_DIAGNOSTIC_CODES.UnknownTable, "DML001", "LOG001"]);
+
+  assert.strictEqual(shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.UnknownTable, disabled), true, "Custom diagnostic codes should be suppressible");
+  assert.strictEqual(shouldSuppressDiagnosticCode("DML001", disabled), true, "Parser diagnostic codes should be suppressible");
+  assert.strictEqual(shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.AmbiguousColumn, disabled), false, "Unlisted diagnostics should remain enabled");
+});
+
+runCase("boolean-diagnostic-settings-map-to-disabled-codes", () => {
+  const disabled = buildDisabledDiagnosticCodes({
+    diagnostics: {
+      unknownTable: false,
+      ambiguousColumn: false,
+      unnamedKeyConstraint: false,
+      unnamedDefaultConstraint: false,
+      updateWithoutWhere: false
+    }
+  });
+
+  assert.strictEqual(shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.UnknownTable, disabled), true, "Checkbox settings should disable unknown table diagnostics");
+  assert.strictEqual(shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.AmbiguousColumn, disabled), true, "Checkbox settings should disable ambiguous column diagnostics");
+  assert.strictEqual(shouldSuppressDiagnosticCode("DDL002", disabled), true, "Checkbox settings should disable unnamed key constraint diagnostics");
+  assert.strictEqual(shouldSuppressDiagnosticCode("DDL003", disabled), true, "Checkbox settings should disable unnamed default constraint diagnostics");
+  assert.strictEqual(shouldSuppressDiagnosticCode("DML001", disabled), true, "Checkbox settings should disable parser warnings too");
+  assert.strictEqual(shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.UnknownColumn, disabled), false, "Unselected checkboxes should leave other diagnostics enabled");
+});
+
+runCase("saralsql-section-settings-map-to-disabled-codes", () => {
+  const disabled = buildDisabledDiagnosticCodes({
+    saralsql: {
+      disabledDiagnostics: ["LOG001"],
+      diagnostics: {
+        unknownColumn: false
+      }
+    }
+  });
+
+  assert.strictEqual(shouldSuppressDiagnosticCode("LOG001", disabled), true, "Advanced disabled codes should be honored");
+  assert.strictEqual(shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.UnknownColumn, disabled), true, "VS Code settings payloads should disable diagnostics");
+});
+
+runCase("severity-settings-override-diagnostic-severities", () => {
+  const severityOverrides = buildDiagnosticSeverityOverrides({
+    diagnostics: {
+      readabilityHintSeverity: "hint",
+      unnamedDefaultConstraintSeverity: "error",
+      updateWithoutWhereSeverity: "error"
+    }
+  });
+
+  assert.strictEqual(
+    resolveDiagnosticSeverity(SARAL_DIAGNOSTIC_CODES.ReadabilityQualifyColumn, DiagnosticSeverity.Information, severityOverrides),
+    DiagnosticSeverity.Hint,
+    "Readability hint severity should be overrideable"
+  );
+
+  assert.strictEqual(
+    resolveDiagnosticSeverity("DML001", DiagnosticSeverity.Warning, severityOverrides),
+    DiagnosticSeverity.Error,
+    "Parser and LSP diagnostic severities should share the same override map"
+  );
+
+  assert.strictEqual(
+    resolveDiagnosticSeverity("DDL003", DiagnosticSeverity.Warning, severityOverrides),
+    DiagnosticSeverity.Error,
+    "DDL diagnostics should share the same override map"
+  );
+});
+
+runCase("saralsql-section-settings-override-diagnostic-severities", () => {
+  const severityOverrides = buildDiagnosticSeverityOverrides({
+    saralsql: {
+      diagnostics: {
+        unknownTableSeverity: "hint"
+      }
+    }
+  });
+
+  assert.strictEqual(
+    resolveDiagnosticSeverity(SARAL_DIAGNOSTIC_CODES.UnknownTable, DiagnosticSeverity.Error, severityOverrides),
+    DiagnosticSeverity.Hint,
+    "VS Code settings payloads should override diagnostic severity"
+  );
 });
 
 runCase("ambiguity-diagnostic-emitted-for-bare-column", () => {
@@ -100,17 +186,23 @@ WHERE EmployeeId > 0;
   indexText(queryUri, querySql);
   const parsed = parseSql(querySql);
   const lineStarts = getLineStarts(querySql);
+  const severityOverrides = buildDiagnosticSeverityOverrides({
+    diagnostics: {
+      readabilityHintSeverity: "hint"
+    }
+  });
   const diagnostics = collectReadableBareColumnDiagnostics(
     parsed,
     lineStarts,
     tablesByName,
     tableTypesByName,
-    "SaralSQL"
+    "SaralSQL",
+    severityOverrides
   );
 
   const diag = diagnostics.find(d => String(d.message).includes("Consider qualifying 'EmployeeId'"));
   assert.ok(diag, "Unique bare column should create an information diagnostic");
-  assert.strictEqual(diag?.severity, 3, "Readability diagnostic should be information severity");
+  assert.strictEqual(diag?.severity, DiagnosticSeverity.Hint, "Readability diagnostic should honor the severity dropdown");
 
   const action = buildReadableBareColumnCodeAction(queryUri, diag!);
   assert.ok(action, "Readability diagnostic should produce a quick fix code action");

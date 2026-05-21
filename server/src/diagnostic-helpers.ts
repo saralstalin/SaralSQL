@@ -3,6 +3,154 @@ import { isSqlKeyword, normalizeName, offsetToPosition } from "./text-utils";
 import { getCteColumns, getDisplaySymbolName, resolveAliasTableName, resolveDerivedAliasColumn } from "./ast-utils";
 import { extractReferences } from "@saralsql/tsql-parser";
 
+export const SARAL_DIAGNOSTIC_CODES = {
+  UnknownTable: "LSP001",
+  UnknownColumn: "LSP002",
+  AmbiguousColumn: "LSP003",
+  ReadabilityQualifyColumn: "LSP004",
+  StringComparison: "LSP005"
+} as const;
+
+type DiagnosticSettingSpec = {
+  enabledPath: string;
+  severityPath: string;
+  code: string;
+  fallbackSeverity: DiagnosticSeverity;
+};
+
+const DIAGNOSTIC_SETTING_SPECS: DiagnosticSettingSpec[] = [
+  { enabledPath: "diagnostics.unknownTable", severityPath: "diagnostics.unknownTableSeverity", code: SARAL_DIAGNOSTIC_CODES.UnknownTable, fallbackSeverity: DiagnosticSeverity.Error },
+  { enabledPath: "diagnostics.unknownColumn", severityPath: "diagnostics.unknownColumnSeverity", code: SARAL_DIAGNOSTIC_CODES.UnknownColumn, fallbackSeverity: DiagnosticSeverity.Error },
+  { enabledPath: "diagnostics.ambiguousColumn", severityPath: "diagnostics.ambiguousColumnSeverity", code: SARAL_DIAGNOSTIC_CODES.AmbiguousColumn, fallbackSeverity: DiagnosticSeverity.Warning },
+  { enabledPath: "diagnostics.readabilityHint", severityPath: "diagnostics.readabilityHintSeverity", code: SARAL_DIAGNOSTIC_CODES.ReadabilityQualifyColumn, fallbackSeverity: DiagnosticSeverity.Information },
+  { enabledPath: "diagnostics.stringComparison", severityPath: "diagnostics.stringComparisonSeverity", code: SARAL_DIAGNOSTIC_CODES.StringComparison, fallbackSeverity: DiagnosticSeverity.Warning },
+  { enabledPath: "diagnostics.unnamedKeyConstraint", severityPath: "diagnostics.unnamedKeyConstraintSeverity", code: "DDL002", fallbackSeverity: DiagnosticSeverity.Warning },
+  { enabledPath: "diagnostics.unnamedDefaultConstraint", severityPath: "diagnostics.unnamedDefaultConstraintSeverity", code: "DDL003", fallbackSeverity: DiagnosticSeverity.Warning },
+  { enabledPath: "diagnostics.undeclaredVariable", severityPath: "diagnostics.undeclaredVariableSeverity", code: "VAR001", fallbackSeverity: DiagnosticSeverity.Error },
+  { enabledPath: "diagnostics.unusedVariable", severityPath: "diagnostics.unusedVariableSeverity", code: "VAR002", fallbackSeverity: DiagnosticSeverity.Warning },
+  { enabledPath: "diagnostics.unusedParameter", severityPath: "diagnostics.unusedParameterSeverity", code: "VAR003", fallbackSeverity: DiagnosticSeverity.Warning },
+  { enabledPath: "diagnostics.variableUsedBeforeSet", severityPath: "diagnostics.variableUsedBeforeSetSeverity", code: "VAR004", fallbackSeverity: DiagnosticSeverity.Warning },
+  { enabledPath: "diagnostics.selfComparison", severityPath: "diagnostics.selfComparisonSeverity", code: "LOG001", fallbackSeverity: DiagnosticSeverity.Warning },
+  { enabledPath: "diagnostics.updateWithoutWhere", severityPath: "diagnostics.updateWithoutWhereSeverity", code: "DML001", fallbackSeverity: DiagnosticSeverity.Warning },
+  { enabledPath: "diagnostics.deleteWithoutWhere", severityPath: "diagnostics.deleteWithoutWhereSeverity", code: "DML002", fallbackSeverity: DiagnosticSeverity.Warning },
+  { enabledPath: "diagnostics.insertWithoutColumnList", severityPath: "diagnostics.insertWithoutColumnListSeverity", code: "DML003", fallbackSeverity: DiagnosticSeverity.Warning },
+  { enabledPath: "diagnostics.updateTargetNoLock", severityPath: "diagnostics.updateTargetNoLockSeverity", code: "DML004", fallbackSeverity: DiagnosticSeverity.Error }
+];
+
+function readBooleanSetting(settings: any, path: string): boolean | undefined {
+  const parts = path.split(".");
+  let current = settings;
+
+  for (const part of parts) {
+    if (!current || typeof current !== "object") {
+      return undefined;
+    }
+    current = current[part];
+  }
+
+  return typeof current === "boolean" ? current : undefined;
+}
+
+export function normalizeSaralSqlSettings(settings: any): any {
+  return settings?.saralsql && typeof settings.saralsql === "object"
+    ? settings.saralsql
+    : settings;
+}
+
+function readStringSetting(settings: any, path: string): string | undefined {
+  const parts = path.split(".");
+  let current = settings;
+
+  for (const part of parts) {
+    if (!current || typeof current !== "object") {
+      return undefined;
+    }
+    current = current[part];
+  }
+
+  return typeof current === "string" ? current : undefined;
+}
+
+function addIfDisabled(disabled: Set<string>, enabled: boolean | undefined, code: string): void {
+  if (enabled === false) {
+    disabled.add(code);
+  }
+}
+
+function parseDiagnosticSeveritySetting(value: string | undefined): DiagnosticSeverity | undefined {
+  switch (String(value ?? "").trim().toLowerCase()) {
+    case "error":
+      return DiagnosticSeverity.Error;
+    case "warning":
+    case "warn":
+      return DiagnosticSeverity.Warning;
+    case "information":
+    case "info":
+      return DiagnosticSeverity.Information;
+    case "hint":
+      return DiagnosticSeverity.Hint;
+    default:
+      return undefined;
+  }
+}
+
+export function buildDisabledDiagnosticCodes(settings: any): Set<string> {
+  settings = normalizeSaralSqlSettings(settings);
+  const disabled = new Set<string>();
+
+  const rawDisabled = settings?.disabledDiagnostics ?? [];
+  const disabledList = Array.isArray(rawDisabled) ? rawDisabled : [rawDisabled];
+  for (const value of disabledList) {
+    const code = String(value ?? "").trim().toUpperCase();
+    if (code) {
+      disabled.add(code);
+    }
+  }
+
+  for (const spec of DIAGNOSTIC_SETTING_SPECS) {
+    addIfDisabled(disabled, readBooleanSetting(settings, spec.enabledPath), spec.code);
+  }
+
+  return disabled;
+}
+
+export function buildDiagnosticSeverityOverrides(settings: any): Map<string, DiagnosticSeverity> {
+  settings = normalizeSaralSqlSettings(settings);
+  const overrides = new Map<string, DiagnosticSeverity>();
+
+  for (const spec of DIAGNOSTIC_SETTING_SPECS) {
+    const severity = parseDiagnosticSeveritySetting(readStringSetting(settings, spec.severityPath));
+    if (severity !== undefined) {
+      overrides.set(spec.code, severity);
+      continue;
+    }
+
+    overrides.set(spec.code, spec.fallbackSeverity);
+  }
+
+  return overrides;
+}
+
+export function shouldSuppressDiagnosticCode(code: string | undefined, disabledCodes: Set<string>): boolean {
+  if (!code || disabledCodes.size === 0) {
+    return false;
+  }
+
+  return disabledCodes.has(String(code).trim().toUpperCase());
+}
+
+export function resolveDiagnosticSeverity(
+  code: string | undefined,
+  fallback: DiagnosticSeverity,
+  severityOverrides: Map<string, DiagnosticSeverity>
+): DiagnosticSeverity {
+  if (!code || severityOverrides.size === 0) {
+    return fallback;
+  }
+
+  return severityOverrides.get(String(code).trim().toUpperCase()) ?? fallback;
+}
+
 export function hasBlockingParseIssues(parsed: any, parserIssues: any[]): boolean {
   if (!parsed?.ast) {
     return true;
@@ -20,7 +168,8 @@ export function collectAmbiguousColumnDiagnostics(
   lineStarts: number[],
   tablesByName: Map<string, any>,
   tableTypesByName: Map<string, any>,
-  source = "SaralSQL"
+  source = "SaralSQL",
+  severityOverrides = new Map<string, DiagnosticSeverity>()
 ): Diagnostic[] {
   if (!parsed?.ast || !parsed?.scope?.root) {
     return [];
@@ -105,7 +254,8 @@ export function collectAmbiguousColumnDiagnostics(
     seen.add(key);
 
     diagnostics.push({
-      severity: DiagnosticSeverity.Warning,
+      code: SARAL_DIAGNOSTIC_CODES.AmbiguousColumn,
+      severity: resolveDiagnosticSeverity(SARAL_DIAGNOSTIC_CODES.AmbiguousColumn, DiagnosticSeverity.Warning, severityOverrides),
       range: {
         start: { line: startPos.line, character: startPos.character },
         end: { line: endPos.line, character: endPos.character }
@@ -123,7 +273,8 @@ export function collectReadableBareColumnDiagnostics(
   lineStarts: number[],
   tablesByName: Map<string, any>,
   tableTypesByName: Map<string, any>,
-  source = "SaralSQL"
+  source = "SaralSQL",
+  severityOverrides = new Map<string, DiagnosticSeverity>()
 ): Diagnostic[] {
   if (!parsed?.ast || !parsed?.scope?.root) {
     return [];
@@ -185,7 +336,8 @@ export function collectReadableBareColumnDiagnostics(
     const match = matches[0];
     const replacement = `${match.displayAlias}.${name}`;
     diagnostics.push({
-      severity: DiagnosticSeverity.Information,
+      code: SARAL_DIAGNOSTIC_CODES.ReadabilityQualifyColumn,
+      severity: resolveDiagnosticSeverity(SARAL_DIAGNOSTIC_CODES.ReadabilityQualifyColumn, DiagnosticSeverity.Information, severityOverrides),
       range: {
         start: { line: startPos.line, character: startPos.character },
         end: { line: endPos.line, character: endPos.character }
@@ -234,7 +386,8 @@ export function collectStringComparisonDiagnostics(
   lineStarts: number[],
   tablesByName: Map<string, any>,
   tableTypesByName: Map<string, any>,
-  source = "SaralSQL"
+  source = "SaralSQL",
+  severityOverrides = new Map<string, DiagnosticSeverity>()
 ): Diagnostic[] {
   if (!parsed?.ast || !parsed?.scope?.root) {
     return [];
@@ -260,7 +413,8 @@ export function collectStringComparisonDiagnostics(
           const startPos = offsetToPosition(typeof node.start === "number" ? node.start : node.left?.start ?? 0, lineStarts);
           const endPos = offsetToPosition(typeof node.end === "number" ? node.end : node.right?.end ?? node.left?.end ?? 0, lineStarts);
           diagnostics.push({
-            severity: DiagnosticSeverity.Warning,
+            code: SARAL_DIAGNOSTIC_CODES.StringComparison,
+            severity: resolveDiagnosticSeverity(SARAL_DIAGNOSTIC_CODES.StringComparison, DiagnosticSeverity.Warning, severityOverrides),
             range: {
               start: { line: startPos.line, character: startPos.character },
               end: { line: endPos.line, character: endPos.character }

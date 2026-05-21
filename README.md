@@ -44,15 +44,26 @@
 
 - **Diagnostics & Error Checking**  
   Real-time parser-backed diagnostics using `@saralsql/tsql-parser`.  
-  SaralSQL can highlight schema issues, unsafe statements, and semantic warnings as you type:
-  - Unknown tables and columns
-  - Conditions that compare a column to itself, such as `e.DepartmentId = e.DepartmentId`
-  - `UPDATE` statements without a `WHERE` clause
-  - Variables or parameters that are declared but never used
-  - Readability hints for bare columns, with a quick fix to qualify them when a unique alias is available
+  SaralSQL can highlight schema issues, unsafe statements, and semantic warnings as you type. In VS Code Settings, each diagnostic has a checkbox to enable or disable it and a severity dropdown to choose `error`, `warning`, `information`, or `hint`:
+  - `Unknown table` (`LSP001`)
+  - `Unknown column` (`LSP002`)
+  - `Ambiguous bare column` (`LSP003`)
+  - `Readability hint` for qualifying a bare column when a unique alias is available (`LSP004`)
+  - `String comparison` warnings for direct `varchar` and `nvarchar` comparisons (`LSP005`)
+  - `Unnamed primary key or unique constraint` (`DDL002`)
+  - `Unnamed default constraint` (`DDL003`)
+  - `Undeclared variable` (`VAR001`)
+  - `Unused variable` (`VAR002`)
+  - `Unused parameter` (`VAR003`)
+  - `Variable used before set` (`VAR004`)
+  - `Self comparison` (`LOG001`)
+  - `UPDATE without WHERE` (`DML001`)
+  - `DELETE without WHERE` (`DML002`)
+  - `INSERT without column list` (`DML003`)
+  - `UPDATE target NOLOCK` (`DML004`)
   - Parser issues, when enabled from settings
 
-  Diagnostics are enabled by default with `saralsql.showDiagnostics`. Parser issues are hidden by default with `saralsql.showParseIssues`; when parser issues are hidden, SaralSQL only shows other diagnostics after the document parses successfully. Schema diagnostics (unknown table/column and ambiguous bare columns) are opt-in via `saralsql.enableSchemaValidation` (default: off).
+  Diagnostics are enabled by default with `saralsql.showDiagnostics`. Parser issues are hidden by default with `saralsql.showParseIssues`; when parser issues are hidden, SaralSQL only shows other diagnostics after the document parses successfully. Schema diagnostics (unknown table/column and ambiguous bare columns) are opt-in via `saralsql.enableSchemaValidation` (default: off). Each diagnostic has an enable setting such as `saralsql.diagnostics.unknownTable` and a severity setting such as `saralsql.diagnostics.unknownTableSeverity`; an advanced `saralsql.disabledDiagnostics` setting remains available if you want to suppress by code.
 
 ![Self-comparison diagnostic](Images/DiagnosticsSelfComparison.png)
 
