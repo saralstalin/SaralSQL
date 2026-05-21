@@ -43,14 +43,6 @@ export function normalizeAstTableName(raw: any): string | null {
     return normalizeName(String(raw.property).replace(/^dbo\./i, "").replace(/^\[|\]$/g, ""));
   }
 
-  // Handle legacy node-sql-parser format (backward compatibility)
-  if (raw.table && typeof raw.table === "string") {
-    return normalizeName(String(raw.table).replace(/^dbo\./i, "").replace(/^\[|\]$/g, ""));
-  }
-  if (raw.name && typeof raw.name === "string" && !raw.type) {
-    return normalizeName(String(raw.name).replace(/^dbo\./i, "").replace(/^\[|\]$/g, ""));
-  }
-
   // Handle nested expr
   if (raw.expr && typeof raw.expr === "object") {
     return normalizeAstTableName(raw.expr);
@@ -89,17 +81,6 @@ export function extractColumnName(colNode: any): string | null {
   // Handle ColumnNode from SELECT columns
   if (colNode.type === "Column" && colNode.expression) {
     return extractColumnName(colNode.expression);
-  }
-
-  // Handle legacy format (direct properties)
-  if (colNode.column && typeof colNode.column === "string") {
-    return normalizeName(colNode.column.replace(/^\[|\]$/g, ""));
-  }
-  if (colNode.name && typeof colNode.name === "string") {
-    return normalizeName(colNode.name.replace(/^\[|\]$/g, ""));
-  }
-  if (colNode.value && typeof colNode.value === "string") {
-    return normalizeName(colNode.value.replace(/^\[|\]$/g, ""));
   }
 
   // Handle nested expr
@@ -196,39 +177,6 @@ export function resolveColumnFromAst(ast: any, columnName: string): string | nul
         });
       }
 
-      // Handle legacy format (old parser compatibility)
-      else if (n.type === "select" || n.ast === "select") {
-        const aliasMap = new Map<string, string>();
-        const fromArr = Array.isArray(n.from) ? n.from : (n.from ? [n.from] : []);
-        for (const f of fromArr) {
-          try {
-            let alias: any = f.as || f.alias || (f.as && f.as.value) || (f.alias && f.alias.value);
-            if (alias && typeof alias === "object") { alias = alias.value || alias.name; }
-            if (typeof alias === "string") { alias = alias.replace(/[\[\]]/g, "").toLowerCase(); }
-
-            const table = normalizeAstTableName(f) || null;
-            if (table) {
-              aliasMap.set((alias || String(table).toLowerCase()), table);
-            }
-          } catch { }
-        }
-
-        walkAst(n, (m) => {
-          if (m && typeof m === "object" && (m.type === "column_ref" || m.ast === "column_ref") && m.column) {
-            const col = normalizeName(String(m.column));
-            if (col === columnName) {
-              if (m.table) {
-                const rawTable = String(m.table).replace(/[\[\]]/g, "").toLowerCase();
-                const mapped = aliasMap.get(rawTable) || normalizeName(rawTable.replace(/^dbo\./i, ""));
-                if (mapped) { found = mapped; }
-              } else if (aliasMap.size === 1) {
-                found = Array.from(aliasMap.values())[0];
-              }
-            }
-          }
-        });
-      }
-
       // Handle UpdateStatement
       else if (n.type === "UpdateStatement") {
         const targetTable = normalizeAstTableName(n.target);
@@ -274,6 +222,7 @@ export function resolveColumnFromAst(ast: any, columnName: string): string | nul
         const targetTable = normalizeAstTableName(n.target);
         if (!targetTable) { return; }
 
+        // Check WHERE
         walkAst(n.where, (m) => {
           if (m && typeof m === "object") {
             const col = extractColumnName(m);
@@ -281,6 +230,7 @@ export function resolveColumnFromAst(ast: any, columnName: string): string | nul
           }
         });
       }
+
     });
 
     if (found) { return found; }
@@ -336,13 +286,6 @@ export function resolveAliasFromAst(alias: string, ast: any): string | null {
         }
       }
 
-      // Handle legacy format
-      if (f.as && normalizeName(f.as) === aliasNorm && f.table) {
-        return normalizeName(f.table);
-      }
-      if (!f.as && f.table && normalizeName(f.table) === aliasNorm) {
-        return normalizeName(f.table);
-      }
     }
     return null;
   }
@@ -356,4 +299,64 @@ export function resolveAliasFromAst(alias: string, ast: any): string | null {
     }
   }
   return null;
+}
+
+export function resolveAliasTableName(sym: any): string | undefined {
+  const metadataName = sym?.metadata?.tableName;
+  if (typeof metadataName === "string" && metadataName.length > 0) {
+    return metadataName;
+  }
+
+  const table = sym?.location?.table;
+  if (typeof table === "string") {
+    return table;
+  }
+
+  if (typeof table?.name === "string") {
+    return table.name;
+  }
+
+  return undefined;
+}
+
+export function getCteColumns(sym: any): Array<{ name: string; rawName: string; start?: number; end?: number }> {
+  const cols = sym?.location?.query?.columns;
+  if (!Array.isArray(cols)) {
+    return [];
+  }
+
+  const out: Array<{ name: string; rawName: string; start?: number; end?: number }> = [];
+  for (const col of cols) {
+    const rawName = String(col?.outputName ?? col?.sourceName ?? col?.expression?.name ?? "").trim();
+    if (!rawName) {
+      continue;
+    }
+
+    out.push({
+      name: normalizeName(rawName),
+      rawName,
+      start: typeof col?.start === "number" ? col.start : undefined,
+      end: typeof col?.end === "number" ? col.end : undefined
+    });
+  }
+
+  return out;
+}
+
+export function resolveSymbolCaseInsensitive(scope: any, name: string): any {
+  if (!scope || !name) {
+    return null;
+  }
+
+  const direct = typeof scope.resolve === "function" ? scope.resolve(name) : null;
+  if (direct) {
+    return direct;
+  }
+
+  const nameNorm = name.toLowerCase();
+  const visibleSymbols = typeof scope.getVisibleSymbols === "function"
+    ? scope.getVisibleSymbols()
+    : Object.values(scope.symbols ?? {});
+
+  return visibleSymbols.find((sym: any) => String(sym.name ?? "").toLowerCase() === nameNorm) ?? null;
 }

@@ -56,6 +56,11 @@
           "default": false,
           "description": "Show parser issues from @saralsql/tsql-parser. When disabled, SaralSQL diagnostics are shown only for documents without parser issues."
         },
+        "saralsql.enableSchemaValidation": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable schema diagnostics such as unknown table/column and ambiguous bare columns."
+        },
         "saralsql.exclude": {
           "type": "array",
           "default": [
@@ -78,6 +83,9 @@
     "compile-tests": "tsc -p . --outDir out",
     "watch-tests": "tsc -p . -w --outDir out",
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "test:regression": "npm run compile-tests && node out/server/src/tests/regression-index.js",
+    "test:validation": "npm run compile-tests && node out/server/src/tests/validation-layer.js",
+    "test:all-local": "npm run test:regression && npm run test:validation",
     "check-types": "tsc --noEmit",
     "lint": "eslint src --ext ts",
     "test": "vscode-test"

@@ -25,7 +25,7 @@ export interface ParseResult {
  */
 export function parseSql(sql: string, opts: any = {}): ParseResult | null {
     try {
-        if (!sql || sql.length > 4 * 1024) {
+        if (!sql) {
             return null;
         }
 

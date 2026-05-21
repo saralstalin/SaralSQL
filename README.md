@@ -51,7 +51,7 @@
   - Variables or parameters that are declared but never used
   - Parser issues, when enabled from settings
 
-  Diagnostics are enabled by default with `saralsql.showDiagnostics`. Parser issues are hidden by default with `saralsql.showParseIssues`; when parser issues are hidden, SaralSQL only shows other diagnostics after the document parses successfully.
+  Diagnostics are enabled by default with `saralsql.showDiagnostics`. Parser issues are hidden by default with `saralsql.showParseIssues`; when parser issues are hidden, SaralSQL only shows other diagnostics after the document parses successfully. Schema diagnostics (unknown table/column and ambiguous bare columns) are opt-in via `saralsql.enableSchemaValidation` (default: off).
 
 ![Self-comparison diagnostic](Images/DiagnosticsSelfComparison.png)
 
@@ -145,3 +145,24 @@ We welcome feedback and bug reports!
 
 ## 📜 License
 MIT License
+
+---
+
+## Regression Requirement
+
+Every functional change must include at least one regression test that fails before the change and passes after.
+
+This rule applies to fixes/features touching:
+- parsing and AST shape
+- scope/reference extraction
+- hover/definition/reference/completion behavior
+- diagnostics behavior
+
+Default required test layer is parser + index unit-style coverage. LSP integration tests are required only when index-level tests cannot reliably prove the behavior.
+
+Each PR must include a short **Regression scenario** note with:
+- input SQL snippet
+- expected behavior
+- test name(s) covering the scenario
+
+If no new test is added, the PR must state why existing tests already cover the change.

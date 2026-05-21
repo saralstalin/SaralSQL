@@ -4,3 +4,5 @@ node_modules
 .vscode-test/
 *.vsix
 .vscode/.s2c-graph-cache.json
+server/src/*.js
+server/src/test_var.*
