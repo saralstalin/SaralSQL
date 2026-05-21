@@ -97,45 +97,6 @@ export function getDisplaySymbolName(sym: any): string {
   return raw || String(sym?.name ?? "");
 }
 
-export function resolveDerivedAliasColumn(sym: any, columnName: string): { start: number; end: number; rawName: string } | null {
-  const tableNode = sym?.location?.table;
-  if (!tableNode || tableNode.type !== "SubqueryExpression") {
-    return null;
-  }
-
-  const queryColumns = tableNode.query?.columns;
-  if (!Array.isArray(queryColumns)) {
-    return null;
-  }
-
-  const target = normalizeName(columnName);
-  if (!target) {
-    return null;
-  }
-
-  for (const col of queryColumns) {
-    const output = normalizeName(String(col?.outputName ?? ""));
-    const source = normalizeName(String(col?.sourceName ?? ""));
-    const exprName = normalizeName(String(col?.expression?.name ?? ""));
-    const names = [output, source, exprName].filter(Boolean) as string[];
-
-    if (!names.includes(target)) {
-      continue;
-    }
-
-    const start = typeof col?.start === "number" ? col.start : undefined;
-    const end = typeof col?.end === "number" ? col.end : undefined;
-    if (typeof start !== "number" || typeof end !== "number") {
-      return null;
-    }
-
-    const rawName = String(col?.outputName ?? col?.sourceName ?? col?.expression?.name ?? columnName).trim();
-    return { start, end, rawName };
-  }
-
-  return null;
-}
-
 /**
  * Try to resolve which table provides `columnName` inside the given AST
  * Returns normalized table name (matching columnsByTable keys) or null

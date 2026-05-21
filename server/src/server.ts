@@ -58,7 +58,7 @@ import {
 } from "./definitions";
 import { parseSql, type ParseResult } from "./sql-parser";
 import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, normalizeSaralSqlSettings, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "./diagnostic-helpers";
-import { getCteColumns, resolveAliasTableName, resolveSymbolCaseInsensitive, normalizeAstTableName, resolveDerivedAliasColumn, resolveAliasFromAst, getDisplaySymbolName } from "./ast-utils";
+import { getCteColumns, resolveAliasTableName, resolveSymbolCaseInsensitive, normalizeAstTableName, resolveAliasFromAst, getDisplaySymbolName } from "./ast-utils";
 import { LruCache } from "./lru-cache";
 
 // ---------- Connection + Documents ----------
@@ -448,19 +448,6 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
             }
           }
 
-          const aliasSym = resolveSymbolCaseInsensitive(scopeAtPos, tableName);
-          if (aliasSym?.kind === "Alias") {
-            const derivedCol = resolveDerivedAliasColumn(aliasSym, colName);
-            if (derivedCol) {
-              return [{
-                uri: doc.uri,
-                range: {
-                  start: doc.positionAt(derivedCol.start),
-                  end: doc.positionAt(derivedCol.end)
-                }
-              }];
-            }
-          }
         }
         return findColumnInTable(tableName, colName);
       }
@@ -561,7 +548,7 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
               });
             }
           } else if (sym.kind === "Alias") {
-            const derivedColumns = getDerivedAliasColumnNames(sym);
+            const derivedColumns = getParserAliasColumnNames(parsed, sym);
             if (derivedColumns.length > 0) {
               for (const colName of derivedColumns) {
                 items.push({
@@ -624,7 +611,7 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
               });
             }
           } else {
-            const derivedColumns = getDerivedAliasColumnNames(completionSym);
+            const derivedColumns = getParserAliasColumnNames(completionParsed, completionSym);
             if (derivedColumns.length > 0) {
               for (const colName of derivedColumns) {
                 items.push({
@@ -876,37 +863,33 @@ function getVariableCompletionItems(scopeAtPos: any): CompletionItem[] {
   return items;
 }
 
-function getDerivedAliasColumnNames(sym: any): string[] {
-  const tableNode = sym?.location?.table;
-  if (!tableNode || tableNode.type !== "SubqueryExpression") {
-    return [];
-  }
-
-  const cols = tableNode.query?.columns;
-  if (!Array.isArray(cols)) {
-    return [];
-  }
-
+function getParserAliasColumnNames(parsed: ParseResult | null | undefined, sym: any): string[] {
   const names = new Map<string, string>();
-  for (const col of cols) {
-    const output = String(col?.outputName ?? "").trim();
-    const outputNorm = normalizeName(output);
-    if (outputNorm) {
-      names.set(outputNorm, output);
+
+  if (Array.isArray(sym?.columns)) {
+    for (const col of sym.columns) {
+      const name = String(typeof col === "string" ? col : (col?.rawName ?? col?.name ?? "")).trim();
+      const norm = normalizeName(name);
+      if (norm) {
+        names.set(norm, name);
+      }
+    }
+  }
+
+  const aliasName = normalizeName(sym?.name ?? "");
+  const sources = Array.isArray((parsed as any)?.lineage?.sources) ? (parsed as any).lineage.sources : [];
+  for (const source of sources) {
+    const sourceName = normalizeName(source?.alias ?? source?.name ?? "");
+    if (!aliasName || sourceName !== aliasName || !Array.isArray(source?.projection)) {
       continue;
     }
 
-    const source = String(col?.sourceName ?? "").trim();
-    const sourceNorm = normalizeName(source);
-    if (sourceNorm) {
-      names.set(sourceNorm, source);
-      continue;
-    }
-
-    const exprName = String(col?.expression?.name ?? "").trim();
-    const exprNameNorm = normalizeName(exprName);
-    if (exprNameNorm) {
-      names.set(exprNameNorm, exprName);
+    for (const projection of source.projection) {
+      const name = String(projection?.name ?? "").trim();
+      const norm = normalizeName(name);
+      if (norm) {
+        names.set(norm, name);
+      }
     }
   }
 
@@ -1828,7 +1811,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
             }
               const aliasSym = resolveSymbolCaseInsensitive(scopeAtPos, tableName);
               if (aliasSym?.kind === "Alias") {
-                const derivedColumns = getDerivedAliasColumnNames(aliasSym);
+                const derivedColumns = getParserAliasColumnNames(parsed, aliasSym);
                 if (derivedColumns.some(c => normalizeName(c) === colName)) {
                   colDef = { name: colName, rawName: colName };
                   containerName = getDisplaySymbolName(aliasSym) ?? tableName;
@@ -1977,7 +1960,6 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
     try {
       const normDocUri = toNormUri(doc.uri);
       const fileAliases = aliasesByUri.get(normDocUri);
-      const derivedAliases = new Set<string>();
       const cteNames = new Set<string>();
       const seenTables = new Set<string>();
       const seenColumns = new Set<string>();
@@ -2084,7 +2066,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         return Boolean(fileAliases?.has(normalizeName(ref.name)));
       }
 
-      function collectDerivedAliases(scope: any): void {
+      function collectCteNames(scope: any): void {
         const symbols = typeof scope?.getOwnSymbols === "function"
           ? scope.getOwnSymbols()
           : Object.values(scope?.symbols ?? {});
@@ -2093,20 +2075,6 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
           if (sym?.kind === "CTE") {
             cteNames.add(normalizeName(sym.name));
           }
-
-          if (sym?.kind !== "Alias") {
-            continue;
-          }
-
-          const tableNode = sym.location?.table;
-          const tableNodeType = String(tableNode?.type ?? "");
-          const isTableLikeNode =
-            tableNodeType === "Identifier" ||
-            tableNodeType === "MemberExpression";
-
-          if (!isTableLikeNode && tableNode) {
-            derivedAliases.add(normalizeName(sym.name));
-          }
         }
 
         const children = typeof scope?.getChildren === "function"
@@ -2114,11 +2082,11 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
           : (scope?.children ?? []);
 
         for (const child of children) {
-          collectDerivedAliases(child);
+          collectCteNames(child);
         }
       }
 
-      collectDerivedAliases(parsed.scope.root);
+      collectCteNames(parsed.scope.root);
 
       for (const ref of getReferencesForUri(normDocUri)) {
         if (ref.validateSchema === false) {
@@ -2127,10 +2095,6 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
 
         if (ref.kind === "table") {
           if (isAliasMutationTarget(ref)) {
-            continue;
-          }
-
-          if (derivedAliases.has(normalizeName(ref.name))) {
             continue;
           }
 
@@ -2169,6 +2133,10 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
             if (!srcTable || !srcCol) {
               continue;
             }
+            if (String(input.sourceKind ?? "table") !== "table") {
+              hasValidatedResolvedInput = true;
+              break;
+            }
             if (tableExists(srcTable) && columnExists(srcTable, srcCol)) {
               hasValidatedResolvedInput = true;
               break;
@@ -2178,17 +2146,11 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
             if (hasValidatedResolvedInput) {
               continue;
             }
-            // Parser resolved column flow but we could not validate any source confidently.
-            // Avoid false positives in complex correlated scopes (APPLY/subqueries/CTE/PIVOT/UNPIVOT).
             continue;
           }
         }
 
         if (!table || table.startsWith("@")) {
-          continue;
-        }
-
-        if (derivedAliases.has(table)) {
           continue;
         }
 

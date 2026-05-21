@@ -8,7 +8,7 @@ import {
 import * as url from "url";
 import { walkAst, resolveAliasTableName, resolveSymbolCaseInsensitive } from "./ast-utils";
 import { parseSql, type ParseResult } from "./sql-parser";
-import { extractReferences, type ASTNode, type BinaryExpression, type Expression, type InsertNode, type Statement, type TableReference, type UpdateNode, type VariableNode } from "@saralsql/tsql-parser";
+import { extractReferences, type ASTNode, type BinaryExpression, type Expression, type ExtractedReferenceContext, type InsertNode, type Statement, type TableReference, type UpdateNode, type VariableNode } from "@saralsql/tsql-parser";
 
 export interface ColumnDef {
     name: string;
@@ -35,7 +35,7 @@ export interface ReferenceDef {
     start: number;
     end: number;
     kind: "table" | "column" | "parameter";
-    context?: string;
+    context?: ExtractedReferenceContext | "create-definition";
     validateSchema?: boolean;
 }
 
@@ -426,7 +426,7 @@ export function indexText(uri: string, text: string): void {
                 end: endChar,
                 kind: "table",
                 context: ref.context,
-                validateSchema: String(ref.context ?? "") !== "execute-target"
+                validateSchema: ref.context !== "execute-target"
             });
         } else if (ref.kind === "variable") {
             localRefs.push({
@@ -452,24 +452,8 @@ export function indexText(uri: string, text: string): void {
             let resolved = false;
 
             if (matchedResolution && matchedResolution.inputs) {
-                const qualifierNorm = parts.length === 2 ? normalizeName(parts[0]) : "";
-                let expectedQualifierSource: string | undefined;
-                if (qualifierNorm) {
-                    for (const sym of visibleSymbols) {
-                        if (sym.kind === "Alias" && normalizeName(sym.name) === qualifierNorm) {
-                            expectedQualifierSource = resolveAliasTableName(sym);
-                            break;
-                        }
-                    }
-                }
-
                 for (const input of matchedResolution.inputs) {
                     if (input.kind === "column" && input.source) {
-                        const inputSourceNorm = normalizeName(String(input.source));
-                        if (expectedQualifierSource && inputSourceNorm !== normalizeName(expectedQualifierSource)) {
-                            continue;
-                        }
-
                         localRefs.push({
                             name: `${normalizeName(input.source)}.${normalizeName(input.name.split('.').pop()!)}`,
                             uri: normUri,
@@ -648,23 +632,17 @@ function indexQualifiedColumnReferencesFromAst(
             return;
         }
 
-        const tableNode = sym.location?.table;
-        const tableNodeType = String(tableNode?.type ?? "");
         const tableName = resolveAliasTableName(sym);
-        const isDerivedAliasColumn = !tableName && hasDerivedAliasColumn(sym, columnName);
-        if (!tableName && !isDerivedAliasColumn) {
+        if (!tableName) {
             return;
         }
 
         const normalizedTableName = tableName ? normalizeName(tableName) : "";
-        const isSchemaValidTableAlias =
-            (tableNodeType === "Identifier" || tableNodeType === "MemberExpression") &&
-            Boolean(normalizedTableName) &&
-            (tablesByName.has(normalizedTableName) || tableTypesByName.has(normalizedTableName));
+        const isSchemaValidTableAlias = Boolean(normalizedTableName) && (tablesByName.has(normalizedTableName) || tableTypesByName.has(normalizedTableName));
 
         const pos = offsetToPosition(node.start, lineStarts);
         localRefs.push({
-            name: tableName ? `${normalizeName(tableName)}.${columnName}` : `${qualifier}.${columnName}`,
+            name: `${normalizeName(tableName)}.${columnName}`,
             uri: normUri,
             line: pos.line,
             start: node.start - lineStarts[pos.line],
@@ -903,38 +881,6 @@ function resolveTableNameFromNode(tableNode: Expression | TableReference | strin
     }
 
     return undefined;
-}
-
-function hasDerivedAliasColumn(sym: { location?: { table?: { type?: string; query?: { columns?: Array<{ outputName?: string; sourceName?: string; expression?: { name?: string } }> } } } } | null, columnName: string): boolean {
-    const tableNode = sym?.location?.table;
-    if (!tableNode || tableNode.type !== "SubqueryExpression") {
-        return false;
-    }
-
-    const queryColumns = tableNode.query?.columns;
-    if (!Array.isArray(queryColumns)) {
-        return false;
-    }
-
-    const target = normalizeName(columnName);
-    for (const col of queryColumns) {
-        const output = normalizeName(String(col?.outputName ?? ""));
-        if (output && output === target) {
-            return true;
-        }
-
-        const source = normalizeName(String(col?.sourceName ?? ""));
-        if (source && source === target) {
-            return true;
-        }
-
-        const exprName = normalizeName(String(col?.expression?.name ?? ""));
-        if (exprName && exprName === target) {
-            return true;
-        }
-    }
-
-    return false;
 }
 
 function findAliasRange(node: { table?: { end?: number }; start?: number; end?: number }, aliasName: string, text: string): { start: number; end: number } | null {

@@ -1,7 +1,7 @@
 import * as assert from "assert";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { parseSql } from "../sql-parser";
-import { getDisplaySymbolName, resolveAliasFromAst, resolveColumnFromAst, resolveDerivedAliasColumn } from "../ast-utils";
+import { getDisplaySymbolName, resolveAliasFromAst, resolveColumnFromAst } from "../ast-utils";
 import { getLineStarts, normalizeName, offsetAt } from "../text-utils";
 import { collectAmbiguousColumnDiagnostics } from "../diagnostic-helpers";
 import {
@@ -117,12 +117,16 @@ FROM (
   const parsed = parseSql(sql);
   const alias = findSymbol(parsed?.scope?.root, "Alias", "a");
   assert.ok(alias, "Derived table alias should exist in parser scope");
+  assert.strictEqual(alias?.metadata?.sourceKind, "derived_subquery", "Parser should classify derived-table aliases explicitly");
 
-  const resolved = resolveDerivedAliasColumn(alias, "SomeName");
-  assert.ok(resolved, "Derived table projected column should resolve to its definition range");
+  const resolution = parsed?.columns?.resolutions?.find((r: any) => r.location?.name === "a.SomeName");
+  assert.ok(
+    resolution?.inputs?.some((input: any) => normalizeName(input.source) === "employee" && normalizeName(String(input.name).split(".").pop() ?? "") === "firstname"),
+    "Parser should resolve derived projected columns back to their source column"
+  );
 
   indexText(uri, sql);
-  assert.ok(getRefs("a.somename").length > 0, "Derived table projected column should be indexed for definition lookup");
+  assert.ok(getRefs("employee.firstname").length > 0, "Derived table projected column should be indexed through parser lineage");
 });
 
 runCase("derived-table-alias-exposes-projected-columns", () => {
@@ -251,7 +255,7 @@ WHERE d.EmployeeId > 0;
 `;
 
   indexText(uri, sql);
-  assert.ok(getRefs("d.employeeid").length > 0, "Derived table alias projected columns should be indexed as alias-qualified columns");
+  assert.ok(getRefs("employee.employeeid").length > 0, "Derived table alias projected columns should be indexed through parser lineage");
 });
 
 runCase("system-table-validation-exemption-preconditions", () => {

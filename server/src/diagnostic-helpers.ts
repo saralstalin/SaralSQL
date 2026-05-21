@@ -1,6 +1,6 @@
 import { CodeAction, CodeActionKind, Diagnostic, DiagnosticSeverity, TextEdit } from "vscode-languageserver/node";
 import { isSqlKeyword, normalizeName, offsetToPosition } from "./text-utils";
-import { getCteColumns, getDisplaySymbolName, resolveAliasTableName, resolveDerivedAliasColumn } from "./ast-utils";
+import { getCteColumns, getDisplaySymbolName, resolveAliasTableName } from "./ast-utils";
 import { extractReferences } from "@saralsql/tsql-parser";
 
 export const SARAL_DIAGNOSTIC_CODES = {
@@ -537,8 +537,7 @@ function resolveReadableAliasColumn(
 
   const tableName = normalizeName(resolveAliasTableName(sym) ?? "");
   if (!tableName) {
-    const derived = resolveDerivedAliasColumn(sym, colNorm);
-    return Boolean(derived);
+    return false;
   }
 
   const stripped = tableName.replace(/^dbo\./, "");
