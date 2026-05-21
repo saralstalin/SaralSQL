@@ -7,8 +7,8 @@ import {
 } from "./text-utils";
 import * as url from "url";
 import { walkAst, resolveAliasTableName, resolveSymbolCaseInsensitive } from "./ast-utils";
-import { parseSql } from "./sql-parser";
-import { extractReferences } from "@saralsql/tsql-parser";
+import { parseSql, type ParseResult } from "./sql-parser";
+import { extractReferences, type ASTNode, type BinaryExpression, type Expression, type InsertNode, type Statement, type TableReference, type UpdateNode, type VariableNode } from "@saralsql/tsql-parser";
 
 export interface ColumnDef {
     name: string;
@@ -334,7 +334,7 @@ export function indexText(uri: string, text: string): void {
     definitions.delete(normUri);
     deleteRefsForFile(normUri);
 
-    const parsed = parseSql(text);
+    const parsed: ParseResult | null = parseSql(text);
     if (!parsed || !parsed.ast) {
         return;
     }
@@ -476,7 +476,8 @@ export function indexText(uri: string, text: string): void {
                             line: refPos.line,
                             start: startChar,
                             end: endChar,
-                            kind: "column"
+                            kind: "column",
+                            validateSchema: tablesByName.has(normalizeName(String(input.source))) || tableTypesByName.has(normalizeName(String(input.source)))
                         });
                         resolved = true;
                     } else if (input.kind === "variable") {
@@ -493,9 +494,9 @@ export function indexText(uri: string, text: string): void {
                 }
             }
 
-            if (!resolved) {
-                // Scope-based fallback resolution
-                if (parts.length === 2) {
+                if (!resolved) {
+                    // Scope-based fallback resolution
+                    if (parts.length === 2) {
                     const aliasOrTable = parts[0].trim();
                     const col = parts[1].trim();
                     const aliasOrTableNorm = normalizeName(aliasOrTable);
@@ -512,11 +513,13 @@ export function indexText(uri: string, text: string): void {
                         }
                     }
 
+                    let resolvedFromFileAlias = false;
                     if (!resolvedTable) {
                         const fileAliases = aliasesByUri.get(normUri);
                         const matchedTable = fileAliases?.get(aliasOrTableNorm);
                         if (matchedTable && matchedTable.toLowerCase() !== "__subquery__") {
                             resolvedTable = matchedTable;
+                            resolvedFromFileAlias = true;
                         }
                     }
 
@@ -527,7 +530,8 @@ export function indexText(uri: string, text: string): void {
                             line: refPos.line,
                             start: startChar,
                             end: endChar,
-                            kind: "column"
+                            kind: "column",
+                            validateSchema: !resolvedFromFileAlias
                         });
                     }
                 } else if (parts.length === 1) {
@@ -611,7 +615,7 @@ export function indexText(uri: string, text: string): void {
 }
 
 function indexQualifiedColumnReferencesFromAst(
-    ast: any,
+    ast: ParseResult["ast"] | null,
     rootScope: any,
     normUri: string,
     lineStarts: number[],
@@ -644,11 +648,19 @@ function indexQualifiedColumnReferencesFromAst(
             return;
         }
 
+        const tableNode = sym.location?.table;
+        const tableNodeType = String(tableNode?.type ?? "");
         const tableName = resolveAliasTableName(sym);
         const isDerivedAliasColumn = !tableName && hasDerivedAliasColumn(sym, columnName);
         if (!tableName && !isDerivedAliasColumn) {
             return;
         }
+
+        const normalizedTableName = tableName ? normalizeName(tableName) : "";
+        const isSchemaValidTableAlias =
+            (tableNodeType === "Identifier" || tableNodeType === "MemberExpression") &&
+            Boolean(normalizedTableName) &&
+            (tablesByName.has(normalizedTableName) || tableTypesByName.has(normalizedTableName));
 
         const pos = offsetToPosition(node.start, lineStarts);
         localRefs.push({
@@ -657,13 +669,14 @@ function indexQualifiedColumnReferencesFromAst(
             line: pos.line,
             start: node.start - lineStarts[pos.line],
             end: (node.end ?? node.start + String(node.name).length) - lineStarts[pos.line],
-            kind: "column"
+            kind: "column",
+            validateSchema: isSchemaValidTableAlias
         });
     });
 }
 
 function indexInsertColumnReferencesFromAst(
-    ast: any,
+    ast: ParseResult["ast"] | null,
     normUri: string,
     lineStarts: number[],
     localRefs: ReferenceDef[]
@@ -698,7 +711,7 @@ function indexInsertColumnReferencesFromAst(
 }
 
 function indexUpdateAssignmentColumnsFromAst(
-    ast: any,
+    ast: ParseResult["ast"] | null,
     rootScope: any,
     normUri: string,
     lineStarts: number[],
@@ -745,15 +758,16 @@ function indexUpdateAssignmentColumnsFromAst(
     });
 }
 
-function resolveUpdateTargetTable(updateNode: any, rootScope: any): string | undefined {
-    const targetParts = Array.isArray(updateNode?.target?.parts) ? updateNode.target.parts : [];
-    const targetName = String(updateNode?.target?.name ?? targetParts.join(".") ?? "").trim();
+function resolveUpdateTargetTable(updateNode: UpdateNode, rootScope: any): string | undefined {
+    const targetExpr = updateNode?.target as any;
+    const targetParts = Array.isArray(targetExpr?.parts) ? targetExpr.parts : [];
+    const targetName = String(targetExpr?.name ?? targetParts.join(".") ?? "").trim();
     if (!targetName) {
         return undefined;
     }
 
     const targetNorm = normalizeName(targetName);
-    const scopeAtPos = rootScope.findInnermost?.(updateNode.target?.start) ?? rootScope;
+    const scopeAtPos = rootScope.findInnermost?.(targetExpr?.start) ?? rootScope;
     const targetSym = resolveSymbolCaseInsensitive(scopeAtPos, targetNorm);
 
     if (targetSym?.kind === "Alias") {
@@ -787,7 +801,7 @@ function resolveUpdateTargetTable(updateNode: any, rootScope: any): string | und
 }
 
 function indexTableVariableColumnReferencesFromAst(
-    ast: any,
+    ast: ParseResult["ast"] | null,
     rootScope: any,
     normUri: string,
     lineStarts: number[],
@@ -835,7 +849,7 @@ function indexTableVariableColumnReferencesFromAst(
 
 
 function indexAliasReferencesFromAst(
-    ast: any,
+    ast: ParseResult["ast"] | null,
     text: string,
     normUri: string,
     lineStarts: number[],
@@ -864,12 +878,13 @@ function indexAliasReferencesFromAst(
             line: pos.line,
             start: aliasRange.start - lineStarts[pos.line],
             end: aliasRange.end - lineStarts[pos.line],
-            kind: "table"
+            kind: "table",
+            validateSchema: false
         });
     });
 }
 
-function resolveTableNameFromNode(tableNode: any): string | undefined {
+function resolveTableNameFromNode(tableNode: Expression | TableReference | string | null | undefined): string | undefined {
     if (!tableNode) {
         return undefined;
     }
@@ -878,18 +893,19 @@ function resolveTableNameFromNode(tableNode: any): string | undefined {
         return tableNode;
     }
 
-    if (typeof tableNode?.name === "string") {
-        return tableNode.name;
+    const node = tableNode as any;
+    if (typeof node?.name === "string") {
+        return node.name;
     }
 
-    if (tableNode.type === "Identifier" && typeof tableNode.name === "string") {
-        return tableNode.name;
+    if (node.type === "Identifier" && typeof node.name === "string") {
+        return node.name;
     }
 
     return undefined;
 }
 
-function hasDerivedAliasColumn(sym: any, columnName: string): boolean {
+function hasDerivedAliasColumn(sym: { location?: { table?: { type?: string; query?: { columns?: Array<{ outputName?: string; sourceName?: string; expression?: { name?: string } }> } } } } | null, columnName: string): boolean {
     const tableNode = sym?.location?.table;
     if (!tableNode || tableNode.type !== "SubqueryExpression") {
         return false;
@@ -921,7 +937,7 @@ function hasDerivedAliasColumn(sym: any, columnName: string): boolean {
     return false;
 }
 
-function findAliasRange(node: any, aliasName: string, text: string): { start: number; end: number } | null {
+function findAliasRange(node: { table?: { end?: number }; start?: number; end?: number }, aliasName: string, text: string): { start: number; end: number } | null {
     const searchStart = typeof node.table?.end === "number" ? node.table.end : node.start ?? 0;
     const searchEnd = typeof node.end === "number" ? node.end : Math.min(text.length, searchStart + 200);
     if (searchEnd <= searchStart) {

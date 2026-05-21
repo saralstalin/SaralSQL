@@ -1,11 +1,13 @@
 import * as assert from "assert";
+import { TextDocument } from "vscode-languageserver-textdocument";
 import { parseSql } from "../sql-parser";
-import { resolveColumnFromAst } from "../ast-utils";
-import { getLineStarts } from "../text-utils";
+import { getDisplaySymbolName, resolveAliasFromAst, resolveColumnFromAst, resolveDerivedAliasColumn } from "../ast-utils";
+import { getLineStarts, normalizeName, offsetAt } from "../text-utils";
 import { collectAmbiguousColumnDiagnostics } from "../diagnostic-helpers";
 import {
   indexText,
   getRefs,
+  getReferencesForUri,
   aliasesByUri,
   definitions,
   referencesIndex,
@@ -95,6 +97,96 @@ WHERE c.DepartmentId > 10;
   const aliasMap = aliasesByUri.get(uri);
   assert.ok(aliasMap?.get("c") === "cteemp", "Alias should resolve to CTE name for downstream validation checks");
   assert.ok(getRefs("cteemp.employeeid").length > 0, "CTE-qualified column should map to CTE");
+});
+
+runCase("derived-table-column-definition-resolution", () => {
+  const uri = "file:///regression/derived-table-column-definition-resolution.sql";
+  const sql = `
+SELECT a.SomeName
+FROM (
+  SELECT d.DepartmentName,
+         d.DepartmentId,
+         e.EmployeeId,
+         e.FirstName SomeName,
+         e.LastName
+  FROM [dbo].[Department] d
+  JOIN [dbo].[Employee] e ON d.DepartmentId = e.DepartmentId
+) a;
+`;
+
+  const parsed = parseSql(sql);
+  const alias = findSymbol(parsed?.scope?.root, "Alias", "a");
+  assert.ok(alias, "Derived table alias should exist in parser scope");
+
+  const resolved = resolveDerivedAliasColumn(alias, "SomeName");
+  assert.ok(resolved, "Derived table projected column should resolve to its definition range");
+
+  indexText(uri, sql);
+  assert.ok(getRefs("a.somename").length > 0, "Derived table projected column should be indexed for definition lookup");
+});
+
+runCase("derived-table-alias-exposes-projected-columns", () => {
+  const sql = `
+SELECT a.SomeName
+FROM (
+  SELECT d.DepartmentName,
+         d.DepartmentId,
+         e.EmployeeId,
+         e.FirstName SomeName,
+         e.LastName,
+         e.Email
+  FROM [dbo].[Department] d
+  JOIN [dbo].[Employee] e ON d.DepartmentId = e.DepartmentId AND d.HeadEmployeeId = e.EmployeeId
+) a;
+`;
+
+  const parsed = parseSql(sql);
+  const alias = findSymbol(parsed?.scope?.root, "Alias", "a");
+  assert.ok(alias, "Derived table alias a should exist in parser scope");
+  const projected = Array.isArray(alias?.location?.table?.query?.columns)
+    ? alias.location.table.query.columns.map((c: any) => c.outputName ?? c.sourceName ?? c.expression?.name).filter(Boolean)
+    : [];
+  assert.ok(projected.includes("SomeName"), "Derived table alias should expose projected column SomeName");
+  assert.ok(!projected.includes("somename"), "Derived table alias should preserve raw column casing");
+  assert.ok(projected.includes("DepartmentId"), "Derived table alias should expose projected column DepartmentId");
+  assert.strictEqual(getDisplaySymbolName({ rawName: "SomeName", name: "somename" }), "SomeName", "Hover display should prefer raw names");
+});
+
+runCase("completion-sanitized-select-list-resolves-join-alias", () => {
+  const sql = `
+SELECT a.SomeName
+    FROM (
+    SELECT d.DepartmentName
+           , d.DepartmentId
+           , e.EmployeeId
+           , e.FirstName SomeName
+           , e.LastName
+           , e.__X__
+    FROM [dbo].[Department] d 
+         JOIN [dbo].[Employee] e  ON d.DepartmentId = e.DepartmentId AND d.HeadEmployeeId = e.EmployeeId
+    WHERE d.DepartmentId = 23378 ) a
+`;
+
+  const parsed = parseSql(sql);
+  assert.ok(parsed?.ast, "Sanitized completion parse should produce an AST");
+  assert.strictEqual(resolveAliasFromAst("e", parsed?.ast), "employee", "Join alias e should resolve to Employee in sanitized completion parses");
+});
+
+runCase("unknown-table-alias-reference-is-not-schema-validated", () => {
+  const uri = "file:///regression/unknown-table-alias.sql";
+  const sql = `
+SELECT *
+FROM UnknownTable ut;
+`;
+
+  indexText(uri, sql);
+  const refs = getReferencesForUri(uri);
+  const tableRef = refs.find(r => r.kind === "table" && r.start === 5);
+  const aliasRef = refs.find(r => r.kind === "table" && r.start === 18);
+  assert.ok(tableRef, "Source table token should be indexed");
+  assert.ok(aliasRef, "Alias token should be indexed");
+  assert.strictEqual(tableRef?.validateSchema, true, "Source table token should be schema-validated");
+  assert.strictEqual(aliasRef?.validateSchema, false, "Alias token should not be schema-validated");
 });
 
 runCase("multi-statement-alias-resolution-isolation", () => {
@@ -252,6 +344,48 @@ WHERE EXISTS (
   assert.strictEqual(resolved, null, "Nested SELECT columns should not leak into outer statement resolution");
 });
 
+runCase("cross-apply-correlated-alias-column-resolution", () => {
+  const schemaUri = "file:///regression/cross-apply-schema.sql";
+  const queryUri = "file:///regression/cross-apply-query.sql";
+  const schemaSql = `
+CREATE TABLE Employee (
+  EmployeeId INT,
+  Skillset NVARCHAR(4000)
+);
+CREATE TABLE Skill (
+  SkillId INT,
+  SkillName NVARCHAR(200)
+);
+CREATE TABLE EmployeeSkillset (
+  EmployeeId INT,
+  SkillId INT
+);
+`;
+  const querySql = `
+INSERT INTO EmployeeSkillset (EmployeeId, SkillId)
+SELECT DISTINCT EmployeeId, s.SkillId
+FROM Employee e
+CROSS APPLY STRING_SPLIT(ISNULL(e.Skillset, ''), ',') ss
+CROSS APPLY (SELECT LTRIM(RTRIM(ss.value)) AS SkillName) trimmed
+JOIN Skill s ON s.SkillName = trimmed.SkillName
+WHERE ISNULL(e.Skillset, '') <> '' AND trimmed.SkillName <> ''
+  AND NOT EXISTS (
+      SELECT 1 FROM EmployeeSkillset es
+      WHERE EmployeeId = EmployeeId AND es.SkillId = s.SkillId
+  );
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  assert.ok(getRefs("employee.skillset").length > 0, "Correlated alias column in CROSS APPLY should resolve to base table column");
+  const aliasMap = aliasesByUri.get(queryUri);
+  assert.strictEqual(aliasMap?.get("ss"), "string_split", "CROSS APPLY alias ss should resolve to the function source");
+  const refs = getReferencesForUri(queryUri);
+  assert.ok(!refs.some(r => r.kind === "table" && normalizeName(r.name) === "ss"), "CROSS APPLY alias ss should not be indexed as a schema-validated table reference");
+  const ssValueRef = refs.find(r => normalizeName(r.name) === "string_split.value");
+  assert.strictEqual(ssValueRef?.validateSchema, false, "Derived APPLY value reference should not be schema-validated");
+});
+
 runCase("local-variable-and-parameter-indexing-and-resolution", () => {
   const uri = "file:///regression/local-variables.sql";
   const sql = `
@@ -286,6 +420,15 @@ END;
   
   const taxRefs = getRefs("@localtax");
   assert.ok(taxRefs.length >= 2, "Variable @LocalTax references should be indexed"); // declaration + usage
+});
+
+runCase("offset-at-honors-crlf-line-endings", () => {
+  const text = "SELECT 1\r\nFROM dbo.Employee\r\nWHERE Name = 'x'\r\n";
+  const doc = TextDocument.create("file:///regression/crlf.sql", "sql", 1, text);
+
+  assert.strictEqual(offsetAt(doc, { line: 0, character: 7 }), doc.offsetAt({ line: 0, character: 7 }), "Line 0 offsets should match");
+  assert.strictEqual(offsetAt(doc, { line: 1, character: 0 }), doc.offsetAt({ line: 1, character: 0 }), "CRLF line start should match TextDocument");
+  assert.strictEqual(offsetAt(doc, { line: 2, character: 6 }), doc.offsetAt({ line: 2, character: 6 }), "CRLF later line offsets should match TextDocument");
 });
 
 process.stdout.write("All regression index tests passed.\n");

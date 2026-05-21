@@ -11,6 +11,9 @@ import {
   CompletionItem,
   CompletionItemKind,
   CompletionParams,
+  CodeAction,
+  CodeActionKind,
+  CodeActionParams,
   Diagnostic,
   DiagnosticSeverity,
   Hover,
@@ -53,9 +56,9 @@ import {
   , getRefs
   , tableTypesByName
 } from "./definitions";
-import { parseSql } from "./sql-parser";
-import { collectAmbiguousColumnDiagnostics, hasBlockingParseIssues } from "./diagnostic-helpers";
-import { getCteColumns, resolveAliasTableName, resolveSymbolCaseInsensitive } from "./ast-utils";
+import { parseSql, type ParseResult } from "./sql-parser";
+import { buildReadableBareColumnCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues } from "./diagnostic-helpers";
+import { getCteColumns, resolveAliasTableName, resolveSymbolCaseInsensitive, normalizeAstTableName, resolveDerivedAliasColumn, resolveAliasFromAst, getDisplaySymbolName } from "./ast-utils";
 import { LruCache } from "./lru-cache";
 
 // ---------- Connection + Documents ----------
@@ -67,7 +70,7 @@ let enableValidation = true;
 let showParseIssues = false;
 let enableSchemaValidation = false;
 const DEBUG = process.env.SARALSQL_DEBUG === "1";
-const dbg = (...args: any[]) => { if (DEBUG) { console.debug('[HOVER]', ...args); } };
+const dbg = (...args: any[]) => { if (DEBUG) { console.debug("[SaralSQL]", ...args); } };
 
 // Call this after building the definitions index
 async function markIndexReady() {
@@ -173,7 +176,7 @@ function safeError(msg: string, err?: unknown): void {
   connection.console.error(`[SaralSQL] ${msg}: ${err instanceof Error ? err.stack || err.message : String(err)}`);
 }
 
-function getParsedDocument(doc: TextDocument): any {
+function getParsedDocument(doc: TextDocument): ParseResult | null {
   const text = doc.getText();
   const version = typeof doc.version === "number" ? doc.version : -1;
   const cacheKey = `${doc.uri}::${version}`;
@@ -244,7 +247,10 @@ connection.onInitialize((_params: InitializeParams): InitializeResult => {
       hoverProvider: true,
       documentSymbolProvider: true,
       workspaceSymbolProvider: true,
-      renameProvider: true
+      renameProvider: true,
+      codeActionProvider: {
+        codeActionKinds: [CodeActionKind.QuickFix]
+      }
     }
   };
 });
@@ -334,6 +340,9 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
     const offset = doc.offsetAt(params.position);
 
     const match = findReferenceAtPosition(normUri, params.position.line, params.position.character);
+    if (isAmbiguousBareColumnAtPosition(doc, params.position, parsed)) {
+      return null;
+    }
 
     if (!match) {
       // Fallback: look up word under cursor globally in definitions
@@ -404,6 +413,27 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
       if (parts.length === 2) {
         const tableName = parts[0];
         const colName = parts[1];
+        const matchedResolution = parsed?.columns?.resolutions?.find((r: any) => {
+          const s = Number(r?.location?.start);
+          const e = Number(r?.location?.end);
+          return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
+        });
+        if (matchedResolution?.inputs) {
+          for (const input of matchedResolution.inputs) {
+            if (input?.kind !== "column" || !input?.source || !input?.name) {
+              continue;
+            }
+            const srcTable = normalizeName(String(input.source));
+            const srcCol = normalizeName(String(input.name).split(".").pop() ?? "");
+            if (!srcTable || !srcCol) {
+              continue;
+            }
+            const locs = findColumnInTable(srcTable, srcCol);
+            if (locs.length > 0) {
+              return locs;
+            }
+          }
+        }
         if (parsed?.scope?.root) {
           const scopeAtPos = parsed.scope.root.findInnermost(offset);
           const cteSym = resolveSymbolCaseInsensitive(scopeAtPos, tableName);
@@ -415,6 +445,20 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
                 range: {
                   start: doc.positionAt(cteCol.start),
                   end: doc.positionAt(cteCol.end)
+                }
+              }];
+            }
+          }
+
+          const aliasSym = resolveSymbolCaseInsensitive(scopeAtPos, tableName);
+          if (aliasSym?.kind === "Alias") {
+            const derivedCol = resolveDerivedAliasColumn(aliasSym, colName);
+            if (derivedCol) {
+              return [{
+                uri: doc.uri,
+                range: {
+                  start: doc.positionAt(derivedCol.start),
+                  end: doc.positionAt(derivedCol.end)
                 }
               }];
             }
@@ -454,9 +498,8 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
     const parsed = getParsedDocument(doc);
     const scopeAtPos = parsed?.scope?.root?.findInnermost(offset);
     const variableItems = getVariableCompletionItems(scopeAtPos);
-    const fullText = doc.getText();
     const updateSetTarget = getUpdateSetTargetTable(parsed, offset);
-    const insertColumnTarget = getInsertColumnTargetTable(parsed, fullText, offset);
+    const insertColumnTarget = getInsertColumnTargetTable(parsed, offset);
 
     if (updateSetTarget && !endsWithDotToken(linePrefix)) {
       const targetNorm = normalizeName(updateSetTarget);
@@ -497,7 +540,7 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
       const aliasNorm = normalizeName(aliasRaw);
 
       if (scopeAtPos) {
-        const sym = scopeAtPos.resolve(aliasNorm);
+        const sym = resolveSymbolCaseInsensitive(scopeAtPos, aliasNorm);
         if (sym) {
           let targetTable = aliasNorm;
           if (sym.kind === "Alias") {
@@ -518,6 +561,18 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
                 detail: col.type ? `Column in ${resolved.rawName} (${col.type})` : `Column in ${resolved.rawName}`,
                 insertText: col.rawName
               });
+            }
+          } else if (sym.kind === "Alias") {
+            const derivedColumns = getDerivedAliasColumnNames(sym);
+            if (derivedColumns.length > 0) {
+              for (const colName of derivedColumns) {
+                items.push({
+                  label: colName,
+                  kind: CompletionItemKind.Field,
+                  detail: `Column in derived table ${sym.name}`,
+                  insertText: colName
+                });
+              }
             }
           } else if (sym.kind === "Alias") {
             const aliasTarget = normalizeName(resolveAliasTableName(sym) ?? "");
@@ -541,6 +596,63 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
                 detail: `Column in ${sym.name}`,
                 insertText: name
               });
+            }
+          }
+        }
+      }
+      if (items.length === 0) {
+        const completionParsedCtx = getCompletionParsedDocument(doc, offset);
+        const completionParsed = completionParsedCtx?.parsed ?? parsed;
+        const completionOffset = completionParsedCtx?.offset ?? offset;
+        const completionScopeAtPos = completionParsed?.scope?.root?.findInnermost?.(completionOffset) ?? completionParsed?.scope?.root;
+        const completionSym = completionScopeAtPos ? resolveSymbolCaseInsensitive(completionScopeAtPos, aliasNorm) : null;
+        if (completionSym?.kind === "Alias") {
+          let targetTable = normalizeName(completionSym.metadata?.tableName as string || (completionSym.location as any).table?.name || (completionSym.location as any).table || aliasNorm);
+          if (!targetTable) {
+            targetTable = normalizeName(resolveAliasTableName(completionSym) ?? "");
+          }
+          let resolved = tablesByName.get(targetTable) || tableTypesByName.get(targetTable);
+          if (!resolved && completionSym.dataType) {
+            const typeKey = normalizeName(completionSym.dataType);
+            resolved = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
+          }
+          if (resolved?.columns) {
+            for (const col of resolved.columns) {
+              items.push({
+                label: col.rawName,
+                kind: CompletionItemKind.Field,
+                detail: col.type ? `Column in ${resolved.rawName} (${col.type})` : `Column in ${resolved.rawName}`,
+                insertText: col.rawName
+              });
+            }
+          } else {
+            const derivedColumns = getDerivedAliasColumnNames(completionSym);
+            if (derivedColumns.length > 0) {
+              for (const colName of derivedColumns) {
+                items.push({
+                  label: colName,
+                  kind: CompletionItemKind.Field,
+                  detail: `Column in derived table ${completionSym.name}`,
+                  insertText: colName
+                });
+              }
+            }
+          }
+        }
+
+        if (items.length === 0) {
+          const tableFromAst = resolveAliasTableFromStatementAst(completionParsed, completionOffset, aliasNorm);
+          if (tableFromAst) {
+            const def = tablesByName.get(tableFromAst) || tableTypesByName.get(tableFromAst);
+            if (def?.columns) {
+              for (const col of def.columns) {
+                items.push({
+                  label: col.rawName,
+                  kind: CompletionItemKind.Field,
+                  detail: col.type ? `Column in ${def.rawName} (${col.type})` : `Column in ${def.rawName}`,
+                  insertText: col.rawName
+                });
+              }
             }
           }
         }
@@ -651,6 +763,67 @@ connection.onCompletion((params: CompletionParams): CompletionItem[] => {
       return items;
     }
 
+    // Fallback: suggest visible columns from current scope before generic table/keyword list.
+    if (scopeAtPos) {
+      const visibleTables = new Set<string>();
+      const visibleCtes = new Map<string, Array<{ rawName: string }>>();
+      const visibleSymbols = scopeAtPos.getVisibleSymbols?.() ?? [];
+      for (const sym of visibleSymbols) {
+        if (sym.kind === "Table" || sym.kind === "TempTable" || sym.kind === "CTE") {
+          const name = normalizeName(String(sym.name ?? ""));
+          if (name) { visibleTables.add(name); }
+          if (sym.kind === "CTE") {
+            visibleCtes.set(name, getCteColumns(sym).map(c => ({ rawName: c.rawName })));
+          }
+        } else if (sym.kind === "Alias") {
+          const tblName = resolveAliasTableName(sym);
+          if (tblName) {
+            const tblNorm = normalizeName(tblName);
+            visibleTables.add(tblNorm);
+            const cteSym = resolveSymbolCaseInsensitive(scopeAtPos, tblNorm);
+            if (cteSym?.kind === "CTE") {
+              visibleCtes.set(tblNorm, getCteColumns(cteSym).map(c => ({ rawName: c.rawName })));
+            }
+          }
+        }
+      }
+
+      for (const t of getStatementTableCandidatesFromAst(parsed, offset)) {
+        visibleTables.add(t);
+      }
+
+      for (const tbl of visibleTables) {
+        const def = tablesByName.get(tbl) || tableTypesByName.get(tbl);
+        if (def?.columns) {
+          for (const col of def.columns) {
+            items.push({
+              label: col.rawName,
+              kind: CompletionItemKind.Field,
+              detail: col.type ? `Column in ${def.rawName} (${col.type})` : `Column in ${def.rawName}`,
+              insertText: col.rawName
+            });
+          }
+        } else {
+          const cteCols = visibleCtes.get(tbl);
+          if (cteCols) {
+            for (const col of cteCols) {
+              items.push({
+                label: col.rawName,
+                kind: CompletionItemKind.Field,
+                detail: `Column in CTE ${tbl}`,
+                insertText: col.rawName
+              });
+            }
+          }
+        }
+      }
+
+      if (items.length > 0) {
+        items.push(...variableItems);
+        return items;
+      }
+    }
+
     // Fallback: tables + keywords
     items.push(...variableItems);
 
@@ -716,30 +889,33 @@ function getDerivedAliasColumnNames(sym: any): string[] {
     return [];
   }
 
-  const names = new Set<string>();
+  const names = new Map<string, string>();
   for (const col of cols) {
-    const output = normalizeName(String(col?.outputName ?? ""));
-    if (output) {
-      names.add(output);
+    const output = String(col?.outputName ?? "").trim();
+    const outputNorm = normalizeName(output);
+    if (outputNorm) {
+      names.set(outputNorm, output);
       continue;
     }
 
-    const source = normalizeName(String(col?.sourceName ?? ""));
-    if (source) {
-      names.add(source);
+    const source = String(col?.sourceName ?? "").trim();
+    const sourceNorm = normalizeName(source);
+    if (sourceNorm) {
+      names.set(sourceNorm, source);
       continue;
     }
 
-    const exprName = normalizeName(String(col?.expression?.name ?? ""));
-    if (exprName) {
-      names.add(exprName);
+    const exprName = String(col?.expression?.name ?? "").trim();
+    const exprNameNorm = normalizeName(exprName);
+    if (exprNameNorm) {
+      names.set(exprNameNorm, exprName);
     }
   }
 
-  return Array.from(names);
+  return Array.from(names.values());
 }
 
-function getUpdateSetTargetTable(parsed: any, offset: number): string | undefined {
+function getUpdateSetTargetTable(parsed: ParseResult | null, offset: number): string | undefined {
   const ast = parsed?.ast;
   if (!ast) {
     return undefined;
@@ -799,7 +975,7 @@ function getUpdateSetTargetTable(parsed: any, offset: number): string | undefine
   return targetName;
 }
 
-function getInsertColumnTargetTable(parsed: any, text: string, offset: number): string | undefined {
+function getInsertColumnTargetTable(parsed: any, offset: number): string | undefined {
   const ast = parsed?.ast;
   if (!ast) {
     return undefined;
@@ -811,24 +987,12 @@ function getInsertColumnTargetTable(parsed: any, text: string, offset: number): 
       return;
     }
 
-    if (node.type === "InsertStatement" && node.table && typeof node.table.end === "number") {
-      const tableEnd = node.table.end;
-      const closeBound = typeof node.selectQuery?.start === "number"
-        ? node.selectQuery.start
-        : (typeof node.values?.start === "number" ? node.values.start : (node.end ?? text.length));
-
-      const segment = text.slice(tableEnd, closeBound);
-      const openRel = segment.indexOf("(");
-      if (openRel >= 0) {
-        const closeRel = segment.indexOf(")", openRel + 1);
-        if (closeRel >= 0) {
-          const openAbs = tableEnd + openRel;
-          const closeAbs = tableEnd + closeRel;
-          if (offset >= openAbs + 1 && offset <= closeAbs) {
-            match = node;
-            return;
-          }
-        }
+    if (node.type === "InsertStatement" && Array.isArray(node.columnNodes) && node.columnNodes.length > 0) {
+      const first = node.columnNodes[0];
+      const last = node.columnNodes[node.columnNodes.length - 1];
+      if (typeof first?.start === "number" && typeof last?.end === "number" && offset >= first.start && offset <= last.end) {
+        match = node;
+        return;
       }
     }
 
@@ -1008,12 +1172,10 @@ function isInSelectProjectionContext(parsed: any, offset: number, linePrefix: st
 }
 
 function getContainingStatementNode(ast: any, offset: number): any | null {
-  if (!ast || !Array.isArray(ast.body)) {
-    return null;
-  }
-
+  if (!ast) { return null; }
+  const statements = Array.isArray(ast?.body) ? ast.body : (Array.isArray(ast) ? ast : [ast]);
   let best: any | null = null;
-  for (const stmt of ast.body) {
+  for (const stmt of statements) {
     if (typeof stmt?.start !== "number" || typeof stmt?.end !== "number") {
       continue;
     }
@@ -1028,6 +1190,28 @@ function getContainingStatementNode(ast: any, offset: number): any | null {
   }
 
   return best;
+}
+
+function resolveAliasTableFromStatementAst(parsed: ParseResult | null, offset: number, aliasNorm: string): string | null {
+  const stmt = getContainingStatementNode(parsed?.ast, offset);
+  if (!stmt) {
+    return null;
+  }
+  return resolveAliasFromAst(aliasNorm, stmt);
+}
+
+function getCompletionParsedDocument(doc: TextDocument, offset: number): { parsed: ParseResult; offset: number } | null {
+  const text = doc.getText();
+  const patchedText = `${text.slice(0, offset)}__X__${text.slice(offset)}`;
+  const parsed = parseSql(patchedText);
+  if (!parsed?.ast) {
+    return null;
+  }
+
+  return {
+    parsed,
+    offset: offset + 5
+  };
 }
 
 function collectTablesFromAstNode(node: any): string[] {
@@ -1051,6 +1235,17 @@ function collectTablesFromAstNode(node: any): string[] {
         add(table.name);
       } else if (typeof table === "string") {
         add(table);
+      }
+
+      if (Array.isArray(current.joins)) {
+        for (const join of current.joins) {
+          const joinTable = join?.table;
+          if (typeof joinTable?.name === "string") {
+            add(joinTable.name);
+          } else if (typeof joinTable === "string") {
+            add(joinTable);
+          }
+        }
       }
     }
 
@@ -1108,7 +1303,7 @@ function findStatementLocalColumnOwner(
   statementText: string,
   columnName: string,
   scopeAtPos?: any,
-  parsed?: any,
+  parsed?: ParseResult | null,
   offset?: number
 ): { kindLabel: string; ownerName: string; column: any } | null {
   const colNorm = normalizeName(columnName);
@@ -1175,11 +1370,71 @@ function findStatementLocalColumnOwner(
   return null;
 }
 
+function isAmbiguousBareColumnAtPosition(doc: TextDocument, position: Position, parsed: ParseResult | null): boolean {
+  const range = getWordRangeAtPosition(doc, position);
+  if (!range) { return false; }
+
+  const rawWord = doc.getText(range).trim();
+  if (!rawWord || rawWord.includes(".") || rawWord.startsWith("@")) {
+    return false;
+  }
+
+  const colNorm = normalizeName(rawWord);
+  if (!colNorm || isSqlKeyword(colNorm)) {
+    return false;
+  }
+
+  const offset = doc.offsetAt(position);
+  const scopeAtPos = parsed?.scope?.root?.findInnermost?.(offset) ?? parsed?.scope?.root;
+  if (!scopeAtPos) {
+    return false;
+  }
+
+  const owners = new Set<string>();
+  const visibleSymbols = typeof scopeAtPos.getVisibleSymbols === "function"
+    ? (scopeAtPos.getVisibleSymbols() as any[])
+    : typeof scopeAtPos.getOwnSymbols === "function"
+      ? (scopeAtPos.getOwnSymbols() as any[])
+      : [];
+
+  for (const sym of visibleSymbols) {
+    if (sym.kind === "CTE") {
+      const cteCols = getCteColumns(sym);
+      if (cteCols.some(c => normalizeName(c.name) === colNorm)) {
+        owners.add(`cte:${normalizeName(String(sym.name ?? ""))}`);
+      }
+      if (owners.size > 1) { return true; }
+      continue;
+    }
+
+    let tableName = "";
+    if (sym.kind === "Alias") {
+      tableName = normalizeName(resolveAliasTableName(sym) ?? "");
+    } else if (sym.kind === "Table" || sym.kind === "TempTable") {
+      tableName = normalizeName(String(sym.name ?? ""));
+    }
+    if (!tableName) { continue; }
+
+    const stripped = tableName.replace(/^dbo\./, "");
+    const def = tablesByName.get(tableName) || tablesByName.get(stripped) || tableTypesByName.get(tableName) || tableTypesByName.get(stripped);
+    if (def?.columns?.some((c: any) => normalizeName(c.name) === colNorm)) {
+      owners.add(`tbl:${normalizeName(def.rawName ?? def.name ?? tableName)}`);
+    }
+    if (owners.size > 1) { return true; }
+  }
+
+  return owners.size > 1;
+}
+
 // --- References ---
 connection.onReferences((params: ReferenceParams): Location[] => {
   try {
     const doc = documents.get(params.textDocument.uri);
     if (!doc) { return []; }
+    const parsed = getParsedDocument(doc);
+    if (isAmbiguousBareColumnAtPosition(doc, params.position, parsed)) {
+      return [];
+    }
 
     const range = getWordRangeAtPosition(doc, params.position);
     if (!range) { return []; }
@@ -1188,6 +1443,23 @@ connection.onReferences((params: ReferenceParams): Location[] => {
     return findReferencesForWord(rawWord, doc, params.position);
   } catch (err) {
     safeError("[references] handler error", err);
+    return [];
+  }
+});
+
+// --- Code Actions ---
+connection.onCodeAction((params: CodeActionParams): CodeAction[] => {
+  try {
+    const actions: CodeAction[] = [];
+    for (const diagnostic of params.context.diagnostics ?? []) {
+      const action = buildReadableBareColumnCodeAction(params.textDocument.uri, diagnostic);
+      if (action) {
+        actions.push(action);
+      }
+    }
+    return actions;
+  } catch (err) {
+    safeError("[codeAction] handler error", err);
     return [];
   }
 });
@@ -1473,7 +1745,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
           const cteCols = getCteColumns(cteSym);
           if (cteCols.length > 0) {
             const rows = cteCols.map(c => `- \`${c.rawName}\``);
-            const body = `**CTE** \`${cteSym.name}\`\n\n${rows.join("\n")}`;
+            const body = `**CTE** \`${getDisplaySymbolName(cteSym)}\`\n\n${rows.join("\n")}`;
             return { contents: { kind: MarkupKind.Markdown, value: body }, range };
           }
         }
@@ -1489,7 +1761,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
           if (aliasTableDef?.columns) {
             const rows = aliasTableDef.columns.map(c => `- \`${c.rawName}\`${c.type ? ` ${c.type}` : ""}`);
             const kindLabel = tablesByName.has(aliasTableNorm) ? "Table" : "Table Type";
-            const body = `**Alias** \`${aliasSym.name}\`\n\nResolves to **${kindLabel}** \`${aliasTableDef.rawName}\`\n\n${rows.join("\n")}`;
+            const body = `**Alias** \`${getDisplaySymbolName(aliasSym)}\`\n\nResolves to **${kindLabel}** \`${aliasTableDef.rawName}\`\n\n${rows.join("\n")}`;
             return { contents: { kind: MarkupKind.Markdown, value: body }, range };
           }
         }
@@ -1556,15 +1828,15 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
                 isCte = true;
               }
             }
-            const aliasSym = resolveSymbolCaseInsensitive(scopeAtPos, tableName);
-            if (aliasSym?.kind === "Alias") {
-              const derivedColumns = getDerivedAliasColumnNames(aliasSym);
-              if (derivedColumns.includes(colName)) {
-                colDef = { name: colName, rawName: colName };
-                containerName = aliasSym.name ?? tableName;
+              const aliasSym = resolveSymbolCaseInsensitive(scopeAtPos, tableName);
+              if (aliasSym?.kind === "Alias") {
+                const derivedColumns = getDerivedAliasColumnNames(aliasSym);
+                if (derivedColumns.some(c => normalizeName(c) === colName)) {
+                  colDef = { name: colName, rawName: colName };
+                  containerName = getDisplaySymbolName(aliasSym) ?? tableName;
+                }
               }
             }
-          }
         }
 
         if (colDef) {
@@ -1822,7 +2094,13 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
             continue;
           }
 
-          if (sym.location?.table?.type === "SubqueryExpression") {
+          const tableNode = sym.location?.table;
+          const tableNodeType = String(tableNode?.type ?? "");
+          const isTableLikeNode =
+            tableNodeType === "Identifier" ||
+            tableNodeType === "MemberExpression";
+
+          if (!isTableLikeNode && tableNode) {
             derivedAliases.add(normalizeName(sym.name));
           }
         }
@@ -1848,6 +2126,10 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
             continue;
           }
 
+          if (derivedAliases.has(normalizeName(ref.name))) {
+            continue;
+          }
+
           if (cteNames.has(normalizeName(ref.name))) {
             continue;
           }
@@ -1867,6 +2149,36 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
 
         const table = normalizeName(ref.name.slice(0, lastDot));
         const column = normalizeName(ref.name.slice(lastDot + 1));
+        const refOffset = (lineStarts[ref.line] ?? 0) + ref.start;
+
+        const matchedResolution = parsed?.columns?.resolutions?.find((r: any) => r.location?.start === refOffset);
+        if (matchedResolution?.inputs) {
+          let hasResolvedColumnInput = false;
+          let hasValidatedResolvedInput = false;
+          for (const input of matchedResolution.inputs) {
+            if (input?.kind !== "column" || !input?.source || !input?.name) {
+              continue;
+            }
+            hasResolvedColumnInput = true;
+            const srcTable = normalizeName(String(input.source));
+            const srcCol = normalizeName(String(input.name).split(".").pop() ?? "");
+            if (!srcTable || !srcCol) {
+              continue;
+            }
+            if (tableExists(srcTable) && columnExists(srcTable, srcCol)) {
+              hasValidatedResolvedInput = true;
+              break;
+            }
+          }
+          if (hasResolvedColumnInput) {
+            if (hasValidatedResolvedInput) {
+              continue;
+            }
+            // Parser resolved column flow but we could not validate any source confidently.
+            // Avoid false positives in complex correlated scopes (APPLY/subqueries/CTE/PIVOT/UNPIVOT).
+            continue;
+          }
+        }
 
         if (!table || table.startsWith("@")) {
           continue;
@@ -1898,6 +2210,14 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         for (const sym of Object.values(scope.symbols ?? {}) as any[]) {
           if (sym.kind === "Alias" && sym.location?.table) {
             const t = sym.location.table;
+            const tableNodeType = String(t.type ?? "");
+            const isTableLikeNode =
+              tableNodeType === "Identifier" ||
+              tableNodeType === "MemberExpression";
+
+            if (!isTableLikeNode) {
+              continue;
+            }
 
             if (
               typeof t.start === "number" &&
@@ -1929,6 +2249,14 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
       visitScope(parsed.scope.root);
 
       for (const diag of collectAmbiguousColumnDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL")) {
+        diagnostics.push(diag);
+      }
+
+      for (const diag of collectReadableBareColumnDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL")) {
+        diagnostics.push(diag);
+      }
+
+      for (const diag of collectStringComparisonDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL")) {
         diagnostics.push(diag);
       }
     } catch (e) {

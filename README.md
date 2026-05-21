@@ -10,7 +10,7 @@
 
 - **Offline-friendly** – works entirely from your source code, no live DB needed  
 - **Privacy-friendly** – **no tracking; all code and actions stay in your workspace**  
-- **Lightweight & fast** – hybrid regex + advanced T-SQL parser engine keeps typing latency low  
+- **Lightweight & fast** – advanced T-SQL parser engine keeps typing latency low  
 - **Code-centric** – ideal for projects that version-control schema scripts  
 - **Zero-config** – open a folder of `.sql` files and start coding with real-time diagnostics  
 - **Scales to large projects** – indexes **2000+ SQL files in under 1 minute**
@@ -49,6 +49,7 @@
   - Conditions that compare a column to itself, such as `e.DepartmentId = e.DepartmentId`
   - `UPDATE` statements without a `WHERE` clause
   - Variables or parameters that are declared but never used
+  - Readability hints for bare columns, with a quick fix to qualify them when a unique alias is available
   - Parser issues, when enabled from settings
 
   Diagnostics are enabled by default with `saralsql.showDiagnostics`. Parser issues are hidden by default with `saralsql.showParseIssues`; when parser issues are hidden, SaralSQL only shows other diagnostics after the document parses successfully. Schema diagnostics (unknown table/column and ambiguous bare columns) are opt-in via `saralsql.enableSchemaValidation` (default: off).
@@ -63,9 +64,9 @@
   - Automatically indexes all `.sql` files in the workspace when workspace is opened in VS code
   - Updates instantly as you type or save
 
-- **Hybrid Regex + Parser Engine**  
-  - Regex-based indexer ensures fast responses  
+- **Parser-First Engine**  
   - Advanced T-SQL parser (`@saralsql/tsql-parser`) provides accurate semantic analysis, diagnostics, and complex query handling
+  - Workspace indexing stays fast while semantic features use parser-backed scope and lineage data
 
 ---
 
@@ -92,8 +93,8 @@ This is an **Early-Access Preview**:
 - Optimized for **T-SQL / SQL Server** DDL & DML with advanced `@saralsql/tsql-parser`  
 - Dialects like Postgres or MySQL may partially work but are not officially supported.  
 - Real-time diagnostics now available for syntax and semantic validation, if you enable it from settings
-- Column and reference detection uses both regex indexing and full parser analysis  
-- Certain constructs (e.g. `TOP(@Variable)`, `MERGE`, `OUTPUT INTO`) are still being improved
+- Column and reference detection uses parser-backed indexing and analysis
+- Some editor behaviors around more complex statements are still being polished, even though the parser already understands constructs like `TOP(@Variable)`, `MERGE`, and `OUTPUT INTO`
 
 We’re releasing early to gather real-world feedback before expanding the feature set.
 
@@ -103,7 +104,7 @@ We’re releasing early to gather real-world feedback before expanding the featu
 
 - **Outline View** for procedures, tables, and columns  
 - **Workspace Symbol Search** (`Ctrl+T`) across SQL objects  
-- **Better handling** of parameterised constructs like `TOP(@var)` and `OUTPUT INTO`  
+- **Sharper editor behavior** around complex statement shapes and derived scopes  
 - **Schema-aware resolution** for databases with duplicate table names across schemas  
 - **Incremental indexing** for even faster performance on very large workspaces  
 - **Enhanced dialect support** for Postgres, MySQL, and other SQL variants
@@ -116,14 +117,14 @@ This extension is intentionally lightweight and does **not** do full SQL semanti
 Be aware of these trade-offs:
 
 - **Column References**  
-  Column references are matched globally by name in regex fallback mode.  
-  If multiple tables share a column name (e.g. `Id`), all may appear in references.  
-  Teams using explicit names like `EmployeeId`, `DepartmentId` are less affected.
+  Column references are resolved from parser-backed scope and workspace index data.  
+  When a column name is shared by multiple visible tables, the extension may warn that it is ambiguous rather than guessing.  
+  Teams using explicit names like `EmployeeId` and `DepartmentId` are less affected.
 
 - **Bare Columns**  
   Bare columns (`SELECT EmployeeId`) resolve to their table using advanced T-SQL parsing.  
-  In complex cases, they may fall back to regex mode and be treated as global.  
-  Aliased usage (`e.EmployeeId`) is always most reliable.
+  When the column is uniquely owned by a visible alias, SaralSQL can suggest qualifying it for readability and offer a quick fix.  
+  Aliased usage (`e.EmployeeId`) is still the most explicit form.
 
 - **Schemas**  
   `dbo.TableName` and `TableName` are treated the same.  

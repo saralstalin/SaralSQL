@@ -1,5 +1,6 @@
 // AST utilities for @saralsql/tsql-parser
 import { normalizeName } from "./text-utils";
+import type { ASTNode, Program, Statement } from "@saralsql/tsql-parser";
 
 /**
  * Walk through AST nodes recursively
@@ -91,149 +92,170 @@ export function extractColumnName(colNode: any): string | null {
   return null;
 }
 
+export function getDisplaySymbolName(sym: any): string {
+  const raw = String(sym?.rawName ?? sym?.metadata?.rawName ?? sym?.name ?? "").trim();
+  return raw || String(sym?.name ?? "");
+}
+
+export function resolveDerivedAliasColumn(sym: any, columnName: string): { start: number; end: number; rawName: string } | null {
+  const tableNode = sym?.location?.table;
+  if (!tableNode || tableNode.type !== "SubqueryExpression") {
+    return null;
+  }
+
+  const queryColumns = tableNode.query?.columns;
+  if (!Array.isArray(queryColumns)) {
+    return null;
+  }
+
+  const target = normalizeName(columnName);
+  if (!target) {
+    return null;
+  }
+
+  for (const col of queryColumns) {
+    const output = normalizeName(String(col?.outputName ?? ""));
+    const source = normalizeName(String(col?.sourceName ?? ""));
+    const exprName = normalizeName(String(col?.expression?.name ?? ""));
+    const names = [output, source, exprName].filter(Boolean) as string[];
+
+    if (!names.includes(target)) {
+      continue;
+    }
+
+    const start = typeof col?.start === "number" ? col.start : undefined;
+    const end = typeof col?.end === "number" ? col.end : undefined;
+    if (typeof start !== "number" || typeof end !== "number") {
+      return null;
+    }
+
+    const rawName = String(col?.outputName ?? col?.sourceName ?? col?.expression?.name ?? columnName).trim();
+    return { start, end, rawName };
+  }
+
+  return null;
+}
+
 /**
  * Try to resolve which table provides `columnName` inside the given AST
  * Returns normalized table name (matching columnsByTable keys) or null
  */
 export function resolveColumnFromAst(ast: any, columnName: string): string | null {
   if (!ast) { return null; }
-  const nodes = Array.isArray(ast) ? ast : [ast];
-  columnName = normalizeName(columnName);
+  const roots = Array.isArray(ast) ? ast : [ast];
+  const colNorm = normalizeName(columnName);
 
-  for (const root of nodes) {
-    let found: string | null = null;
+  const isStatementNode = (n: any): boolean => {
+    const t = String(n?.type ?? "");
+    return t.endsWith("Statement") || t === "WithStatement";
+  };
 
-    walkAst(root, (n) => {
-      if (found || !n || typeof n !== "object") { return; }
+  const walkExpressionOnly = (node: any, fn: (n: any) => void): void => {
+    if (!node || typeof node !== "object") { return; }
+    fn(node);
+    for (const key in node) {
+      const child = node[key];
+      if (Array.isArray(child)) {
+        for (const c of child) {
+          if (c && typeof c === "object" && !isStatementNode(c)) {
+            walkExpressionOnly(c, fn);
+          }
+        }
+      } else if (child && typeof child === "object" && !isStatementNode(child)) {
+        walkExpressionOnly(child, fn);
+      }
+    }
+  };
 
-      // Handle SelectNode (new parser)
-      if (n.type === "SelectStatement" && n.columns) {
-        const aliasMap = new Map<string, string>(); // aliasLower -> tableNorm
-
-        // Build alias map from TableReferences
-        if (n.from && Array.isArray(n.from)) {
-          for (const tableRef of n.from) {
-            if (tableRef.table) {
-              const tableName = normalizeAstTableName(tableRef.table);
-              const alias = tableRef.alias || null;
-
-              if (tableName) {
-                if (alias) {
-                  aliasMap.set(normalizeName(alias), tableName);
-                } else {
-                  aliasMap.set(tableName.toLowerCase(), tableName);
-                }
-              }
-
-              // Handle joins
-              if (tableRef.joins && Array.isArray(tableRef.joins)) {
-                for (const join of tableRef.joins) {
-                  const joinTable = normalizeAstTableName(join.table);
-                  const joinAlias = join.alias || null;
-                  if (joinTable) {
-                    if (joinAlias) {
-                      aliasMap.set(normalizeName(joinAlias), joinTable);
-                    } else {
-                      aliasMap.set(joinTable.toLowerCase(), joinTable);
-                    }
-                  }
-                }
-              }
+  const resolveSelectStatement = (n: any): string | null => {
+    const aliasMap = new Map<string, string>();
+    if (Array.isArray(n?.from)) {
+      for (const tableRef of n.from) {
+        const tableName = normalizeAstTableName(tableRef?.table);
+        const alias = tableRef?.alias || null;
+        if (tableName) {
+          aliasMap.set(alias ? normalizeName(alias) : tableName, tableName);
+        }
+        if (Array.isArray(tableRef?.joins)) {
+          for (const join of tableRef.joins) {
+            const joinTable = normalizeAstTableName(join?.table);
+            const joinAlias = join?.alias || null;
+            if (joinTable) {
+              aliasMap.set(joinAlias ? normalizeName(joinAlias) : joinTable, joinTable);
             }
           }
         }
-
-        // Find column in SELECT columns or WHERE
-        if (n.columns && Array.isArray(n.columns)) {
-          for (const col of n.columns) {
-            const colName = extractColumnName(col);
-            if (colName === columnName) {
-              // Try to determine the source table
-              if (col.expression && col.expression.type === "MemberExpression") {
-                const tableRef = col.expression.object;
-                if (tableRef && tableRef.type === "Identifier") {
-                  const mapped = aliasMap.get(normalizeName(tableRef.name));
-                  if (mapped) { found = mapped; }
-                }
-              } else if (aliasMap.size === 1) {
-                // Single table in FROM, use it
-                found = Array.from(aliasMap.values())[0];
-              }
-            }
-          }
-        }
-
-        // Check WHERE clause
-        walkAst(n.where, (m) => {
-          if (m && typeof m === "object") {
-            if (m.type === "MemberExpression" && m.property) {
-              const col = extractColumnName(m);
-              if (col === columnName && m.object && m.object.type === "Identifier") {
-                const mapped = aliasMap.get(normalizeName(m.object.name));
-                if (mapped) { found = mapped; }
-              }
-            }
-          }
-        });
       }
+    }
 
-      // Handle UpdateStatement
-      else if (n.type === "UpdateStatement") {
-        const targetTable = normalizeAstTableName(n.target);
-        if (!targetTable) { return; }
-
-        // Check assignments
-        if (n.assignments && Array.isArray(n.assignments)) {
-          for (const assignment of n.assignments) {
-            const aCol = extractColumnName(assignment?.column ?? assignment);
-            if (aCol && aCol === columnName) {
-              found = targetTable;
-            }
-          }
+    if (Array.isArray(n?.columns)) {
+      for (const col of n.columns) {
+        if (extractColumnName(col) !== colNorm) { continue; }
+        if (col?.expression?.type === "MemberExpression" && col.expression.object?.type === "Identifier") {
+          const mapped = aliasMap.get(normalizeName(col.expression.object.name));
+          if (mapped) { return mapped; }
         }
-
-        // Check WHERE
-        walkAst(n.where, (m) => {
-          if (m && typeof m === "object") {
-            const col = extractColumnName(m);
-            if (col === columnName) { found = targetTable; }
-          }
-        });
-      }
-
-      // Handle InsertStatement
-      else if (n.type === "InsertStatement") {
-        const targetTable = normalizeAstTableName(n.table);
-        if (!targetTable) { return; }
-
-        const cols = (n.columns || []).map((c: any) => extractColumnName(c)).filter(Boolean) as string[];
-        if (cols.includes(columnName)) {
-          found = targetTable;
-        }
-
-        if (n.selectQuery) {
-          const subFound = resolveColumnFromAst(n.selectQuery, columnName);
-          if (subFound) { found = subFound; }
+        if (aliasMap.size === 1) {
+          return Array.from(aliasMap.values())[0];
         }
       }
+    }
 
-      // Handle DeleteStatement
-      else if (n.type === "DeleteStatement") {
-        const targetTable = normalizeAstTableName(n.target);
-        if (!targetTable) { return; }
-
-        // Check WHERE
-        walkAst(n.where, (m) => {
-          if (m && typeof m === "object") {
-            const col = extractColumnName(m);
-            if (col === columnName) { found = targetTable; }
-          }
-        });
+    let whereFound: string | null = null;
+    walkExpressionOnly(n?.where, (m) => {
+      if (whereFound || m?.type !== "MemberExpression" || !m?.property) { return; }
+      if (extractColumnName(m) !== colNorm) { return; }
+      if (m.object?.type === "Identifier") {
+        const mapped = aliasMap.get(normalizeName(m.object.name));
+        if (mapped) { whereFound = mapped; }
       }
-
     });
+    return whereFound;
+  };
 
-    if (found) { return found; }
+  const resolveSingleStatement = (n: any): string | null => {
+    if (!n || typeof n !== "object") { return null; }
+    if (n.type === "SelectStatement" && n.columns) {
+      return resolveSelectStatement(n);
+    }
+    if (n.type === "UpdateStatement") {
+      const targetTable = normalizeAstTableName(n.target);
+      if (!targetTable) { return null; }
+      for (const assignment of n.assignments ?? []) {
+        const aCol = extractColumnName(assignment?.column ?? assignment);
+        if (aCol === colNorm) { return targetTable; }
+      }
+      let seen = false;
+      walkExpressionOnly(n.where, (m) => {
+        if (!seen && extractColumnName(m) === colNorm) { seen = true; }
+      });
+      return seen ? targetTable : null;
+    }
+    if (n.type === "InsertStatement") {
+      const targetTable = normalizeAstTableName(n.table);
+      if (!targetTable) { return null; }
+      const cols = (n.columns || []).map((c: any) => extractColumnName(c)).filter(Boolean) as string[];
+      if (cols.includes(colNorm)) { return targetTable; }
+      if (n.selectQuery && n.selectQuery.type === "SelectStatement") {
+        return resolveSelectStatement(n.selectQuery);
+      }
+      return null;
+    }
+    if (n.type === "DeleteStatement") {
+      const targetTable = normalizeAstTableName(n.target);
+      if (!targetTable) { return null; }
+      let seen = false;
+      walkExpressionOnly(n.where, (m) => {
+        if (!seen && extractColumnName(m) === colNorm) { seen = true; }
+      });
+      return seen ? targetTable : null;
+    }
+    return null;
+  };
+
+  for (const root of roots) {
+    const resolved = resolveSingleStatement(root);
+    if (resolved) { return resolved; }
   }
   return null;
 }
@@ -269,35 +291,74 @@ export function extractQualifiedName(expr: any): { table?: string | null; column
 
 
 /**
- * Resolve alias from AST (backward compatibility)
+ * Resolve alias from AST (scoped to the provided statement/program subtree)
  */
-export function resolveAliasFromAst(alias: string, ast: any): string | null {
-  const aliasNorm = normalizeName(alias);
+export function resolveAliasFromAst(alias: string, ast: Program | Statement | null): string | null {
+  if (!alias || !ast) {
+    return null;
+  }
 
-  function searchFrom(fromArr: any[]): string | null {
-    for (const f of fromArr) {
-      // Handle new TableReference format
-      if (f.type === "TableReference") {
-        if (f.alias && normalizeName(f.alias) === aliasNorm && f.table) {
-          return normalizeAstTableName(f.table);
-        }
-        if (!f.alias && f.table && normalizeAstTableName(f.table) === aliasNorm) {
-          return normalizeAstTableName(f.table);
+  const aliasNorm = normalizeName(alias);
+  const roots: Statement[] = isProgramNode(ast) ? [...(ast.body ?? [])] : [ast];
+
+  for (const root of roots) {
+    const resolved = resolveAliasInNode(aliasNorm, root);
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  return null;
+}
+
+function isProgramNode(node: Program | Statement): node is Program {
+  return String((node as any)?.type ?? "") === "Program" && Array.isArray((node as any)?.body);
+}
+
+function resolveAliasInNode(aliasNorm: string, node: ASTNode | Statement | null): string | null {
+  if (!node || typeof node !== "object") {
+    return null;
+  }
+
+  const current = node as any;
+
+  if (current.type === "TableReference") {
+    if (current.alias && normalizeName(String(current.alias)) === aliasNorm && current.table) {
+      return normalizeAstTableName(current.table);
+    }
+
+    if (Array.isArray(current.joins)) {
+      for (const join of current.joins) {
+        if (join?.alias && normalizeName(String(join.alias)) === aliasNorm && join.table) {
+          return normalizeAstTableName(join.table);
         }
       }
+    }
 
+    if (!current.alias && current.table && normalizeAstTableName(current.table) === aliasNorm) {
+      return normalizeAstTableName(current.table);
+    }
+  }
+
+  if (Array.isArray(current)) {
+    for (const item of current) {
+      const resolved = resolveAliasInNode(aliasNorm, item);
+      if (resolved) {
+        return resolved;
+      }
     }
     return null;
   }
 
-  const roots = Array.isArray(ast) ? ast : [ast];
-  for (const root of roots) {
-    if (root.from) {
-      const fromArr = Array.isArray(root.from) ? root.from : [root.from];
-      const res = searchFrom(fromArr);
-      if (res) { return res; }
+  for (const value of Object.values(current)) {
+    if (value && typeof value === "object") {
+      const resolved = resolveAliasInNode(aliasNorm, value as ASTNode);
+      if (resolved) {
+        return resolved;
+      }
     }
   }
+
   return null;
 }
 

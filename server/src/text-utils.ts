@@ -152,9 +152,15 @@ export function isSqlKeyword(token: string): boolean {
 }
 
 export function offsetAt(doc: TextDocument, pos: Position) {
+    if (typeof doc.offsetAt === "function") {
+        return doc.offsetAt(pos);
+    }
+
     const text = doc.getText();
     const lines = text.split(/\r?\n/);
     let off = 0;
-    for (let i = 0; i < pos.line; i++) { off += lines[i].length + 1; }
+    for (let i = 0; i < pos.line; i++) {
+        off += lines[i].length + 1;
+    }
     return off + pos.character;
 }
