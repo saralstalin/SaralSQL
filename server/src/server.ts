@@ -55,6 +55,7 @@ import {
   , findTableOrColumn
   , getRefs
   , tableTypesByName
+  , tempTablesByUri
 } from "./definitions";
 import { parseSql, type ParseResult } from "./sql-parser";
 import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, normalizeSaralSqlSettings, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "./diagnostic-helpers";
@@ -404,6 +405,7 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
           }];
         }
       }
+
     }
 
     if (match.kind === "column") {
@@ -1960,10 +1962,12 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
     try {
       const normDocUri = toNormUri(doc.uri);
       const fileAliases = aliasesByUri.get(normDocUri);
+      const refsForDoc = getReferencesForUri(normDocUri);
       const cteNames = new Set<string>();
       const seenTables = new Set<string>();
       const seenColumns = new Set<string>();
       const diagnosticTextCache = new Map<string, string>();
+      const tableRefsByName = new Map<string, ReferenceDef[]>();
 
       function makeOffsetRange(start: number, end: number): Range {
         const startPos = offsetToPosition(start, lineStarts);
@@ -1990,6 +1994,9 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         if (shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.UnknownTable, disabledDiagnosticCodes)) {return;}
 
         const clean = normalizeName(name);
+        const refOffset = (lineStarts[startLine] ?? 0) + startChar;
+        if (resolveCteSymbolAtOffset(clean, refOffset)) {return;}
+        if (cteNames.has(clean)) {return;}
 
         if (clean.startsWith("#") || clean.startsWith("@")) {return;}
         if (isSystemTableReference(clean)) {return;}
@@ -2066,6 +2073,50 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         return Boolean(fileAliases?.has(normalizeName(ref.name)));
       }
 
+      function resolveTempTableSymbolAtOffset(tableName: string, offset: number): any | null {
+        if (!tableName.startsWith("#")) {
+          return null;
+        }
+
+        if (parsed?.scope?.root) {
+          const scopeAtPos = parsed.scope.root.findInnermost?.(offset) ?? parsed.scope.root;
+          const sym = resolveSymbolCaseInsensitive(scopeAtPos, tableName);
+          if (sym && (sym.kind === "TempTable" || (sym.kind === "Table" && String(sym.name ?? "").startsWith("#")))) {
+            return sym;
+          }
+        }
+
+        const fallback = tempTablesByUri.get(normDocUri)?.get(normalizeName(tableName));
+        if (fallback && offset >= fallback.declaredAt) {
+          return {
+            kind: "TempTable",
+            name: normalizeName(tableName),
+            columns: Array.from(fallback.columns.values()).map((c) => ({ name: c, rawName: c }))
+          };
+        }
+
+        return null;
+      }
+
+      function resolveCteSymbolAtOffset(tableName: string, offset: number): any | null {
+        if (!parsed?.scope?.root) {
+          return null;
+        }
+
+        const scopeAtPos = parsed.scope.root.findInnermost?.(offset) ?? parsed.scope.root;
+        const sym = resolveSymbolCaseInsensitive(scopeAtPos, tableName);
+        return sym?.kind === "CTE" ? sym : null;
+      }
+
+      function tempTableSymbolHasColumn(sym: any, columnName: string): boolean {
+        if (!sym || !Array.isArray(sym.columns)) {
+          return false;
+        }
+
+        const target = normalizeName(columnName);
+        return sym.columns.some((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === target);
+      }
+
       function collectCteNames(scope: any): void {
         const symbols = typeof scope?.getOwnSymbols === "function"
           ? scope.getOwnSymbols()
@@ -2087,18 +2138,37 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
       }
 
       collectCteNames(parsed.scope.root);
+      for (const ref of refsForDoc) {
+        if (ref.kind === "table") {
+          const key = normalizeName(ref.name);
+          const bucket = tableRefsByName.get(key) ?? [];
+          bucket.push(ref);
+          tableRefsByName.set(key, bucket);
+        }
+      }
 
-      for (const ref of getReferencesForUri(normDocUri)) {
+      for (const ref of refsForDoc) {
         if (ref.validateSchema === false) {
           continue;
         }
 
         if (ref.kind === "table") {
+          if (ref.context === "create-definition") {
+            continue;
+          }
           if (isAliasMutationTarget(ref)) {
             continue;
           }
 
           if (cteNames.has(normalizeName(ref.name))) {
+            continue;
+          }
+
+          const refOffset = (lineStarts[ref.line] ?? 0) + ref.start;
+          if (resolveCteSymbolAtOffset(ref.name, refOffset)) {
+            continue;
+          }
+          if (resolveTempTableSymbolAtOffset(ref.name, refOffset)) {
             continue;
           }
 
@@ -2118,6 +2188,13 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         const table = normalizeName(ref.name.slice(0, lastDot));
         const column = normalizeName(ref.name.slice(lastDot + 1));
         const refOffset = (lineStarts[ref.line] ?? 0) + ref.start;
+        const tempTableSym = resolveTempTableSymbolAtOffset(table, refOffset);
+        if (tempTableSym) {
+          if (!tempTableSymbolHasColumn(tempTableSym, column)) {
+            addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplayTableName(table));
+          }
+          continue;
+        }
 
         const matchedResolution = parsed?.columns?.resolutions?.find((r: any) => r.location?.start === refOffset);
         if (matchedResolution?.inputs) {
@@ -2163,7 +2240,14 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         }
 
         if (!tableExists(table)) {
-          addUnknownTable(table, ref.line, ref.start, ref.end);
+          const tableRef = (tableRefsByName.get(table) ?? [])
+            .find((r) => r.context === "insert-target" && r.validateSchema !== false)
+            ?? (tableRefsByName.get(table) ?? []).find((r) => r.validateSchema !== false);
+          if (tableRef) {
+            addUnknownTable(tableRef.name, tableRef.line, tableRef.start, tableRef.end);
+          } else {
+            addUnknownTable(table, ref.line, ref.start, ref.end);
+          }
           continue;
         }
 

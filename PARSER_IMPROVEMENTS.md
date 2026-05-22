@@ -5,7 +5,7 @@ Each item should describe parser behavior goals, not temporary LSP logic.
 
 ## Current Status
 
-Parser package in this workspace: `@saralsql/tsql-parser@0.2.8`.
+Parser package in this workspace: `@saralsql/tsql-parser@0.2.9`.
 
 The previously tracked 7 improvement areas are now covered by parser output and consumed by the extension:
 
@@ -22,6 +22,8 @@ The previously tracked 7 improvement areas are now covered by parser output and 
 - `GO` batch boundaries are now represented in AST as `BatchSeparatorStatement`.
 - Scope builder creates statement-isolated `batch` child scopes when `GO` is present.
 - Cross-batch variable leakage false positives (such as duplicate declaration across `GO`) are no longer produced.
+- `CREATE VIEW ... AS WITH ...` bodies are visited/scoped correctly.
+- CTE symbols inside `CREATE VIEW` bodies are available in semantic scope for diagnostics/hover/definition/references.
 
 ## Workaround Policy
 

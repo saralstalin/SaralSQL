@@ -46,6 +46,7 @@ export const referencesIndex = new Map<string, Map<string, ReferenceDef[]>>();
 const referencesByUri = new Map<string, Map<number, ReferenceDef[]>>();
 export const tablesByName = new Map<string, SymbolDef>();
 export const tableTypesByName = new Map<string, SymbolDef>();
+export const tempTablesByUri = new Map<string, Map<string, { columns: Set<string>; declaredAt: number }>>();
 
 const MAX_FILE_SIZE_BYTES = 250 * 1024;  // 250 KB (skip larger files)
 const DEPLOY_BLOCK_SUBSTRING = "deploy"; // block any path that contains this substring
@@ -332,6 +333,7 @@ export function indexText(uri: string, text: string): void {
         tableTypesByName.delete(d.name);
     }
     definitions.delete(normUri);
+    tempTablesByUri.delete(normUri);
     deleteRefsForFile(normUri);
 
     const parsed: ParseResult | null = parseSql(text);
@@ -383,7 +385,9 @@ export function indexText(uri: string, text: string): void {
         const columns = getParserColumns(node, text, lineStarts);
         if (columns.length > 0) {
             sym.columns = columns;
-            columnsByTable.set(norm, new Set(columns.map(col => normalizeName(col.name))));
+            if (!norm.startsWith("#")) {
+                columnsByTable.set(norm, new Set(columns.map(col => normalizeName(col.name))));
+            }
 
             for (const col of columns) {
                 localRefs.push({
@@ -403,6 +407,7 @@ export function indexText(uri: string, text: string): void {
     indexVariablesFromScope(parsed.scope?.root, normUri, lineStarts, localRefs);
     indexVariableReferencesFromAst(parsed.ast, normUri, lineStarts, localRefs);
     indexAliasReferencesFromAst(parsed.ast, text, normUri, lineStarts, localRefs);
+    indexSelectIntoTempTablesFromAst(parsed.ast, normUri);
     indexInsertColumnReferencesFromAst(parsed.ast, normUri, lineStarts, localRefs);
     indexUpdateAssignmentColumnsFromAst(parsed.ast, parsed.scope?.root, normUri, lineStarts, localRefs);
     indexTableVariableColumnReferencesFromAst(parsed.ast, parsed.scope?.root, normUri, lineStarts, localRefs);
@@ -508,14 +513,15 @@ export function indexText(uri: string, text: string): void {
                     }
 
                     if (resolvedTable) {
+                        const resolvedTableNorm = normalizeName(resolvedTable);
                         localRefs.push({
-                            name: `${normalizeName(resolvedTable)}.${colNorm}`,
+                            name: `${resolvedTableNorm}.${colNorm}`,
                             uri: normUri,
                             line: refPos.line,
                             start: startChar,
                             end: endChar,
                             kind: "column",
-                            validateSchema: !resolvedFromFileAlias
+                            validateSchema: !resolvedFromFileAlias && !resolvedTableNorm.startsWith("#")
                         });
                     }
                 } else if (parts.length === 1) {
@@ -590,12 +596,72 @@ export function indexText(uri: string, text: string): void {
     for (const def of defs) {
         if (!def.columns || !Array.isArray(def.columns) || def.columns.length === 0) { continue; }
         const kindNorm = (def.kind || "").toUpperCase();
-        if (kindNorm === "TABLE" || kindNorm === "VIEW") {
+        if ((kindNorm === "TABLE" || kindNorm === "VIEW") && !def.name.startsWith("#")) {
             tablesByName.set(def.name, def);
         } else if (kindNorm === "TYPE") {
             tableTypesByName.set(def.name, def);
         }
     }
+}
+
+function indexSelectIntoTempTablesFromAst(
+    ast: ParseResult["ast"] | null,
+    normUri: string
+): void {
+    const tempTables = new Map<string, { columns: Set<string>; declaredAt: number }>();
+
+    walkAst(ast, (node: any) => {
+        if (!node || node.type !== "SelectStatement" || !node.into || !Array.isArray(node.columns)) {
+            return;
+        }
+
+        const intoName = normalizeName(String(node.into?.name ?? ""));
+        if (!intoName.startsWith("#")) {
+            return;
+        }
+
+        const columns = new Set<string>();
+        for (const col of node.columns) {
+            const projected = extractSelectProjectedColumnName(col);
+            if (!projected) {
+                continue;
+            }
+            columns.add(projected);
+        }
+
+        if (columns.size === 0) {
+            return;
+        }
+
+        const declaredAt = typeof node.into?.start === "number" ? node.into.start : 0;
+        tempTables.set(intoName, { columns, declaredAt });
+    });
+
+    if (tempTables.size > 0) {
+        tempTablesByUri.set(normUri, tempTables);
+    }
+}
+
+function extractSelectProjectedColumnName(col: any): string | null {
+    const alias = normalizeName(String(col?.alias ?? col?.name ?? ""));
+    if (alias) {
+        return alias;
+    }
+
+    const expr = col?.expression;
+    if (!expr) {
+        return null;
+    }
+
+    if (expr.type === "Identifier") {
+        const raw = Array.isArray(expr.parts) && expr.parts.length > 0
+            ? String(expr.parts[expr.parts.length - 1] ?? "")
+            : String(expr.name ?? "");
+        const norm = normalizeName(raw);
+        return norm || null;
+    }
+
+    return null;
 }
 
 function indexQualifiedColumnReferencesFromAst(

@@ -13,7 +13,8 @@ import {
   referencesIndex,
   columnsByTable,
   tablesByName,
-  tableTypesByName
+  tableTypesByName,
+  tempTablesByUri
 } from "../definitions";
 
 function resetIndexState(): void {
@@ -23,6 +24,7 @@ function resetIndexState(): void {
   columnsByTable.clear();
   tablesByName.clear();
   tableTypesByName.clear();
+  tempTablesByUri.clear();
 }
 
 function runCase(name: string, fn: () => void): void {
@@ -97,6 +99,29 @@ WHERE c.DepartmentId > 10;
   const aliasMap = aliasesByUri.get(uri);
   assert.ok(aliasMap?.get("c") === "cteemp", "Alias should resolve to CTE name for downstream validation checks");
   assert.ok(getRefs("cteemp.employeeid").length > 0, "CTE-qualified column should map to CTE");
+});
+
+runCase("create-view-cte-name-and-column-resolution", () => {
+  const uri = "file:///regression/create-view-cte-name-and-column-resolution.sql";
+  const sql = `
+CREATE VIEW dbo.vEmployeeDepartment
+AS
+WITH cteEmp AS (
+  SELECT EmployeeId, DepartmentId FROM Employee
+)
+SELECT c.EmployeeId, c.DepartmentId
+FROM cteEmp c;
+`;
+
+  const parsed = parseSql(sql);
+  const cte = findSymbol(parsed?.scope?.root, "CTE", "cteEmp");
+  assert.ok(cte, "CTE symbol inside CREATE VIEW should exist in parser scope");
+  assert.ok(Array.isArray(cte.location?.query?.columns), "CTE query inside CREATE VIEW should expose projected columns");
+
+  indexText(uri, sql);
+  assert.ok(getRefs("cteemp").length > 0, "CTE table references inside CREATE VIEW should be indexed");
+  assert.ok(getRefs("cteemp.employeeid").length > 0, "CTE projected columns inside CREATE VIEW should resolve via alias usage");
+  assert.ok(getRefs("cteemp.departmentid").length > 0, "CTE projected columns inside CREATE VIEW should resolve via alias usage");
 });
 
 runCase("derived-table-column-definition-resolution", () => {
@@ -219,6 +244,40 @@ FROM DepartmentSalaryInfo e;
 
   assert.ok(getRefs("departmentsalaryinfo.departmentid").length > 0, "Qualified alias column should resolve to current-statement alias target");
   assert.strictEqual(getRefs("#t.departmentid").length, 0, "Qualified alias column must not leak to earlier statement sources");
+  assert.ok(getRefs("#t.id").length > 0, "Temp table Id column should be indexed");
+  assert.ok(getRefs("#t.name").length > 0, "Temp table Name column should be indexed");
+  assert.ok(getRefs("#t.salary").length > 0, "Temp table Salary column should be indexed");
+});
+
+runCase("temp-table-does-not-leak-across-files", () => {
+  const uriA = "file:///regression/temp-a.sql";
+  const uriB = "file:///regression/temp-b.sql";
+
+  indexText(uriA, "CREATE TABLE #t (Id INT, Name NVARCHAR(100));");
+  indexText(uriB, "SELECT t.Id FROM #t t;");
+
+  const leaked = getRefs("#t.id").find(r => r.uri === uriB);
+  assert.ok(leaked, "Temp table column token should still be indexed in-file");
+  assert.strictEqual(
+    leaked?.validateSchema,
+    false,
+    "Temp table columns from another file must not be schema-validated"
+  );
+});
+
+runCase("select-into-temp-table-registers-schema", () => {
+  const uri = "file:///regression/select-into-temp-table-registers-schema.sql";
+  const sql = `
+SELECT EmployeeId, Name
+INTO #EmpTemp
+FROM Employee;
+`;
+
+  indexText(uri, sql);
+  const schema = tempTablesByUri.get(uri)?.get("#emptemp");
+  assert.ok(schema, "SELECT INTO temp table should register file-scoped temp schema");
+  assert.ok(schema?.columns.has("employeeid"), "Projected column EmployeeId should be registered on temp table");
+  assert.ok(schema?.columns.has("name"), "Projected column Name should be registered on temp table");
 });
 
 runCase("update-target-alias-indexing", () => {
