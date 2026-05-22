@@ -2294,6 +2294,15 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         if (shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.UnknownTable, disabledDiagnosticCodes)) {return;}
 
         const clean = normalizeName(name);
+        const preferredRef = getSchemaEquivalentTableRefCandidates(clean)
+          .find((r) => r.validateSchema !== false && (r.context === "insert-target" || r.context === "from" || r.context === "join" || r.context === "update-target" || r.context === "delete-target"))
+          ?? getSchemaEquivalentTableRefCandidates(clean).find((r) => r.validateSchema !== false);
+        if (preferredRef) {
+          startLine = preferredRef.line;
+          startChar = preferredRef.start;
+          endLine = preferredRef.line;
+          endChar = preferredRef.end;
+        }
         const refOffset = (lineStarts[startLine] ?? 0) + startChar;
         if (resolveCteSymbolAtOffset(clean, refOffset)) {return;}
         if (cteNames.has(clean)) {return;}
@@ -2449,7 +2458,25 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         }
       }
 
+      function collectCteNamesFromText(sqlText: string): void {
+        const patterns = [
+          /\bWITH\s+([A-Za-z_][A-Za-z0-9_#@$]*|\[[^\]]+\])\s+AS\s*\(/gi,
+          /,\s*([A-Za-z_][A-Za-z0-9_#@$]*|\[[^\]]+\])\s+AS\s*\(/gi
+        ];
+
+        for (const pattern of patterns) {
+          for (const match of sqlText.matchAll(pattern)) {
+            const rawName = String(match[1] ?? "").trim();
+            if (!rawName) {
+              continue;
+            }
+            cteNames.add(normalizeName(rawName));
+          }
+        }
+      }
+
       collectCteNames(parsed.scope.root);
+      collectCteNamesFromText(text);
       for (const ref of refsForDoc) {
         if (ref.kind === "table") {
           const key = normalizeName(ref.name);

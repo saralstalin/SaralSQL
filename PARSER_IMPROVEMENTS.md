@@ -38,4 +38,22 @@ The previously tracked 7 improvement areas are now covered by parser output and 
 
 ## Next Candidate Improvements
 
-No active parser-blocking items are tracked right now. Add new items here only when a concrete failing SQL snippet is identified.
+1. Ensure CTE scope symbols are emitted consistently inside function-return query bodies.
+   - Example shape:
+     - `CREATE FUNCTION ... RETURNS TABLE AS RETURN (WITH cteX AS (...) SELECT ... FROM cteX)`
+   - Current gap:
+     - parser may emit `FROM cteX` references without surfacing corresponding `CTE` symbol metadata in scope for this function-return form.
+   - Desired behavior:
+     - CTE definitions inside function-return query bodies should appear in semantic scope the same way they do in top-level/view/procedure query contexts.
+   - Why this matters:
+     - avoids LSP fallback text-pattern CTE suppression in schema validation and keeps CTE ownership/parser lineage parser-native.
+
+2. Add SQLCMD-aware preprocessing with source mapping.
+   - Scope:
+     - directives such as `:r`, `:setvar`, and `$(Var)` substitution semantics (with batch/preprocess behavior compatible enough for editor workflows).
+   - Desired parser contract:
+     - preprocess SQLCMD input into parseable SQL,
+     - preserve a source map from preprocessed text back to original files/offsets (including `:r` includes),
+     - expose directive/expansion diagnostics in a parser-consumable form.
+   - Why this matters:
+     - SQLCMD changes the effective token stream before SQL parsing; parser-native preprocessing avoids LSP-only hacks across diagnostics/hover/definition/reference.
