@@ -529,6 +529,13 @@ export function indexText(uri: string, text: string): void {
                     const colNorm = normalizeName(parts[0]);
                     const candidateTables = collectBareColumnCandidateTablesIncremental(scopeAtPos, colNorm);
 
+                    if (candidateTables.length === 0) {
+                        const updateTarget = resolveUpdateTargetTableAtOffsetFromAst(parsed.ast, parsed.scope?.root, ref.location.start);
+                        if (updateTarget) {
+                            candidateTables.push(normalizeName(updateTarget));
+                        }
+                    }
+
                     if (candidateTables.length > 0) {
                         for (const t of candidateTables) {
                             localRefs.push({
@@ -586,6 +593,39 @@ export function indexText(uri: string, text: string): void {
             tableTypesByName.set(def.name, def);
         }
     }
+}
+
+function resolveUpdateTargetTableAtOffsetFromAst(
+    ast: ParseResult["ast"] | null,
+    rootScope: any,
+    offset: number
+): string | null {
+    if (!ast || !rootScope || typeof offset !== "number") {
+        return null;
+    }
+
+    let best: any = null;
+    walkAst(ast, (node: any) => {
+        if (!node || node.type !== "UpdateStatement") {
+            return;
+        }
+        if (typeof node.start !== "number" || typeof node.end !== "number") {
+            return;
+        }
+        if (offset < node.start || offset > node.end) {
+            return;
+        }
+        if (!best || (node.end - node.start) < (best.end - best.start)) {
+            best = node;
+        }
+    });
+
+    if (!best) {
+        return null;
+    }
+
+    const resolved = resolveUpdateTargetTable(best as UpdateNode, rootScope);
+    return resolved ? normalizeName(resolved) : null;
 }
 
 function collectBareColumnCandidateTablesIncremental(scopeAtPos: any, colNorm: string): string[] {

@@ -5,7 +5,7 @@ Each item should describe parser behavior goals, not temporary LSP logic.
 
 ## Current Status
 
-Parser package in this workspace: `@saralsql/tsql-parser@0.2.9`.
+Parser package in this workspace: `@saralsql/tsql-parser@0.3.0`.
 
 The previously tracked 7 improvement areas are now covered by parser output and consumed by the extension:
 
@@ -24,6 +24,9 @@ The previously tracked 7 improvement areas are now covered by parser output and 
 - Cross-batch variable leakage false positives (such as duplicate declaration across `GO`) are no longer produced.
 - `CREATE VIEW ... AS WITH ...` bodies are visited/scoped correctly.
 - CTE symbols inside `CREATE VIEW` bodies are available in semantic scope for diagnostics/hover/definition/references.
+- `OUTPUT` clause semantics now include direct qualified pseudo-table references such as `inserted.<col>` and `deleted.<col>`.
+- `INSERT` target-table reference identity/range is hardened for reliable diagnostics anchoring on the target table token.
+- Bare-column semantics now expose probable lineage candidates and single-source promotion when exactly one viable owner exists in scope.
 
 ## Workaround Policy
 
@@ -35,12 +38,4 @@ The previously tracked 7 improvement areas are now covered by parser output and 
 
 ## Next Candidate Improvements
 
-1. Emit fully-qualified semantic references for `OUTPUT inserted/deleted` columns.
-   - Current behavior: `OUTPUT inserted.EmployeeId` can surface as `unknown` bare-column refs with `OutputColumn.sourceTable` metadata.
-   - Desired behavior: emit direct qualified column refs (e.g., `inserted.employeeid`, `deleted.employeeid`) in reference/resolution output.
-   - Why this matters: removes LSP-only special casing for readability/ambiguity/navigation on `OUTPUT` clauses.
-
-2. Harden `INSERT ...` reference/range mapping to prevent first-column unknown-table diagnostics.
-   - Reported behavior (enterprise codebase): unknown-table diagnostics occasionally anchor to first insert-column token rather than insert target table token.
-   - Local status: not yet reproducible in this repo with current minimized snippets.
-   - Desired behavior: parser/reference mapping should always preserve target-table token identity/range so downstream validators never confuse insert-column tokens as table tokens.
+No active parser-blocking items are tracked right now. Add new items here only when a concrete failing SQL snippet is identified.

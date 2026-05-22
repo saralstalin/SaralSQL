@@ -329,6 +329,21 @@ WHERE e.EmployeeId = 2;
   assert.ok(getRefs("employee.salary").length > 0, "SET qualified assignment columns should resolve to update target table");
 });
 
+runCase("update-where-bare-column-falls-back-to-update-target", () => {
+  const uri = "file:///regression/update-where-bare-column-fallback.sql";
+  const sql = `
+UPDATE HackathonWinners
+SET Prize = @GoodieName
+WHERE WinnerId = @WinnerId;
+`;
+
+  indexText(uri, sql);
+  assert.ok(
+    getRefs("hackathonwinners.winnerid").length > 0,
+    "Bare column in UPDATE WHERE should map to update target table when parser does not resolve it directly"
+  );
+});
+
 runCase("derived-table-alias-column-resolution", () => {
   const uri = "file:///regression/derived-table-alias-columns.sql";
   const sql = `
