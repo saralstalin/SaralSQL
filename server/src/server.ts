@@ -371,6 +371,20 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
 
     if (match.kind === "table") {
       const norm = normalizeName(match.name);
+      if (norm.startsWith("@")) {
+        const byUri = referencesIndex.get(norm);
+        const fileRefs = byUri?.get(normUri) || [];
+        const declarationRef = fileRefs.find(r => r.kind === "parameter") ?? fileRefs[0];
+        if (declarationRef) {
+          return [{
+            uri: declarationRef.uri,
+            range: {
+              start: { line: declarationRef.line, character: declarationRef.start },
+              end: { line: declarationRef.line, character: declarationRef.end }
+            }
+          }];
+        }
+      }
       const defs = definitions.get(norm);
       if (defs && defs.length > 0) {
         return defs.map(d => ({
@@ -381,7 +395,7 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
           }
         }));
       }
-      const tblDef = tablesByName.get(norm);
+      const tblDef = tablesByName.get(norm) || tableTypesByName.get(norm);
       if (tblDef) {
         return [{
           uri: tblDef.uri,
@@ -1713,6 +1727,42 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
 
     if (match.kind === "table") {
       const norm = normalizeName(match.name);
+      if (norm.startsWith("@")) {
+        let dataType = "unknown";
+        let columns: any[] | undefined = undefined;
+        let isTableVariable = false;
+        let paramDisplay = match.name;
+
+        if (parsed?.scope?.root) {
+          const scopeAtPos = parsed.scope.root.findInnermost(offset);
+          const sym = resolveSymbolCaseInsensitive(scopeAtPos, match.name) ?? resolveSymbolCaseInsensitive(scopeAtPos, wordRangeText);
+          if (sym) {
+            paramDisplay = sym.name ?? paramDisplay;
+            if (sym.dataType) {
+              dataType = sym.dataType;
+              const typeKey = normalizeName(dataType);
+              const typeDef = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
+              if (typeDef && typeDef.columns) {
+                columns = typeDef.columns;
+                isTableVariable = true;
+              }
+            }
+            if (sym.columns && Array.isArray(sym.columns)) {
+              columns = sym.columns;
+              isTableVariable = true;
+            }
+          }
+        }
+
+        if (isTableVariable && columns) {
+          const rows = columns.map(c => `- \`${c.rawName ?? c.name}\`${c.type ? ` ${c.type}` : ""}`);
+          const body = `**Table Variable** \`${paramDisplay}\` — \`${dataType}\`\n\n${rows.join("\n")}`;
+          return { contents: { kind: MarkupKind.Markdown, value: body }, range };
+        }
+
+        const value = `**Parameter** \`${paramDisplay}\` — \`${dataType}\``;
+        return { contents: { kind: MarkupKind.Markdown, value }, range };
+      }
       const def = tablesByName.get(norm) || tableTypesByName.get(norm);
       if (def && def.columns) {
         const rows = def.columns.map(c => `- \`${c.rawName}\`${c.type ? ` ${c.type}` : ""}`);

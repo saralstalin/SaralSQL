@@ -405,6 +405,7 @@ export function indexText(uri: string, text: string): void {
     });
 
     indexVariablesFromScope(parsed.scope?.root, normUri, lineStarts, localRefs);
+    indexVariableDataTypeReferencesFromScope(parsed.scope?.root, text, normUri, lineStarts, localRefs);
     indexVariableReferencesFromAst(parsed.ast, normUri, lineStarts, localRefs);
     indexAliasReferencesFromAst(parsed.ast, text, normUri, lineStarts, localRefs);
     indexSelectIntoTempTablesFromAst(parsed.ast, normUri);
@@ -1070,6 +1071,99 @@ function indexVariablesFromScope(
     };
 
     visitScope(rootScope);
+}
+
+function indexVariableDataTypeReferencesFromScope(
+    rootScope: any,
+    text: string,
+    normUri: string,
+    lineStarts: number[],
+    localRefs: ReferenceDef[]
+): void {
+    if (!rootScope) {
+        return;
+    }
+
+    const visitScope = (scope: any) => {
+        const symbols = typeof scope.getOwnSymbols === "function"
+            ? scope.getOwnSymbols()
+            : Object.values(scope.symbols ?? {});
+
+        for (const sym of symbols) {
+            if (sym.kind !== "Parameter" && sym.kind !== "Variable") {
+                continue;
+            }
+
+            const dataTypeRaw = String(sym.dataType ?? "").trim();
+            const dataTypeNorm = normalizeName(dataTypeRaw);
+            if (!dataTypeNorm || isLikelyBuiltInSqlType(dataTypeNorm)) {
+                continue;
+            }
+
+            const loc = sym.location;
+            const start = Number(loc?.start);
+            const end = Number(loc?.end);
+            if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+                continue;
+            }
+
+            const snippet = text.slice(start, end);
+            const range = findTypeNameRangeInSnippet(snippet, dataTypeRaw);
+            if (!range) {
+                continue;
+            }
+
+            const absStart = start + range.start;
+            const absEnd = start + range.end;
+            const pos = offsetToPosition(absStart, lineStarts);
+            localRefs.push({
+                name: dataTypeNorm,
+                uri: normUri,
+                line: pos.line,
+                start: absStart - lineStarts[pos.line],
+                end: absEnd - lineStarts[pos.line],
+                kind: "table",
+                context: "execute-target",
+                validateSchema: false
+            });
+        }
+
+        const children = typeof scope.getChildren === "function"
+            ? scope.getChildren()
+            : (scope.children ?? []);
+
+        for (const child of children) {
+            visitScope(child);
+        }
+    };
+
+    visitScope(rootScope);
+}
+
+function findTypeNameRangeInSnippet(snippet: string, dataTypeRaw: string): { start: number; end: number } | null {
+    const escaped = dataTypeRaw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = new RegExp(`\\b${escaped}\\b`, "i").exec(snippet);
+    if (!match || typeof match.index !== "number") {
+        return null;
+    }
+
+    return { start: match.index, end: match.index + match[0].length };
+}
+
+function isLikelyBuiltInSqlType(dataTypeNorm: string): boolean {
+    const base = dataTypeNorm.split("(")[0]?.trim() ?? dataTypeNorm;
+    const builtins = new Set([
+        "int", "bigint", "smallint", "tinyint", "bit",
+        "decimal", "numeric", "money", "smallmoney",
+        "float", "real",
+        "date", "datetime", "datetime2", "smalldatetime", "time", "datetimeoffset",
+        "char", "varchar", "text", "nchar", "nvarchar", "ntext",
+        "binary", "varbinary", "image",
+        "uniqueidentifier", "xml", "sql_variant",
+        "rowversion", "timestamp", "hierarchyid", "geography", "geometry", "json"
+    ]);
+
+    return builtins.has(base);
 }
 
 function indexVariableReferencesFromAst(

@@ -280,6 +280,30 @@ FROM Employee;
   assert.ok(schema?.columns.has("name"), "Projected column Name should be registered on temp table");
 });
 
+runCase("tvp-type-reference-is-indexed-for-navigation", () => {
+  const uri = "file:///regression/tvp-type-reference-navigation.sql";
+  const sql = `
+CREATE TYPE dbo.MyTvp AS TABLE (
+  Id INT,
+  Name NVARCHAR(50)
+);
+GO
+CREATE PROCEDURE dbo.p
+  @items dbo.MyTvp READONLY
+AS
+BEGIN
+  SELECT * FROM @items;
+END
+`;
+
+  indexText(uri, sql);
+  const typeRefs = getRefs("mytvp");
+  assert.ok(
+    typeRefs.some(r => r.context !== "create-definition"),
+    "TVP usage type token should be indexed so go-to-definition can resolve to CREATE TYPE"
+  );
+});
+
 runCase("update-target-alias-indexing", () => {
   const uri = "file:///regression/update-target-alias-hover.sql";
   const sql = `
