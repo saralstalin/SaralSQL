@@ -210,6 +210,165 @@ WHERE EmployeeId > 0;
   assert.ok(action?.edit?.changes?.[queryUri]?.[0]?.newText === "e.EmployeeId", "Code action should qualify the bare column");
 });
 
+runCase("readable-bare-column-not-emitted-for-qualified-derived-join-columns", () => {
+  const schemaUri = "file:///validation/readable-derived-schema.sql";
+  const queryUri = "file:///validation/readable-derived-query.sql";
+
+  const schemaSql = `
+CREATE TABLE Department (
+  DepartmentId INT
+);
+CREATE TABLE Employee (
+  EmployeeId INT,
+  DepartmentId INT
+);
+`;
+
+  const querySql = `
+SELECT d.DepartmentId, e.EmployeeId
+FROM Department d
+     LEFT JOIN (SELECT EmployeeId, DepartmentId
+                FROM Employee) AS e ON d.DepartmentId = e.DepartmentId;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectReadableBareColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.strictEqual(
+    diagnostics.length,
+    0,
+    "Qualified column references should not trigger readability qualification hints"
+  );
+});
+
+runCase("readable-bare-column-inner-subquery-does-not-suggest-outer-alias", () => {
+  const schemaUri = "file:///validation/readable-inner-subquery-schema.sql";
+  const queryUri = "file:///validation/readable-inner-subquery-query.sql";
+
+  const schemaSql = `
+CREATE TABLE Department (
+  DepartmentId INT
+);
+CREATE TABLE Employee (
+  EmployeeId INT,
+  DepartmentId INT
+);
+`;
+
+  const querySql = `
+SELECT d.DepartmentId
+FROM Department d
+LEFT JOIN (
+  SELECT DepartmentId
+  FROM Employee
+) e ON d.DepartmentId = e.DepartmentId;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectReadableBareColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Consider qualifying 'DepartmentId' as 'd.DepartmentId'")),
+    "Inner subquery bare columns should not be qualified against outer aliases"
+  );
+});
+
+runCase("ambiguity-inner-subquery-does-not-count-outer-owners", () => {
+  const schemaUri = "file:///validation/ambiguity-inner-subquery-schema.sql";
+  const queryUri = "file:///validation/ambiguity-inner-subquery-query.sql";
+
+  const schemaSql = `
+CREATE TABLE Department (
+  DepartmentId INT
+);
+CREATE TABLE Employee (
+  EmployeeId INT,
+  DepartmentId INT
+);
+`;
+
+  const querySql = `
+SELECT d.DepartmentId
+FROM Department d
+LEFT JOIN (
+  SELECT DepartmentId
+  FROM Employee
+) e ON d.DepartmentId = e.DepartmentId;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'DepartmentId'")),
+    "Inner subquery bare columns should not be marked ambiguous due to outer-scope owners"
+  );
+});
+
+runCase("readability-hint-not-emitted-for-output-inserted-columns", () => {
+  const schemaUri = "file:///validation/output-inserted-schema.sql";
+  const queryUri = "file:///validation/output-inserted-query.sql";
+
+  const schemaSql = `
+CREATE TABLE TransportRequests (
+  EmployeeId INT,
+  RequestDate DATE,
+  PickLocation NVARCHAR(100),
+  DropLocation NVARCHAR(100)
+);
+`;
+
+  const querySql = `
+UPDATE tri
+SET PickLocation = tri.PickLocation,
+    DropLocation = tri.DropLocation
+OUTPUT inserted.EmployeeId, inserted.RequestDate, inserted.PickLocation, inserted.DropLocation
+INTO TransportRequests (EmployeeId, RequestDate, PickLocation, DropLocation)
+FROM dbo.TransportRequests tri;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectReadableBareColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.strictEqual(
+    diagnostics.length,
+    0,
+    "OUTPUT inserted/deleted pseudo-table columns should not trigger readability qualification hints"
+  );
+});
+
 runCase("ambiguity-diagnostic-not-emitted-for-qualified-column", () => {
   const schemaUri = "file:///validation/schema-qualified.sql";
   const queryUri = "file:///validation/query-qualified.sql";

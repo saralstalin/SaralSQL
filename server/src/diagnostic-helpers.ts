@@ -207,39 +207,8 @@ export function collectAmbiguousColumnDiagnostics(
     }
 
     const scopeAtPos = parsed.scope.root.findInnermost?.(ref.location.start) ?? parsed.scope.root;
-    const visibleSymbols = typeof scopeAtPos.getVisibleSymbols === "function"
-      ? scopeAtPos.getVisibleSymbols()
-      : Object.values(scopeAtPos.symbols ?? {});
-
     const colNorm = normalizeName(name);
-    const owners = new Set<string>();
-
-    for (const sym of visibleSymbols) {
-      if (sym.kind === "CTE") {
-        const cteCols = getCteColumns(sym);
-        if (cteCols.some(c => normalizeName(c.name) === colNorm)) {
-          owners.add(normalizeName(String(sym.name ?? "")));
-        }
-        continue;
-      }
-
-      let tableName = "";
-      if (sym.kind === "Alias") {
-        tableName = normalizeName(resolveAliasTableName(sym) ?? "");
-      } else if (sym.kind === "Table" || sym.kind === "TempTable") {
-        tableName = normalizeName(String(sym.name ?? ""));
-      }
-
-      if (!tableName) {
-        continue;
-      }
-
-      const stripped = tableName.replace(/^dbo\./, "");
-      const def = tablesByName.get(tableName) || tablesByName.get(stripped) || tableTypesByName.get(tableName) || tableTypesByName.get(stripped);
-      if (def?.columns?.some((c: any) => normalizeName(c.name) === colNorm)) {
-        owners.add(normalizeName(def.rawName ?? def.name));
-      }
-    }
+    const owners = collectAmbiguityOwnersIncremental(scopeAtPos, colNorm, tablesByName, tableTypesByName);
 
     if (owners.size <= 1) {
       continue;
@@ -268,6 +237,62 @@ export function collectAmbiguousColumnDiagnostics(
   return diagnostics;
 }
 
+function collectAmbiguityOwnersIncremental(
+  scopeAtPos: any,
+  colNorm: string,
+  tablesByName: Map<string, any>,
+  tableTypesByName: Map<string, any>
+): Set<string> {
+  const owners = new Set<string>();
+  let scope = scopeAtPos;
+
+  while (scope) {
+    const symbols = typeof scope.getOwnSymbols === "function"
+      ? scope.getOwnSymbols()
+      : Object.values(scope.symbols ?? {});
+
+    const levelOwners = new Set<string>();
+    for (const sym of symbols) {
+      if (sym.kind === "CTE") {
+        const cteCols = getCteColumns(sym);
+        if (cteCols.some(c => normalizeName(c.name) === colNorm)) {
+          levelOwners.add(normalizeName(String(sym.name ?? "")));
+        }
+        continue;
+      }
+
+      let tableName = "";
+      if (sym.kind === "Alias") {
+        tableName = normalizeName(resolveAliasTableName(sym) ?? "");
+      } else if (sym.kind === "Table" || sym.kind === "TempTable") {
+        tableName = normalizeName(String(sym.name ?? ""));
+      }
+
+      if (!tableName) {
+        continue;
+      }
+
+      const stripped = tableName.replace(/^dbo\./, "");
+      const def = tablesByName.get(tableName) || tablesByName.get(stripped) || tableTypesByName.get(tableName) || tableTypesByName.get(stripped);
+      if (def?.columns?.some((c: any) => normalizeName(c.name) === colNorm)) {
+        levelOwners.add(normalizeName(def.rawName ?? def.name));
+      }
+    }
+
+    if (levelOwners.size > 0) {
+      return levelOwners;
+    }
+
+    if (String(scope.name ?? "").toLowerCase() === "subquery") {
+      return owners;
+    }
+
+    scope = scope.parent ?? null;
+  }
+
+  return owners;
+}
+
 export function collectReadableBareColumnDiagnostics(
   parsed: any,
   lineStarts: number[],
@@ -283,6 +308,8 @@ export function collectReadableBareColumnDiagnostics(
   const diagnostics: Diagnostic[] = [];
   const seen = new Set<string>();
   const refs = extractReferences(parsed.ast) ?? [];
+  const qualifiedIdentifierStarts = collectQualifiedIdentifierStarts(parsed.ast);
+  const outputPseudoColumnStarts = collectOutputPseudoColumnStarts(parsed.ast);
 
   for (const ref of refs) {
     if (!ref || (ref.kind !== "column" && ref.kind !== "unknown")) {
@@ -296,30 +323,16 @@ export function collectReadableBareColumnDiagnostics(
     if (!name || name.includes(".") || name.startsWith("@") || isSqlKeyword(normalizeName(name))) {
       continue;
     }
+    if (qualifiedIdentifierStarts.has(ref.location.start)) {
+      continue;
+    }
+    if (outputPseudoColumnStarts.has(ref.location.start)) {
+      continue;
+    }
 
     const scopeAtPos = parsed.scope.root.findInnermost?.(ref.location.start) ?? parsed.scope.root;
-    const visibleSymbols = typeof scopeAtPos.getVisibleSymbols === "function"
-      ? scopeAtPos.getVisibleSymbols()
-      : Object.values(scopeAtPos.symbols ?? {});
-
     const colNorm = normalizeName(name);
-    const matches: Array<{ alias: string; displayAlias: string }> = [];
-
-    for (const sym of visibleSymbols) {
-      if (sym.kind !== "Alias") {
-        continue;
-      }
-
-      const resolved = resolveReadableAliasColumn(sym, colNorm, tablesByName, tableTypesByName);
-      if (!resolved) {
-        continue;
-      }
-
-      matches.push({
-        alias: normalizeName(String(sym.name ?? "")),
-        displayAlias: getDisplaySymbolName(sym) ?? normalizeName(String(sym.name ?? ""))
-      });
-    }
+    const matches = collectReadableAliasMatchesIncremental(scopeAtPos, colNorm, tablesByName, tableTypesByName);
 
     if (matches.length !== 1) {
       continue;
@@ -354,6 +367,137 @@ export function collectReadableBareColumnDiagnostics(
   }
 
   return diagnostics;
+}
+
+function collectReadableAliasMatchesIncremental(
+  scopeAtPos: any,
+  colNorm: string,
+  tablesByName: Map<string, any>,
+  tableTypesByName: Map<string, any>
+): Array<{ alias: string; displayAlias: string }> {
+  let scope = scopeAtPos;
+
+  while (scope) {
+    const symbols = typeof scope.getOwnSymbols === "function"
+      ? scope.getOwnSymbols()
+      : Object.values(scope.symbols ?? {});
+
+    const levelMatches: Array<{ alias: string; displayAlias: string }> = [];
+    let hasLocalOwner = false;
+    for (const sym of symbols) {
+      if (sym.kind === "Alias") {
+        const resolved = resolveReadableAliasColumn(sym, colNorm, tablesByName, tableTypesByName);
+        if (!resolved) {
+          continue;
+        }
+        hasLocalOwner = true;
+        levelMatches.push({
+          alias: normalizeName(String(sym.name ?? "")),
+          displayAlias: getDisplaySymbolName(sym) ?? normalizeName(String(sym.name ?? ""))
+        });
+        continue;
+      }
+
+      if (sym.kind === "CTE") {
+        if (getCteColumns(sym).some(c => normalizeName(c.name) === colNorm)) {
+          hasLocalOwner = true;
+        }
+        continue;
+      }
+
+      if (sym.kind === "Table" || sym.kind === "TempTable") {
+        const tableName = normalizeName(String(sym.name ?? ""));
+        if (!tableName) {
+          continue;
+        }
+        const stripped = tableName.replace(/^dbo\./, "");
+        const def = tablesByName.get(tableName) || tablesByName.get(stripped) || tableTypesByName.get(tableName) || tableTypesByName.get(stripped);
+        if (def?.columns?.some((c: any) => normalizeName(c.name) === colNorm)) {
+          hasLocalOwner = true;
+        }
+      }
+    }
+
+    if (levelMatches.length > 0) {
+      return levelMatches;
+    }
+    if (hasLocalOwner) {
+      return [];
+    }
+    if (String(scope.name ?? "").toLowerCase() === "subquery") {
+      return [];
+    }
+
+    scope = scope.parent ?? null;
+  }
+
+  return [];
+}
+
+function collectQualifiedIdentifierStarts(ast: any): Set<number> {
+  const starts = new Set<number>();
+
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+
+    if (node.type === "Identifier" && Array.isArray(node.parts) && node.parts.length > 1 && typeof node.start === "number") {
+      starts.add(node.start);
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+
+  visit(ast);
+  return starts;
+}
+
+function collectOutputPseudoColumnStarts(ast: any): Set<number> {
+  const starts = new Set<number>();
+
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+
+    if (node.type === "OutputColumn") {
+      const sourceTable = normalizeName(String(node.sourceTable ?? ""));
+      if (sourceTable === "inserted" || sourceTable === "deleted") {
+        const start = Number(node.column?.expression?.start ?? node.column?.start);
+        if (Number.isFinite(start)) {
+          starts.add(start);
+        }
+      }
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+
+  visit(ast);
+  return starts;
 }
 
 export function buildReadableBareColumnCodeAction(uri: string, diagnostic: Diagnostic): CodeAction | null {

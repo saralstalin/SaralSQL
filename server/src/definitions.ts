@@ -527,24 +527,7 @@ export function indexText(uri: string, text: string): void {
                     }
                 } else if (parts.length === 1) {
                     const colNorm = normalizeName(parts[0]);
-                    const candidateTables: string[] = [];
-
-                    for (const sym of visibleSymbols) {
-                        if (sym.kind === "Table" || sym.kind === "TempTable" || sym.kind === "CTE") {
-                            const symNorm = normalizeName(sym.name);
-                            if (columnsByTable.get(symNorm)?.has(colNorm)) {
-                                candidateTables.push(symNorm);
-                            }
-                        } else if (sym.kind === "Alias") {
-                            const tblName = resolveAliasTableName(sym);
-                            if (tblName) {
-                                const tblNorm = normalizeName(tblName);
-                                if (columnsByTable.get(tblNorm)?.has(colNorm)) {
-                                    candidateTables.push(tblNorm);
-                                }
-                            }
-                        }
-                    }
+                    const candidateTables = collectBareColumnCandidateTablesIncremental(scopeAtPos, colNorm);
 
                     if (candidateTables.length > 0) {
                         for (const t of candidateTables) {
@@ -603,6 +586,52 @@ export function indexText(uri: string, text: string): void {
             tableTypesByName.set(def.name, def);
         }
     }
+}
+
+function collectBareColumnCandidateTablesIncremental(scopeAtPos: any, colNorm: string): string[] {
+    const out: string[] = [];
+    let scope = scopeAtPos;
+
+    while (scope) {
+        const symbols = typeof scope.getOwnSymbols === "function"
+            ? scope.getOwnSymbols()
+            : Object.values(scope.symbols ?? {});
+
+        const level = new Set<string>();
+        for (const sym of symbols) {
+            if (sym.kind === "Table" || sym.kind === "TempTable" || sym.kind === "CTE") {
+                const symNorm = normalizeName(sym.name);
+                if (columnsByTable.get(symNorm)?.has(colNorm)) {
+                    level.add(symNorm);
+                }
+                continue;
+            }
+
+            if (sym.kind === "Alias") {
+                const tblName = resolveAliasTableName(sym);
+                if (!tblName) {
+                    continue;
+                }
+                const tblNorm = normalizeName(tblName);
+                if (columnsByTable.get(tblNorm)?.has(colNorm)) {
+                    level.add(tblNorm);
+                }
+            }
+        }
+
+        if (level.size > 0) {
+            out.push(...Array.from(level.values()));
+            return out;
+        }
+
+        if (String(scope.name ?? "").toLowerCase() === "subquery") {
+            return out;
+        }
+
+        scope = scope.parent ?? null;
+    }
+
+    return out;
 }
 
 function indexSelectIntoTempTablesFromAst(

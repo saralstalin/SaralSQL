@@ -35,4 +35,12 @@ The previously tracked 7 improvement areas are now covered by parser output and 
 
 ## Next Candidate Improvements
 
-No active parser-blocking items are tracked right now. Add new items here only when a concrete failing SQL snippet is identified.
+1. Emit fully-qualified semantic references for `OUTPUT inserted/deleted` columns.
+   - Current behavior: `OUTPUT inserted.EmployeeId` can surface as `unknown` bare-column refs with `OutputColumn.sourceTable` metadata.
+   - Desired behavior: emit direct qualified column refs (e.g., `inserted.employeeid`, `deleted.employeeid`) in reference/resolution output.
+   - Why this matters: removes LSP-only special casing for readability/ambiguity/navigation on `OUTPUT` clauses.
+
+2. Harden `INSERT ...` reference/range mapping to prevent first-column unknown-table diagnostics.
+   - Reported behavior (enterprise codebase): unknown-table diagnostics occasionally anchor to first insert-column token rather than insert target table token.
+   - Local status: not yet reproducible in this repo with current minimized snippets.
+   - Desired behavior: parser/reference mapping should always preserve target-table token identity/range so downstream validators never confuse insert-column tokens as table tokens.

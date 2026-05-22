@@ -344,11 +344,54 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
     }
 
     if (!match) {
-      // Fallback: look up word under cursor globally in definitions
+      // Local-first fallback before global lookup.
       const wordRange = getWordRangeAtPosition(doc, params.position);
       if (!wordRange) { return null; }
       const rawWord = doc.getText(wordRange);
       const word = normalizeName(rawWord);
+      const isBareColumnToken = !rawWord.includes(".") && !rawWord.startsWith("@") && !isSqlKeyword(word);
+      const matchedResolution = parsed?.columns?.resolutions?.find((r: any) => {
+        const s = Number(r?.location?.start);
+        const e = Number(r?.location?.end);
+        return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
+      });
+      if (matchedResolution?.inputs) {
+        for (const input of matchedResolution.inputs) {
+          if (input?.kind !== "column" || !input?.source || !input?.name) {
+            continue;
+          }
+          const srcTable = normalizeName(String(input.source));
+          const srcCol = normalizeName(String(input.name).split(".").pop() ?? "");
+          if (!srcTable || !srcCol) {
+            continue;
+          }
+          const locs = findColumnInTable(srcTable, srcCol);
+          if (locs.length > 0) {
+            return locs;
+          }
+        }
+      }
+      const localDefs = (definitions.get(normUri) || []).filter(d => normalizeName(d.name) === word || normalizeName(d.rawName) === word);
+      if (localDefs.length > 0) {
+        return localDefs.map(d => ({
+          uri: d.uri,
+          range: {
+            start: { line: d.line, character: 0 },
+            end: { line: d.line, character: 200 }
+          }
+        }));
+      }
+      if (isBareColumnToken) {
+        const scopeAtPos = parsed?.scope?.root?.findInnermost(offset) ?? parsed?.scope?.root;
+        const stmtOwner = findStatementLocalColumnOwner(getCurrentStatement(doc, params.position), rawWord, scopeAtPos, parsed, offset);
+        if (stmtOwner?.ownerName) {
+          const locs = findColumnInTable(normalizeName(stmtOwner.ownerName), word);
+          if (locs.length > 0) {
+            return locs;
+          }
+        }
+        return null;
+      }
       const fallback = findTableOrColumn(word);
       return fallback.length > 0 ? fallback : null;
     }
@@ -1296,6 +1339,44 @@ function getStatementTableCandidatesFromAst(parsed: any, offset: number): string
   return collectTablesFromAstNode(stmt);
 }
 
+function getDeepestSelectNode(ast: any, offset: number): any | null {
+  let best: any | null = null;
+
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+
+    if (
+      node.type === "SelectStatement" &&
+      typeof node.start === "number" &&
+      typeof node.end === "number" &&
+      offset >= node.start &&
+      offset <= node.end
+    ) {
+      if (!best || (node.end - node.start) < (best.end - best.start)) {
+        best = node;
+      }
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+
+  visit(ast);
+  return best;
+}
+
 function findStatementLocalColumnOwner(
   statementText: string,
   columnName: string,
@@ -1310,35 +1391,80 @@ function findStatementLocalColumnOwner(
 
   const tableCandidates = new Set<string>();
 
-  if (scopeAtPos && typeof scopeAtPos.getVisibleSymbols === "function") {
-    for (const sym of scopeAtPos.getVisibleSymbols()) {
-      if (sym.kind === "Table" || sym.kind === "TempTable") {
-        const tableName = normalizeName(String(sym.name ?? ""));
-        if (tableName) {
-          tableCandidates.add(tableName);
+  if (scopeAtPos) {
+    let scope: any = scopeAtPos;
+    while (scope) {
+      const symbols = typeof scope.getOwnSymbols === "function"
+        ? scope.getOwnSymbols()
+        : Object.values(scope.symbols ?? {});
+
+      const levelCandidates = new Set<string>();
+      let hasLocalOwner = false;
+      for (const sym of symbols) {
+        if (sym.kind === "CTE") {
+          const cteCols = getCteColumns(sym);
+          const cteCol = cteCols.find(c => normalizeName(c.name) === colNorm);
+          if (cteCol) {
+            hasLocalOwner = true;
+            return {
+              kindLabel: "CTE",
+              ownerName: String(sym.name ?? ""),
+              column: cteCol
+            };
+          }
+          continue;
         }
-      } else if (sym.kind === "Alias") {
-        const tableName = normalizeName(resolveAliasTableName(sym) ?? "");
-        if (tableName) {
-          tableCandidates.add(tableName);
+
+        if (sym.kind === "Alias") {
+          const tableName = normalizeName(resolveAliasTableName(sym) ?? "");
+          if (!tableName) {
+            continue;
+          }
+          const stripped = tableName.replace(/^dbo\./, "");
+          const def = tablesByName.get(tableName) || tableTypesByName.get(tableName) || tablesByName.get(stripped) || tableTypesByName.get(stripped);
+          if (def?.columns?.some((c: any) => normalizeName(c.name) === colNorm)) {
+            hasLocalOwner = true;
+            levelCandidates.add(tableName);
+          }
+          continue;
         }
-      } else if (sym.kind === "CTE") {
-        const cteCols = getCteColumns(sym);
-        const cteCol = cteCols.find(c => normalizeName(c.name) === colNorm);
-        if (cteCol) {
-          return {
-            kindLabel: "CTE",
-            ownerName: String(sym.name ?? ""),
-            column: cteCol
-          };
+
+        if (sym.kind === "Table" || sym.kind === "TempTable") {
+          const tableName = normalizeName(String(sym.name ?? ""));
+          if (!tableName) {
+            continue;
+          }
+          const stripped = tableName.replace(/^dbo\./, "");
+          const def = tablesByName.get(tableName) || tableTypesByName.get(tableName) || tablesByName.get(stripped) || tableTypesByName.get(stripped);
+          if (def?.columns?.some((c: any) => normalizeName(c.name) === colNorm)) {
+            hasLocalOwner = true;
+            levelCandidates.add(tableName);
+          }
         }
       }
+
+      if (levelCandidates.size > 0) {
+        for (const c of levelCandidates) {
+          tableCandidates.add(c);
+        }
+        break;
+      }
+      if (hasLocalOwner) {
+        break;
+      }
+      if (String(scope.name ?? "").toLowerCase() === "subquery") {
+        break;
+      }
+      scope = scope.parent ?? null;
     }
   }
 
-  if (parsed && typeof offset === "number") {
-    for (const t of getStatementTableCandidatesFromAst(parsed, offset)) {
-      tableCandidates.add(t);
+  if (tableCandidates.size === 0 && parsed && typeof offset === "number") {
+    const selectNode = getDeepestSelectNode(parsed.ast, offset);
+    if (selectNode) {
+      for (const t of collectTablesFromAstNode(selectNode)) {
+        tableCandidates.add(t);
+      }
     }
   }
 
@@ -1595,10 +1721,17 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
   const match = position
     ? findReferenceAtPosition(normUri, position.line, position.character)
     : undefined;
+  const parsed = position ? getParsedDocument(doc) : null;
+  const offset = position ? doc.offsetAt(position) : -1;
 
   if (match) {
     const byUri = referencesIndex.get(match.name);
-    if (byUri) {
+    const localArr = byUri?.get(normUri) ?? [];
+    if (localArr.length > 0) {
+      for (const r of localArr) {
+        pushLocFromRef(r);
+      }
+    } else if (byUri) {
       for (const arr of byUri.values()) {
         for (const r of arr) {
           pushLocFromRef(r);
@@ -1621,14 +1754,91 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
       }
     }
   } else {
+    const isBareColumnToken = !rawWord.includes(".") && !rawWord.startsWith("@") && !isSqlKeyword(rawNorm);
+    if (parsed && typeof offset === "number" && offset >= 0) {
+      const matchedResolution = parsed?.columns?.resolutions?.find((r: any) => {
+        const s = Number(r?.location?.start);
+        const e = Number(r?.location?.end);
+        return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
+      });
+      if (matchedResolution?.inputs) {
+        for (const input of matchedResolution.inputs) {
+          if (input?.kind !== "column" || !input?.source || !input?.name) {
+            continue;
+          }
+          const srcTable = normalizeName(String(input.source));
+          const srcCol = normalizeName(String(input.name).split(".").pop() ?? "");
+          if (!srcTable || !srcCol) {
+            continue;
+          }
+          const key = `${srcTable}.${srcCol}`;
+          const byUri = referencesIndex.get(key);
+          const localArr = byUri?.get(normUri) ?? [];
+          if (localArr.length > 0) {
+            for (const r of localArr) {
+              pushLocFromRef(r);
+            }
+            return results;
+          }
+          if (byUri) {
+            for (const arr of byUri.values()) {
+              for (const r of arr) {
+                pushLocFromRef(r);
+              }
+            }
+            return results;
+          }
+        }
+      }
+    }
+    if (isBareColumnToken && position) {
+      const scopeAtPos = parsed?.scope?.root?.findInnermost(offset) ?? parsed?.scope?.root;
+      const stmtOwner = findStatementLocalColumnOwner(getCurrentStatement(doc, position), rawWord, scopeAtPos, parsed, offset);
+      if (stmtOwner?.ownerName) {
+        const ownerNorm = normalizeName(stmtOwner.ownerName);
+        const colNorm = normalizeName(rawWord);
+        const key = `${ownerNorm}.${colNorm}`;
+        const byUri = referencesIndex.get(key);
+        const localArr = byUri?.get(normUri) ?? [];
+        if (localArr.length > 0) {
+          for (const r of localArr) {
+            pushLocFromRef(r);
+          }
+          return results;
+        }
+        if (byUri) {
+          for (const arr of byUri.values()) {
+            for (const r of arr) {
+              pushLocFromRef(r);
+            }
+          }
+          return results;
+        }
+      }
+      return results;
+    }
+
     const parts = rawWord.split('.');
     const cleanWord = normalizeName(parts.pop() || rawWord);
 
+    const localCandidates: ReferenceDef[] = [];
     for (const [key, byUri] of referencesIndex.entries()) {
       if (key === cleanWord || key.endsWith("." + cleanWord)) {
-        for (const arr of byUri.values()) {
-          for (const r of arr) {
-            pushLocFromRef(r);
+        localCandidates.push(...(byUri.get(normUri) ?? []));
+      }
+    }
+
+    if (localCandidates.length > 0) {
+      for (const r of localCandidates) {
+        pushLocFromRef(r);
+      }
+    } else {
+      for (const [key, byUri] of referencesIndex.entries()) {
+        if (key === cleanWord || key.endsWith("." + cleanWord)) {
+          for (const arr of byUri.values()) {
+            for (const r of arr) {
+              pushLocFromRef(r);
+            }
           }
         }
       }
@@ -1654,6 +1864,35 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
 
     if (!match) {
       const word = normalizeName(wordRangeText);
+      const matchedResolution = parsed?.columns?.resolutions?.find((r: any) => {
+        const s = Number(r?.location?.start);
+        const e = Number(r?.location?.end);
+        return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
+      });
+      if (matchedResolution?.inputs) {
+        for (const input of matchedResolution.inputs) {
+          if (input?.kind !== "column" || !input?.source || !input?.name) {
+            continue;
+          }
+          const srcTable = normalizeName(String(input.source));
+          const srcCol = normalizeName(String(input.name).split(".").pop() ?? "");
+          if (!srcTable || !srcCol) {
+            continue;
+          }
+          const def = tablesByName.get(srcTable) || tableTypesByName.get(srcTable);
+          if (!def?.columns) {
+            continue;
+          }
+          const colDef = def.columns.find(c => normalizeName(c.name) === srcCol);
+          if (!colDef) {
+            continue;
+          }
+          const kindLabel = tableTypesByName.has(srcTable) ? "table type" : "table";
+          const typePart = colDef.type ? ` — ${colDef.type}` : "";
+          const value = `**Column** \`${colDef.rawName}\`${typePart}\n\nDefined in **${kindLabel}** \`${def.rawName ?? def.name}\``;
+          return { contents: { kind: MarkupKind.Markdown, value }, range };
+        }
+      }
       const def = tablesByName.get(word) || tableTypesByName.get(word);
       if (def && def.columns) {
         const rows = def.columns.map(c => `- \`${c.rawName}\`${c.type ? ` ${c.type}` : ""}`);
@@ -1672,7 +1911,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
         if (colDef) {
           const owner = tablesByName.get(targetNorm) || tableTypesByName.get(targetNorm);
           const kindLabel = tableTypesByName.has(targetNorm) ? "table type" : "table";
-          const typePart = colDef.type ? ` â€” ${colDef.type}` : "";
+          const typePart = colDef.type ? ` - ${colDef.type}` : "";
           const value = `**Column** \`${colDef.rawName}\`${typePart}\n\nDefined in **${kindLabel}** \`${owner?.rawName ?? targetNorm}\``;
           return { contents: { kind: MarkupKind.Markdown, value }, range };
         }
@@ -1681,7 +1920,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
       const hoverScope = parsed?.scope?.root?.findInnermost(offset);
       const stmtOwner = findStatementLocalColumnOwner(getCurrentStatement(doc, pos), word, hoverScope, parsed, offset);
       if (stmtOwner) {
-        const typePart = stmtOwner.column.type ? ` â€” ${stmtOwner.column.type}` : "";
+        const typePart = stmtOwner.column.type ? ` - ${stmtOwner.column.type}` : "";
         const value = `**Column** \`${stmtOwner.column.rawName ?? stmtOwner.column.name}\`${typePart}\n\nDefined in **${stmtOwner.kindLabel}** \`${stmtOwner.ownerName}\``;
         return { contents: { kind: MarkupKind.Markdown, value }, range };
       }
@@ -1807,7 +2046,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
         const hoverScope = parsed?.scope?.root?.findInnermost(offset);
         const stmtOwner = findStatementLocalColumnOwner(getCurrentStatement(doc, pos), parts[0], hoverScope, parsed, offset);
         if (stmtOwner) {
-          const typePart = stmtOwner.column.type ? ` â€” ${stmtOwner.column.type}` : "";
+          const typePart = stmtOwner.column.type ? ` - ${stmtOwner.column.type}` : "";
           const value = `**Column** \`${stmtOwner.column.rawName ?? stmtOwner.column.name}\`${typePart}\n\nDefined in **${stmtOwner.kindLabel}** \`${stmtOwner.ownerName}\``;
           return { contents: { kind: MarkupKind.Markdown, value }, range };
         }
@@ -2100,6 +2339,18 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         return def?.rawName ?? table;
       }
 
+      function getSchemaEquivalentTableRefCandidates(tableName: string): ReferenceDef[] {
+        const norm = normalizeName(tableName);
+        const stripped = norm.replace(/^dbo\./, "");
+        const dboPrefixed = stripped ? `dbo.${stripped}` : norm;
+        const candidates = [
+          ...(tableRefsByName.get(norm) ?? []),
+          ...(tableRefsByName.get(stripped) ?? []),
+          ...(tableRefsByName.get(dboPrefixed) ?? [])
+        ];
+        return candidates;
+      }
+
       function getTextAtRange(startLine: number, startChar: number, endLine: number, endChar: number): string {
         const key = `${startLine}:${startChar}:${endLine}:${endChar}`;
         const cached = diagnosticTextCache.get(key);
@@ -2290,9 +2541,9 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         }
 
         if (!tableExists(table)) {
-          const tableRef = (tableRefsByName.get(table) ?? [])
+          const tableRef = getSchemaEquivalentTableRefCandidates(table)
             .find((r) => r.context === "insert-target" && r.validateSchema !== false)
-            ?? (tableRefsByName.get(table) ?? []).find((r) => r.validateSchema !== false);
+            ?? getSchemaEquivalentTableRefCandidates(table).find((r) => r.validateSchema !== false);
           if (tableRef) {
             addUnknownTable(tableRef.name, tableRef.line, tableRef.start, tableRef.end);
           } else {
