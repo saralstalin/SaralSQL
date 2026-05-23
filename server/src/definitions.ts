@@ -415,6 +415,20 @@ export function indexText(uri: string, text: string): void {
     indexQualifiedColumnReferencesFromAst(parsed.ast, parsed.scope?.root, normUri, lineStarts, localRefs);
 
     // 2. Extract and resolve all references using extractReferences and column resolutions
+    const functionCallStarts = new Set<number>();
+    const functionCallNames = new Set<string>();
+    walkAst(parsed.ast, (node: any) => {
+        if (node?.type === "FunctionCall") {
+            const nameStart = typeof node.nameNode?.start === "number" ? node.nameNode.start : node.start;
+            if (typeof nameStart === "number") {
+                functionCallStarts.add(nameStart);
+            }
+            if (node.name) {
+                functionCallNames.add(normalizeName(node.name));
+            }
+        }
+    });
+
     const references = extractReferences(parsed.ast);
     
     const resolutions = parsed.columns?.resolutions ?? [];
@@ -427,6 +441,7 @@ export function indexText(uri: string, text: string): void {
         const endChar = ref.location.end - lineStarts[refPos.line];
 
         if (ref.kind === "table") {
+            const isFunctionCall = functionCallStarts.has(ref.location.start);
             processedTableRefs.add(`${ref.location.start}:${ref.location.end}`);
             localRefs.push({
                 name: normalizeName(ref.name),
@@ -436,7 +451,7 @@ export function indexText(uri: string, text: string): void {
                 end: endChar,
                 kind: "table",
                 context: ref.context,
-                validateSchema: ref.context !== "execute-target"
+                validateSchema: ref.context !== "execute-target" && !isFunctionCall
             });
         } else if (ref.kind === "variable") {
             localRefs.push({
@@ -528,31 +543,11 @@ export function indexText(uri: string, text: string): void {
                             start: startChar,
                             end: endChar,
                             kind: "column",
-                            validateSchema: !resolvedFromFileAlias && !resolvedTableNorm.startsWith("#")
+                            validateSchema: !resolvedFromFileAlias && !resolvedTableNorm.startsWith("#") && !functionCallNames.has(resolvedTableNorm)
                         });
                     }
                 } else if (parts.length === 1) {
                     const colNorm = normalizeName(parts[0]);
-
-                    // First, prefer any tables declared in the smallest enclosing SELECT (subquery)
-                    // This handles cases where parser scope information is not populated for subqueries.
-                    const selectNode = findSmallestSelectAtOffset(parsed.ast, ref.location.start);
-                    if (selectNode && Array.isArray(selectNode.from) && selectNode.from.length > 0) {
-                        for (const source of selectNode.from) {
-                            const tableName = resolveTableNameFromNode(source?.table ?? source);
-                            if (tableName) {
-                                localRefs.push({
-                                    name: `${normalizeName(tableName)}.${colNorm}`,
-                                    uri: normUri,
-                                    line: refPos.line,
-                                    start: startChar,
-                                    end: endChar,
-                                    kind: "column"
-                                });
-                            }
-                        }
-                        continue;
-                    }
 
                     // Special-case: if this bare column is inside an UPDATE statement,
                     // prefer the update target table as the resolution target.
@@ -562,7 +557,7 @@ export function indexText(uri: string, text: string): void {
                         // (e.g., a subquery). Find any SelectStatement that also encloses the offset
                         // within the update node range; if found, treat as nested and skip.
                         const nestedSelectFound = ((): boolean => {
-                            if (!parsed?.ast) return false;
+                            if (!parsed?.ast) {return false;}
                             let foundSelect = false;
                             walkAst(parsed.ast, (n: any) => {
                                 if (!n || n.type !== "SelectStatement" || typeof n.start !== "number" || typeof n.end !== "number") return;
@@ -585,7 +580,8 @@ export function indexText(uri: string, text: string): void {
                                     line: refPos.line,
                                     start: startChar,
                                     end: endChar,
-                                    kind: "column"
+                                    kind: "column",
+                                    validateSchema: !functionCallNames.has(normalizeName(targetTable))
                                 });
                                 continue;
                             }
@@ -602,7 +598,8 @@ export function indexText(uri: string, text: string): void {
                                 line: refPos.line,
                                 start: startChar,
                                 end: endChar,
-                                kind: "column"
+                                kind: "column",
+                                validateSchema: !functionCallNames.has(normalizeName(t))
                             });
                         }
                     }
@@ -711,13 +708,13 @@ function collectBareColumnCandidateTablesIncremental(scopeAtPos: any, colNorm: s
             }
         }
 
-        if (unknownTables.length > 0) {
-            out.push(...unknownTables);
+        if (knownTables.length > 0) {
+            out.push(...knownTables);
             return out;
         }
 
-        if (knownTables.length > 0) {
-            out.push(...knownTables);
+        if (unknownTables.length > 0) {
+            out.push(...unknownTables);
             return out;
         }
 
@@ -1111,25 +1108,6 @@ function findSmallestNodeAtOffset(ast: ParseResult["ast"] | null, offset: number
     return smallest;
 }
 
-function findSmallestSelectAtOffset(ast: ParseResult["ast"] | null, offset: number): any | null {
-    if (!ast || typeof offset !== "number") {
-        return null;
-    }
-
-    let smallest: any = null;
-    walkAst(ast, (node: any) => {
-        if (!node || node.type !== "SelectStatement" || typeof node.start !== "number" || typeof node.end !== "number") {
-            return;
-        }
-        if (node.start <= offset && offset < node.end) {
-            if (!smallest || (node.end - node.start) < (smallest.end - smallest.start)) {
-                smallest = node;
-            }
-        }
-    });
-
-    return smallest;
-}
 
 function findAliasRange(node: { table?: { end?: number }; start?: number; end?: number }, aliasName: string, text: string): { start: number; end: number } | null {
     const searchStart = typeof node.table?.end === "number" ? node.table.end : node.start ?? 0;

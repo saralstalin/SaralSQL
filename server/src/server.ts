@@ -2011,15 +2011,28 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
         const scopeAtPos = parsed.scope.root.findInnermost(offset);
         const aliasSym = resolveSymbolCaseInsensitive(scopeAtPos, norm);
         if (aliasSym?.kind === "Alias") {
-          const aliasTableName = String(aliasSym.metadata?.tableName ?? aliasSym.location?.table?.name ?? "");
-          const aliasTableNorm = normalizeName(aliasTableName);
+          const aliasTableNorm = normalizeName(resolveAliasTableName(aliasSym) ?? "");
           const aliasTableDef = tablesByName.get(aliasTableNorm) || tableTypesByName.get(aliasTableNorm);
           if (aliasTableDef?.columns) {
             const rows = aliasTableDef.columns.map(c => `- \`${c.rawName}\`${c.type ? ` ${c.type}` : ""}`);
             const kindLabel = tablesByName.has(aliasTableNorm) ? "Table" : "Table Type";
             const body = `**Alias** \`${getDisplaySymbolName(aliasSym)}\`\n\nResolves to **${kindLabel}** \`${aliasTableDef.rawName}\`\n\n${rows.join("\n")}`;
             return { contents: { kind: MarkupKind.Markdown, value: body }, range };
+          } else if (parsed?.ast) {
+            const { isFunc, rawName } = isFunctionCallInAst(parsed.ast, aliasTableNorm);
+            if (isFunc) {
+              const body = `**Alias** \`${getDisplaySymbolName(aliasSym)}\`\n\nResolves to **table-valued function** \`${rawName}\``;
+              return { contents: { kind: MarkupKind.Markdown, value: body }, range };
+            }
           }
+        }
+      }
+
+      if (!tablesByName.has(norm) && !tableTypesByName.has(norm) && parsed?.ast) {
+        const { isFunc, rawName } = isFunctionCallInAst(parsed.ast, norm);
+        if (isFunc) {
+          const body = `**Table-valued function** \`${rawName}\``;
+          return { contents: { kind: MarkupKind.Markdown, value: body }, range };
         }
       }
     }
@@ -2102,8 +2115,16 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
           const value = `**Column** \`${colDef.rawName ?? colDef.name}\`${typePart}\n\nDefined in **${kindLabel}** \`${containerName}\`${aliasPart}`;
           return { contents: { kind: MarkupKind.Markdown, value }, range };
         } else {
+          let kindLabel = "table";
+          if (parsed?.ast) {
+            const { isFunc, rawName } = isFunctionCallInAst(parsed.ast, tableName);
+            if (isFunc) {
+              kindLabel = "table-valued function";
+              containerName = rawName;
+            }
+          }
           const displayCol = normalizeName(wordRangeText) === colName ? wordRangeText : colName;
-          const value = `**Column** \`${displayCol}\`\n\nDefined in **table** \`${containerName}\``;
+          const value = `**Column** \`${displayCol}\`\n\nDefined in **${kindLabel}** \`${containerName}\``;
           return { contents: { kind: MarkupKind.Markdown, value }, range };
         }
       }
@@ -2789,6 +2810,28 @@ connection.onDidChangeConfiguration(change => {
     clearWorkspaceDiagnostics();
   }
 });
+
+function isFunctionCallInAst(ast: any, functionNameNorm: string): { isFunc: boolean; rawName: string } {
+  let isFunc = false;
+  let rawName = functionNameNorm;
+  const visit = (n: any) => {
+    if (!n || typeof n !== "object" || isFunc) return;
+    if (n.type === "FunctionCall" && normalizeName(n.name) === functionNameNorm) {
+      isFunc = true;
+      if (n.name) rawName = n.name;
+      return;
+    }
+    if (Array.isArray(n)) {
+      for (const item of n) visit(item);
+      return;
+    }
+    for (const val of Object.values(n)) {
+      if (val && typeof val === "object") visit(val);
+    }
+  };
+  visit(ast);
+  return { isFunc, rawName };
+}
 
 // ---------- Startup ----------
 documents.listen(connection);
