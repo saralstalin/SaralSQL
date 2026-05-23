@@ -355,11 +355,14 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
         const e = Number(r?.location?.end);
         return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
       });
-      if (!matchedResolution?.isUnverifiable) {
-        for (const src of getResolutionSourceColumns(matchedResolution)) {
-          const locs = findColumnInTable(src.table, src.column);
-          if (locs.length > 0) {
-            return locs;
+      if (matchedResolution) {
+        const sources = getResolutionSourceColumns(matchedResolution);
+        if (sources.length > 0) {
+          for (const src of sources) {
+            const locs = findColumnInTable(src.table, src.column);
+            if (locs.length > 0) {
+              return locs;
+            }
           }
         }
       }
@@ -467,11 +470,14 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
           const e = Number(r?.location?.end);
           return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
         });
-        if (!matchedResolution?.isUnverifiable) {
-          for (const src of getResolutionSourceColumns(matchedResolution)) {
-            const locs = findColumnInTable(src.table, src.column);
-            if (locs.length > 0) {
-              return locs;
+        if (matchedResolution) {
+          const sources = getResolutionSourceColumns(matchedResolution);
+          if (sources.length > 0) {
+            for (const src of sources) {
+              const locs = findColumnInTable(src.table, src.column);
+              if (locs.length > 0) {
+                return locs;
+              }
             }
           }
         }
@@ -1359,10 +1365,6 @@ function getResolutionSourceColumns(resolution: any): Array<{ table: string; col
     }
   }
 
-  for (const candidate of resolution?.candidates ?? resolution?.ambiguityCandidates ?? []) {
-    add(candidate?.source ?? candidate?.table ?? candidate?.owner, candidate?.name ?? candidate?.column);
-  }
-
   return out;
 }
 
@@ -1405,6 +1407,18 @@ function findStatementLocalColumnOwner(
         }
 
         if (sym.kind === "Alias") {
+          if (Array.isArray(sym.columns)) {
+            const col = sym.columns.find((c: any) => normalizeName(c.name || c.rawName) === colNorm);
+            if (col) {
+              hasLocalOwner = true;
+              return {
+                kindLabel: "derived table",
+                ownerName: String(sym.name ?? ""),
+                column: col
+              };
+            }
+          }
+
           const tableName = normalizeName(resolveAliasTableName(sym) ?? "");
           if (!tableName) {
             continue;
@@ -1485,45 +1499,49 @@ function isAmbiguousBareColumnAtPosition(doc: TextDocument, position: Position, 
   }
 
   const offset = doc.offsetAt(position);
-  const scopeAtPos = parsed?.scope?.root?.findInnermost?.(offset) ?? parsed?.scope?.root;
-  if (!scopeAtPos) {
-    return false;
-  }
+  let scope: any = parsed?.scope?.root?.findInnermost?.(offset) ?? parsed?.scope?.root;
 
-  const owners = new Set<string>();
-  const visibleSymbols = typeof scopeAtPos.getVisibleSymbols === "function"
-    ? (scopeAtPos.getVisibleSymbols() as any[])
-    : typeof scopeAtPos.getOwnSymbols === "function"
-      ? (scopeAtPos.getOwnSymbols() as any[])
-      : [];
+  while (scope) {
+    const owners = new Set<string>();
+    const symbols = typeof scope.getOwnSymbols === "function"
+      ? (scope.getOwnSymbols() as any[])
+      : Object.values(scope.symbols ?? {});
 
-  for (const sym of visibleSymbols) {
-    if (sym.kind === "CTE") {
-      const cteCols = getCteColumns(sym);
-      if (cteCols.some(c => normalizeName(c.name) === colNorm)) {
-        owners.add(`cte:${normalizeName(String(sym.name ?? ""))}`);
+    for (const sym of symbols) {
+      if (sym.kind === "CTE") {
+        const cteCols = getCteColumns(sym);
+        if (cteCols.some(c => normalizeName(c.name) === colNorm)) {
+          owners.add(`cte:${normalizeName(String(sym.name ?? ""))}`);
+        }
+        continue;
       }
-      if (owners.size > 1) { return true; }
-      continue;
+
+      let tableName = "";
+      if (sym.kind === "Alias") {
+        tableName = normalizeName(resolveAliasTableName(sym) ?? "");
+      } else if (sym.kind === "Table" || sym.kind === "TempTable") {
+        tableName = normalizeName(String(sym.name ?? ""));
+      }
+      if (!tableName) { continue; }
+
+      const stripped = tableName.replace(/^dbo\./, "");
+      const def = tablesByName.get(tableName) || tablesByName.get(stripped) || tableTypesByName.get(tableName) || tableTypesByName.get(stripped);
+      if (def?.columns?.some((c: any) => normalizeName(c.name) === colNorm)) {
+        owners.add(`tbl:${normalizeName(def.rawName ?? def.name ?? tableName)}`);
+      }
     }
 
-    let tableName = "";
-    if (sym.kind === "Alias") {
-      tableName = normalizeName(resolveAliasTableName(sym) ?? "");
-    } else if (sym.kind === "Table" || sym.kind === "TempTable") {
-      tableName = normalizeName(String(sym.name ?? ""));
+    if (owners.size > 1) {
+      return true;
     }
-    if (!tableName) { continue; }
+    if (owners.size === 1) {
+      return false;
+    }
 
-    const stripped = tableName.replace(/^dbo\./, "");
-    const def = tablesByName.get(tableName) || tablesByName.get(stripped) || tableTypesByName.get(tableName) || tableTypesByName.get(stripped);
-    if (def?.columns?.some((c: any) => normalizeName(c.name) === colNorm)) {
-      owners.add(`tbl:${normalizeName(def.rawName ?? def.name ?? tableName)}`);
-    }
-    if (owners.size > 1) { return true; }
+    scope = scope.parent ?? null;
   }
 
-  return owners.size > 1;
+  return false;
 }
 
 // --- References ---
@@ -1738,24 +1756,27 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
         const e = Number(r?.location?.end);
         return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
       });
-      if (!matchedResolution?.isUnverifiable) {
-        for (const src of getResolutionSourceColumns(matchedResolution)) {
-          const key = `${src.table}.${src.column}`;
-          const byUri = referencesIndex.get(key);
-          const localArr = byUri?.get(normUri) ?? [];
-          if (localArr.length > 0) {
-            for (const r of localArr) {
-              pushLocFromRef(r);
-            }
-            return results;
-          }
-          if (byUri) {
-            for (const arr of byUri.values()) {
-              for (const r of arr) {
+      if (matchedResolution) {
+        const sources = getResolutionSourceColumns(matchedResolution);
+        if (sources.length > 0) {
+          for (const src of sources) {
+            const key = `${src.table}.${src.column}`;
+            const byUri = referencesIndex.get(key);
+            const localArr = byUri?.get(normUri) ?? [];
+            if (localArr.length > 0) {
+              for (const r of localArr) {
                 pushLocFromRef(r);
               }
+              return results;
             }
-            return results;
+            if (byUri) {
+              for (const arr of byUri.values()) {
+                for (const r of arr) {
+                  pushLocFromRef(r);
+                }
+              }
+              return results;
+            }
           }
         }
       }
@@ -1838,20 +1859,22 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
         const e = Number(r?.location?.end);
         return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
       });
-    if (!matchedResolution?.isUnverifiable) {
-      for (const src of getResolutionSourceColumns(matchedResolution)) {
-        const def = tablesByName.get(src.table) || tableTypesByName.get(src.table);
-        if (!def?.columns) {
-          continue;
+    if (matchedResolution) {
+      const sources = getResolutionSourceColumns(matchedResolution);
+      if (sources.length > 0) {
+        for (const src of sources) {
+          const def = tablesByName.get(src.table) || tableTypesByName.get(src.table);
+          const colDef = def?.columns?.find(c => normalizeName(c.name) === src.column);
+
+          if (colDef) {
+            const kindLabel = tableTypesByName.has(src.table) ? "table type" : "table";
+            const typePart = colDef.type ? ` - ${colDef.type}` : "";
+            const displayCol = colDef.rawName ?? (normalizeName(wordRangeText) === src.column ? wordRangeText : src.column);
+            const displayTable = def?.rawName ?? def?.name ?? src.table;
+            const value = `**Column** \`${displayCol}\`${typePart}\n\nDefined in **${kindLabel}** \`${displayTable}\``;
+            return { contents: { kind: MarkupKind.Markdown, value }, range };
+          }
         }
-        const colDef = def.columns.find(c => normalizeName(c.name) === src.column);
-        if (!colDef) {
-          continue;
-        }
-        const kindLabel = tableTypesByName.has(src.table) ? "table type" : "table";
-        const typePart = colDef.type ? ` - ${colDef.type}` : "";
-        const value = `**Column** \`${colDef.rawName}\`${typePart}\n\nDefined in **${kindLabel}** \`${def.rawName ?? def.name}\``;
-        return { contents: { kind: MarkupKind.Markdown, value }, range };
       }
     }
       const def = tablesByName.get(word) || tableTypesByName.get(word);
@@ -2077,6 +2100,10 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
           const typePart = colDef.type ? ` — ${colDef.type}` : "";
           const aliasPart = aliasToken ? ` (parameter \`${aliasToken}\`)` : "";
           const value = `**Column** \`${colDef.rawName ?? colDef.name}\`${typePart}\n\nDefined in **${kindLabel}** \`${containerName}\`${aliasPart}`;
+          return { contents: { kind: MarkupKind.Markdown, value }, range };
+        } else {
+          const displayCol = normalizeName(wordRangeText) === colName ? wordRangeText : colName;
+          const value = `**Column** \`${displayCol}\`\n\nDefined in **table** \`${containerName}\``;
           return { contents: { kind: MarkupKind.Markdown, value }, range };
         }
       }

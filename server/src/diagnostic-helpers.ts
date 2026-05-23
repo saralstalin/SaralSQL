@@ -195,9 +195,6 @@ export function collectAmbiguousColumnDiagnostics(
 
     const matchedResolution = resolutions.find((r: any) => r.location?.start === ref.location.start);
     const resolvedSources = new Set<string>();
-    if (matchedResolution?.isUnverifiable) {
-      continue;
-    }
     if (matchedResolution?.inputs) {
       for (const input of matchedResolution.inputs) {
         if (input.kind === "column" && input.source) {
@@ -336,9 +333,6 @@ export function collectReadableBareColumnDiagnostics(
     const scopeAtPos = parsed.scope.root.findInnermost?.(ref.location.start) ?? parsed.scope.root;
     const colNorm = normalizeName(name);
     const matchedResolution = parsed?.columns?.resolutions?.find((r: any) => r.location?.start === ref.location.start);
-    if (matchedResolution?.isUnverifiable) {
-      continue;
-    }
     const matches = collectReadableAliasMatchesIncremental(scopeAtPos, colNorm, tablesByName, tableTypesByName);
 
     if (matches.length !== 1) {

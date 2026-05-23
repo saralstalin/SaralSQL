@@ -416,10 +416,12 @@ export function indexText(uri: string, text: string): void {
 
     // 2. Extract and resolve all references using extractReferences and column resolutions
     const references = extractReferences(parsed.ast);
+    
     const resolutions = parsed.columns?.resolutions ?? [];
     const processedTableRefs = new Set<string>();
 
     for (const ref of references) {
+        
         const refPos = offsetToPosition(ref.location.start, lineStarts);
         const startChar = ref.location.start - lineStarts[refPos.line];
         const endChar = ref.location.end - lineStarts[refPos.line];
@@ -459,8 +461,8 @@ export function indexText(uri: string, text: string): void {
             const matchedResolution = resolutions.find((r: any) => r.location?.start === ref.location.start);
             let resolved = false;
 
-            if (matchedResolution && !matchedResolution.isUnverifiable) {
-                if (matchedResolution.inputs) {
+            if (matchedResolution) {
+                if (matchedResolution.inputs && matchedResolution.inputs.length > 0) {
                     for (const input of matchedResolution.inputs) {
                         if (input.kind === "column" && input.source) {
                             localRefs.push({
@@ -481,27 +483,6 @@ export function indexText(uri: string, text: string): void {
                                 start: startChar,
                                 end: endChar,
                                 kind: "parameter"
-                            });
-                            resolved = true;
-                        }
-                    }
-                }
-                
-                if (!resolved) {
-                    const fallbackCandidates = (matchedResolution as any).candidates ?? (matchedResolution as any).ambiguityCandidates ?? [];
-                    if (fallbackCandidates.length > 0) {
-                        const c = fallbackCandidates[0];
-                        const srcTable = c.source ?? c.table ?? c.owner;
-                        const srcCol = c.name ?? c.column;
-                        if (srcTable && srcCol) {
-                            localRefs.push({
-                                name: `${normalizeName(srcTable)}.${normalizeName(srcCol.split('.').pop()!)}`,
-                                uri: normUri,
-                                line: refPos.line,
-                                start: startChar,
-                                end: endChar,
-                                kind: "column",
-                                validateSchema: false
                             });
                             resolved = true;
                         }
@@ -552,7 +533,66 @@ export function indexText(uri: string, text: string): void {
                     }
                 } else if (parts.length === 1) {
                     const colNorm = normalizeName(parts[0]);
-                    const candidateTables = collectBareColumnCandidateTablesIncremental(scopeAtPos, colNorm);
+
+                    // First, prefer any tables declared in the smallest enclosing SELECT (subquery)
+                    // This handles cases where parser scope information is not populated for subqueries.
+                    const selectNode = findSmallestSelectAtOffset(parsed.ast, ref.location.start);
+                    if (selectNode && Array.isArray(selectNode.from) && selectNode.from.length > 0) {
+                        for (const source of selectNode.from) {
+                            const tableName = resolveTableNameFromNode(source?.table ?? source);
+                            if (tableName) {
+                                localRefs.push({
+                                    name: `${normalizeName(tableName)}.${colNorm}`,
+                                    uri: normUri,
+                                    line: refPos.line,
+                                    start: startChar,
+                                    end: endChar,
+                                    kind: "column"
+                                });
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Special-case: if this bare column is inside an UPDATE statement,
+                    // prefer the update target table as the resolution target.
+                    const updateNode = findEnclosingUpdateNode(parsed.ast, ref.location.start);
+                    if (updateNode) {
+                        // Skip update-target fallback if the reference is inside a nested SELECT
+                        // (e.g., a subquery). Find any SelectStatement that also encloses the offset
+                        // within the update node range; if found, treat as nested and skip.
+                        const nestedSelectFound = ((): boolean => {
+                            if (!parsed?.ast) return false;
+                            let foundSelect = false;
+                            walkAst(parsed.ast, (n: any) => {
+                                if (!n || n.type !== "SelectStatement" || typeof n.start !== "number" || typeof n.end !== "number") return;
+                                if (n.start <= ref.location.start && ref.location.start < n.end) {
+                                    // ensure this select is within the update node range
+                                    if (n.start >= updateNode.start && n.end <= updateNode.end) {
+                                        foundSelect = true;
+                                    }
+                                }
+                            });
+                            return foundSelect;
+                        })();
+
+                        if (!nestedSelectFound) {
+                            const targetTable = resolveUpdateTargetTable(updateNode as UpdateNode, parsed.scope?.root);
+                            if (targetTable) {
+                                localRefs.push({
+                                    name: `${normalizeName(targetTable)}.${colNorm}`,
+                                    uri: normUri,
+                                    line: refPos.line,
+                                    start: startChar,
+                                    end: endChar,
+                                    kind: "column"
+                                });
+                                continue;
+                            }
+                        }
+                    }
+
+                    const candidateTables = collectBareColumnCandidateTablesIncremental(scopeAtPos, colNorm, parsed.ast, ref.location.start);
 
                     if (candidateTables.length > 0) {
                         for (const t of candidateTables) {
@@ -613,39 +653,71 @@ export function indexText(uri: string, text: string): void {
     }
 }
 
-function collectBareColumnCandidateTablesIncremental(scopeAtPos: any, colNorm: string): string[] {
+function collectBareColumnCandidateTablesIncremental(scopeAtPos: any, colNorm: string, ast?: ParseResult["ast"] | null, offset?: number): string[] {
     const out: string[] = [];
     let scope = scopeAtPos;
+    const stmtNode = (ast && typeof offset === "number") ? findSmallestNodeAtOffset(ast, offset) : null;
 
     while (scope) {
         const symbols = typeof scope.getOwnSymbols === "function"
             ? scope.getOwnSymbols()
             : Object.values(scope.symbols ?? {});
 
-        const level = new Set<string>();
+        const unknownTables: string[] = [];
+        const knownTables: string[] = [];
+
         for (const sym of symbols) {
             if (sym.kind === "Table" || sym.kind === "TempTable" || sym.kind === "CTE") {
                 const symNorm = normalizeName(sym.name);
-                if (columnsByTable.get(symNorm)?.has(colNorm)) {
-                    level.add(symNorm);
+                const tableCols = columnsByTable.get(symNorm);
+                if (tableCols) {
+                    if (tableCols.has(colNorm)) {
+                        knownTables.push(symNorm);
+                    }
+                } else {
+                    // No schema info available for this local table; prefer it only if
+                    // the table symbol is declared inside the same statement node as the reference
+                    if (!stmtNode || (typeof sym.location?.start === "number" && typeof sym.location?.end === "number" && sym.location.start >= stmtNode.start && sym.location.end <= stmtNode.end)) {
+                        unknownTables.push(symNorm);
+                    }
                 }
                 continue;
             }
 
             if (sym.kind === "Alias") {
+                if (Array.isArray(sym.columns)) {
+                    const col = sym.columns.find((c: any) => normalizeName(c.name || c.rawName) === colNorm);
+                    if (col) {
+                        knownTables.push(normalizeName(String(sym.name ?? "")));
+                        continue;
+                    }
+                }
+
                 const tblName = resolveAliasTableName(sym);
                 if (!tblName) {
                     continue;
                 }
                 const tblNorm = normalizeName(tblName);
-                if (columnsByTable.get(tblNorm)?.has(colNorm)) {
-                    level.add(tblNorm);
+                const tblCols = columnsByTable.get(tblNorm);
+                if (tblCols) {
+                    if (tblCols.has(colNorm)) {
+                        knownTables.push(tblNorm);
+                    }
+                } else {
+                    if (!stmtNode || (typeof sym.location?.start === "number" && typeof sym.location?.end === "number" && sym.location.start >= stmtNode.start && sym.location.end <= stmtNode.end)) {
+                        unknownTables.push(tblNorm);
+                    }
                 }
             }
         }
 
-        if (level.size > 0) {
-            out.push(...Array.from(level.values()));
+        if (unknownTables.length > 0) {
+            out.push(...unknownTables);
+            return out;
+        }
+
+        if (knownTables.length > 0) {
+            out.push(...knownTables);
             return out;
         }
 
@@ -998,6 +1070,65 @@ function resolveTableNameFromNode(tableNode: Expression | TableReference | strin
     }
 
     return undefined;
+}
+
+function findEnclosingUpdateNode(ast: ParseResult["ast"] | null, offset: number): any | null {
+    if (!ast || typeof offset !== "number") {
+        return null;
+    }
+
+    let found: any = null;
+    walkAst(ast, (node: any) => {
+        if (!node || node.type !== "UpdateStatement" || typeof node.start !== "number" || typeof node.end !== "number") {
+            return;
+        }
+
+        if (node.start <= offset && offset < node.end) {
+            found = node;
+        }
+    });
+
+    return found;
+}
+
+function findSmallestNodeAtOffset(ast: ParseResult["ast"] | null, offset: number): any | null {
+    if (!ast || typeof offset !== "number") {
+        return null;
+    }
+
+    let smallest: any = null;
+    walkAst(ast, (node: any) => {
+        if (!node || typeof node.start !== "number" || typeof node.end !== "number") {
+            return;
+        }
+        if (node.start <= offset && offset < node.end) {
+            if (!smallest || (node.end - node.start) < (smallest.end - smallest.start)) {
+                smallest = node;
+            }
+        }
+    });
+
+    return smallest;
+}
+
+function findSmallestSelectAtOffset(ast: ParseResult["ast"] | null, offset: number): any | null {
+    if (!ast || typeof offset !== "number") {
+        return null;
+    }
+
+    let smallest: any = null;
+    walkAst(ast, (node: any) => {
+        if (!node || node.type !== "SelectStatement" || typeof node.start !== "number" || typeof node.end !== "number") {
+            return;
+        }
+        if (node.start <= offset && offset < node.end) {
+            if (!smallest || (node.end - node.start) < (smallest.end - smallest.start)) {
+                smallest = node;
+            }
+        }
+    });
+
+    return smallest;
 }
 
 function findAliasRange(node: { table?: { end?: number }; start?: number; end?: number }, aliasName: string, text: string): { start: number; end: number } | null {

@@ -533,4 +533,64 @@ runCase("offset-at-honors-crlf-line-endings", () => {
   assert.strictEqual(offsetAt(doc, { line: 2, character: 6 }), doc.offsetAt({ line: 2, character: 6 }), "CRLF later line offsets should match TextDocument");
 });
 
+runCase("bare-column-subquery-schema-missing", () => {
+  const schemaUri = "file:///regression/schema-missing.sql";
+  const queryUri = "file:///regression/query-missing.sql";
+  const schemaSql = `
+CREATE TABLE [dbo].[Department] (
+  DepartmentId INT,
+  DepartmentName NVARCHAR(100)
+);
+`;
+  const querySql = `
+UPdate d
+SET d.DepartmentName = 'Department Name' + (SELECT TOP 1 FirstName FROM Employee WHERE DepartmentId = d.DepartmentId)
+FROM [dbo].[Department] d
+WHERE d.DepartmentId = 23378
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+
+  const deptIdRefs = getRefs("department.departmentid");
+  // 1 from CREATE TABLE
+  // 1 from d.DepartmentId in the subquery
+  // 1 from d.DepartmentId in the outer WHERE
+  // If the bare DepartmentId leaks, it would be 4!
+  assert.strictEqual(deptIdRefs.length, 3, "Inner bare DepartmentId must not leak to outer Department table when Employee schema is missing");
+
+  assert.strictEqual(getRefs("employee.firstname").length, 1, "FirstName should be correctly pinned to Employee by parser inference");
+});
+
+runCase("bare-column-subquery-schema-present", () => {
+  const schemaUri = "file:///regression/schema-present.sql";
+  const queryUri = "file:///regression/query-present.sql";
+  const schemaSql = `
+CREATE TABLE [dbo].[Department] (
+  DepartmentId INT,
+  DepartmentName NVARCHAR(100)
+);
+CREATE TABLE Employee (
+  EmployeeId INT,
+  FirstName NVARCHAR(100),
+  DepartmentId INT
+);
+`;
+  const querySql = `
+UPdate d
+SET d.DepartmentName = 'Department Name' + (SELECT TOP 1 FirstName FROM Employee WHERE DepartmentId = d.DepartmentId)
+FROM [dbo].[Department] d
+WHERE d.DepartmentId = 23378
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+
+  const empDeptIdRefs = getRefs("employee.departmentid");
+  assert.ok(empDeptIdRefs.some(r => r.uri === queryUri), "Bare DepartmentId should resolve to Employee when schema is present");
+
+  const empFirstNameRefs = getRefs("employee.firstname");
+  assert.ok(empFirstNameRefs.some(r => r.uri === queryUri), "Bare FirstName should resolve to Employee when schema is present");
+});
+
 process.stdout.write("All regression index tests passed.\n");
