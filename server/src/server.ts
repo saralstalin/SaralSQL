@@ -2288,6 +2288,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
       const refsForDoc = getReferencesForUri(normDocUri);
       const cteNames = new Set<string>();
       const seenTables = new Set<string>();
+      const reportedMissingTables = new Set<string>();
       const seenColumns = new Set<string>();
       const diagnosticTextCache = new Map<string, string>();
       const tableRefsByName = new Map<string, ReferenceDef[]>();
@@ -2308,19 +2309,24 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         };
       }
 
-      function addUnknownTable(name: string, line: number, start: number, end: number) {
-        addUnknownTableAt(name, line, start, line, end);
+      function addUnknownTable(name: string, line: number, start: number, end: number, isFallback = false) {
+        addUnknownTableAt(name, line, start, line, end, isFallback);
       }
 
-      function addUnknownTableAt(name: string, startLine: number, startChar: number, endLine: number, endChar: number) {
+      function addUnknownTableAt(name: string, startLine: number, startChar: number, endLine: number, endChar: number, isFallback = false) {
         if (!name) {return;}
         if (shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.UnknownTable, disabledDiagnosticCodes)) {return;}
 
         const clean = normalizeName(name);
         
-        const key = `${clean}:${startLine}:${startChar}`;
+        if (isFallback && reportedMissingTables.has(clean)) {
+            return;
+        }
+
+        const key = isFallback ? `fallback:${clean}` : `${clean}:${startLine}:${startChar}`;
         if (seenTables.has(key)) {return;}
         seenTables.add(key);
+        reportedMissingTables.add(clean);
 
         const refOffset = (lineStarts[startLine] ?? 0) + startChar;
         if (resolveCteSymbolAtOffset(clean, refOffset)) {return;}
@@ -2330,6 +2336,15 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         if (isSystemTableReference(clean)) {return;}
         if (tableExists(clean)) {return;}
 
+        let displayTableName = name;
+        const rangeText = getTextAtRange(startLine, startChar, endLine, endChar);
+        if (rangeText) {
+          const rangeClean = normalizeName(rangeText);
+          if (rangeClean === clean || rangeClean.endsWith("." + clean)) {
+            displayTableName = rangeText;
+          }
+        }
+
         diagnostics.push({
           code: SARAL_DIAGNOSTIC_CODES.UnknownTable,
           severity: resolveDiagnosticSeverity(SARAL_DIAGNOSTIC_CODES.UnknownTable, DiagnosticSeverity.Error, diagnosticSeverityOverrides),
@@ -2337,7 +2352,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
             start: { line: startLine, character: startChar },
             end: { line: endLine, character: endChar }
           },
-          message: `Unknown table '${getTextAtRange(startLine, startChar, endLine, endChar) || name}'`,
+          message: `Unknown table '${displayTableName}'`,
           source: "SaralSQL"
         });
       }
@@ -2601,7 +2616,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
           if (tableRef) {
             addUnknownTable(tableRef.name, tableRef.line, tableRef.start, tableRef.end);
           } else {
-            addUnknownTable(table, ref.line, ref.start, ref.end);
+            addUnknownTable(table, ref.line, ref.start, ref.end, true);
           }
           continue;
         }

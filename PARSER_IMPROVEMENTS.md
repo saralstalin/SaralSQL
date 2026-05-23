@@ -83,3 +83,14 @@ The previously tracked 7 improvement areas are now covered by parser output and 
    - Why this matters:
      - Removes the need for the AST-traversal suppression workaround (`hasTableVar`) in the LSP extension's diagnostic collection.
      - Prevents confusing outer-reference error messages for entirely local columns.
+
+5. Extract AST references inside `TRY...CATCH` blocks.
+   - Scope:
+     - Statements located inside the `tryBlock` or `catchBlock` of a `TryCatchStatement` (and potentially other control flow blocks).
+   - Current gap:
+     - The parser's `extractReferences` utility does not recursively traverse into `TryCatchStatement` bodies, meaning table references inside them are omitted from the returned list.
+   - Desired parser contract:
+     - The parser should recursively extract references from all nested blocks across all statement types.
+   - Why this matters:
+     - Prevents the LSP from falling back to placing "Unknown table" errors on column references when the actual table reference coordinates are missing.
+     - Ensures `Go to Definition` and references indexing work consistently for tables inside error handling blocks.

@@ -418,6 +418,7 @@ export function indexText(uri: string, text: string): void {
     // 2. Extract and resolve all references using extractReferences and column resolutions
     const references = extractReferences(parsed.ast);
     const resolutions = parsed.columns?.resolutions ?? [];
+    const processedTableRefs = new Set<string>();
 
     for (const ref of references) {
         const refPos = offsetToPosition(ref.location.start, lineStarts);
@@ -425,6 +426,7 @@ export function indexText(uri: string, text: string): void {
         const endChar = ref.location.end - lineStarts[refPos.line];
 
         if (ref.kind === "table") {
+            processedTableRefs.add(`${ref.location.start}:${ref.location.end}`);
             localRefs.push({
                 name: normalizeName(ref.name),
                 uri: normUri,
@@ -556,6 +558,64 @@ export function indexText(uri: string, text: string): void {
             }
         }
     }
+
+    walkAst(parsed.ast, (node: any) => {
+        if (!node || typeof node !== "object") {
+            return;
+        }
+
+        let tName: string | null = null;
+        let tStart: number | undefined;
+        let tEnd: number | undefined;
+        let tContext: any = "from";
+
+        if (node.type === "TableReference" && node.table) {
+            tName = typeof node.table.name === "string" ? (node.table.name as string) : (typeof node.table === "string" ? (node.table as string) : null);
+            if (tName && typeof node.table.start === "number") {
+                tStart = node.table.start as number;
+                tEnd = typeof node.table.end === "number" ? (node.table.end as number) : (tStart + tName.length);
+            }
+        } else if (node.type === "UpdateStatement" && node.target) {
+            tName = typeof node.target.name === "string" ? (node.target.name as string) : null;
+            if (tName && typeof node.target.start === "number") {
+                tStart = node.target.start as number;
+                tEnd = typeof node.target.end === "number" ? (node.target.end as number) : (tStart + tName.length);
+                tContext = "update-target";
+            }
+        } else if (node.type === "InsertStatement" && node.table) {
+            tName = typeof node.table.name === "string" ? (node.table.name as string) : (typeof node.table === "string" ? (node.table as string) : null);
+            if (tName && typeof node.table.start === "number") {
+                tStart = node.table.start as number;
+                tEnd = typeof node.table.end === "number" ? (node.table.end as number) : (tStart + tName.length);
+                tContext = "insert-target";
+            }
+        } else if (node.type === "DeleteStatement" && node.target) {
+            tName = typeof node.target.name === "string" ? (node.target.name as string) : null;
+            if (tName && typeof node.target.start === "number") {
+                tStart = node.target.start as number;
+                tEnd = typeof node.target.end === "number" ? (node.target.end as number) : (tStart + tName.length);
+                tContext = "delete-target";
+            }
+        }
+
+        if (tName && typeof tStart === "number" && typeof tEnd === "number") {
+            const key = `${tStart}:${tEnd}`;
+            if (!processedTableRefs.has(key)) {
+                processedTableRefs.add(key);
+                const tPos = offsetToPosition(tStart, lineStarts);
+                localRefs.push({
+                    name: normalizeName(tName),
+                    uri: normUri,
+                    line: tPos.line,
+                    start: tStart - lineStarts[tPos.line],
+                    end: tEnd - lineStarts[tPos.line],
+                    kind: "table",
+                    context: tContext,
+                    validateSchema: true
+                });
+            }
+        }
+    });
 
     definitions.set(normUri, defs);
 
