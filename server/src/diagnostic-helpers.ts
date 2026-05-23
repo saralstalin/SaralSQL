@@ -747,14 +747,6 @@ function resolveTableForQualifier(
     }
   }
 
-  if (statement) {
-    const tableCandidates = collectTablesFromAstNode(statement);
-    if (tableCandidates.length === 1 && normalizeName(tableCandidates[0]) === qualifier) {
-      const tableName = normalizeName(tableCandidates[0]);
-      return tablesByName.get(tableName) || tableTypesByName.get(tableName);
-    }
-  }
-
   return null;
 }
 
@@ -800,22 +792,6 @@ function resolveSingleColumnOwner(
     }
 
     if (def?.columns) {
-      const col = def.columns.find((c: any) => normalizeName(c.rawName ?? c.name) === columnName || normalizeName(c.name) === columnName);
-      if (col) {
-        matches.push({ column: col });
-      }
-    }
-  }
-
-  if (matches.length === 0 && statement) {
-    for (const t of collectTablesFromAstNode(statement)) {
-      tableCandidates.add(normalizeName(t));
-    }
-    for (const tbl of tableCandidates) {
-      const def = tablesByName.get(tbl) || tableTypesByName.get(tbl);
-      if (!def?.columns) {
-        continue;
-      }
       const col = def.columns.find((c: any) => normalizeName(c.rawName ?? c.name) === columnName || normalizeName(c.name) === columnName);
       if (col) {
         matches.push({ column: col });

@@ -355,10 +355,12 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
         const e = Number(r?.location?.end);
         return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
       });
-      for (const src of getResolutionSourceColumns(matchedResolution)) {
-        const locs = findColumnInTable(src.table, src.column);
-        if (locs.length > 0) {
-          return locs;
+      if (!matchedResolution?.isUnverifiable) {
+        for (const src of getResolutionSourceColumns(matchedResolution)) {
+          const locs = findColumnInTable(src.table, src.column);
+          if (locs.length > 0) {
+            return locs;
+          }
         }
       }
       const localDefs = (definitions.get(normUri) || []).filter(d => normalizeName(d.name) === word || normalizeName(d.rawName) === word);
@@ -465,10 +467,12 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
           const e = Number(r?.location?.end);
           return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
         });
-        for (const src of getResolutionSourceColumns(matchedResolution)) {
-          const locs = findColumnInTable(src.table, src.column);
-          if (locs.length > 0) {
-            return locs;
+        if (!matchedResolution?.isUnverifiable) {
+          for (const src of getResolutionSourceColumns(matchedResolution)) {
+            const locs = findColumnInTable(src.table, src.column);
+            if (locs.length > 0) {
+              return locs;
+            }
           }
         }
         if (parsed?.scope?.root) {
@@ -952,8 +956,20 @@ function getUpdateSetTargetTable(parsed: ParseResult | null, offset: number): st
       const last = node.assignments[node.assignments.length - 1];
       const inSetList = typeof first?.start === "number" && typeof last?.end === "number" && offset >= first.start && offset <= last.end;
       if (inSetList) {
-        match = node;
-        return;
+        let insideRhs = false;
+        for (const assignment of node.assignments) {
+          const expr = assignment.expression ?? assignment.value ?? assignment.right;
+          if (expr && typeof expr.start === "number" && typeof expr.end === "number") {
+            if (offset >= expr.start && offset <= expr.end) {
+              insideRhs = true;
+              break;
+            }
+          }
+        }
+        if (!insideRhs) {
+          match = node;
+          return;
+        }
       }
     }
 
@@ -1319,57 +1335,6 @@ function getStatementTableCandidatesFromAst(parsed: any, offset: number): string
   return collectTablesFromAstNode(stmt);
 }
 
-function getUpdateTargetTableAtOffset(parsed: ParseResult | null, offset: number): string | null {
-  const stmt = getContainingStatementNode(parsed?.ast, offset);
-  if (!stmt || stmt.type !== "UpdateStatement") {
-    return null;
-  }
-
-  const target = stmt.target;
-  if (typeof target?.name === "string") {
-    return normalizeName(target.name);
-  }
-  return null;
-}
-
-function getDeepestSelectNode(ast: any, offset: number): any | null {
-  let best: any | null = null;
-
-  const visit = (node: any): void => {
-    if (!node || typeof node !== "object") {
-      return;
-    }
-
-    if (
-      node.type === "SelectStatement" &&
-      typeof node.start === "number" &&
-      typeof node.end === "number" &&
-      offset >= node.start &&
-      offset <= node.end
-    ) {
-      if (!best || (node.end - node.start) < (best.end - best.start)) {
-        best = node;
-      }
-    }
-
-    if (Array.isArray(node)) {
-      for (const item of node) {
-        visit(item);
-      }
-      return;
-    }
-
-    for (const value of Object.values(node)) {
-      if (value && typeof value === "object") {
-        visit(value);
-      }
-    }
-  };
-
-  visit(ast);
-  return best;
-}
-
 function getResolutionSourceColumns(resolution: any): Array<{ table: string; column: string }> {
   const out: Array<{ table: string; column: string }> = [];
   const seen = new Set<string>();
@@ -1476,26 +1441,7 @@ function findStatementLocalColumnOwner(
       if (hasLocalOwner) {
         break;
       }
-      if (String(scope.name ?? "").toLowerCase() === "subquery") {
-        break;
-      }
       scope = scope.parent ?? null;
-    }
-  }
-
-  if (tableCandidates.size === 0 && parsed && typeof offset === "number") {
-    const updateTarget = getUpdateTargetTableAtOffset(parsed, offset);
-    if (updateTarget) {
-      tableCandidates.add(updateTarget);
-    }
-  }
-
-  if (tableCandidates.size === 0 && parsed && typeof offset === "number") {
-    const selectNode = getDeepestSelectNode(parsed.ast, offset);
-    if (selectNode) {
-      for (const t of collectTablesFromAstNode(selectNode)) {
-        tableCandidates.add(t);
-      }
     }
   }
 
@@ -1504,7 +1450,7 @@ function findStatementLocalColumnOwner(
     const stripped = tbl.replace(/^dbo\./, "");
     const def = tablesByName.get(tbl) || tableTypesByName.get(tbl) || tablesByName.get(stripped) || tableTypesByName.get(stripped);
     if (!def?.columns) {
-      continue;
+            continue;
     }
 
     const col = def.columns.find(c => normalizeName(c.name) === colNorm);
@@ -1792,23 +1738,25 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
         const e = Number(r?.location?.end);
         return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
       });
-      for (const src of getResolutionSourceColumns(matchedResolution)) {
-        const key = `${src.table}.${src.column}`;
-        const byUri = referencesIndex.get(key);
-        const localArr = byUri?.get(normUri) ?? [];
-        if (localArr.length > 0) {
-          for (const r of localArr) {
-            pushLocFromRef(r);
-          }
-          return results;
-        }
-        if (byUri) {
-          for (const arr of byUri.values()) {
-            for (const r of arr) {
+      if (!matchedResolution?.isUnverifiable) {
+        for (const src of getResolutionSourceColumns(matchedResolution)) {
+          const key = `${src.table}.${src.column}`;
+          const byUri = referencesIndex.get(key);
+          const localArr = byUri?.get(normUri) ?? [];
+          if (localArr.length > 0) {
+            for (const r of localArr) {
               pushLocFromRef(r);
             }
+            return results;
           }
-          return results;
+          if (byUri) {
+            for (const arr of byUri.values()) {
+              for (const r of arr) {
+                pushLocFromRef(r);
+              }
+            }
+            return results;
+          }
         }
       }
     }
@@ -1890,6 +1838,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
         const e = Number(r?.location?.end);
         return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
       });
+    if (!matchedResolution?.isUnverifiable) {
       for (const src of getResolutionSourceColumns(matchedResolution)) {
         const def = tablesByName.get(src.table) || tableTypesByName.get(src.table);
         if (!def?.columns) {
@@ -1904,6 +1853,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
         const value = `**Column** \`${colDef.rawName}\`${typePart}\n\nDefined in **${kindLabel}** \`${def.rawName ?? def.name}\``;
         return { contents: { kind: MarkupKind.Markdown, value }, range };
       }
+    }
       const def = tablesByName.get(word) || tableTypesByName.get(word);
       if (def && def.columns) {
         const rows = def.columns.map(c => `- \`${c.rawName}\`${c.type ? ` ${c.type}` : ""}`);
@@ -2576,6 +2526,29 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
           if (hasResolvedColumnInput) {
             if (hasValidatedResolvedInput) {
               continue;
+            }
+            
+            // The parser resolved the column, but it failed schema validation.
+            // Emit the exact error so the user sees the typo!
+            for (const input of matchedResolution.inputs) {
+              if (input?.kind !== "column" || !input?.source || !input?.name) {continue};
+              const srcTable = normalizeName(String(input.source));
+              const srcCol = normalizeName(String(input.name).split(".").pop() ?? "");
+              if (!srcTable || !srcCol) {continue};
+              if (String(input.sourceKind ?? "table") !== "table") {continue};
+              
+              if (!tableExists(srcTable)) {
+                const tableRef = getSchemaEquivalentTableRefCandidates(srcTable)
+                  .find((r) => r.context === "insert-target" && r.validateSchema !== false)
+                  ?? getSchemaEquivalentTableRefCandidates(srcTable).find((r) => r.validateSchema !== false);
+                if (tableRef) {
+                  addUnknownTable(tableRef.name, tableRef.line, tableRef.start, tableRef.end);
+                } else {
+                  addUnknownTable(srcTable, ref.line, ref.start, ref.end, true);
+                }
+              } else if (!columnExists(srcTable, srcCol)) {
+                addWrongColumn(srcTable, srcCol, ref.line, ref.start, ref.end, getDisplayTableName(srcTable));
+              }
             }
             continue;
           }

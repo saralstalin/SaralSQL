@@ -459,35 +459,58 @@ export function indexText(uri: string, text: string): void {
             const matchedResolution = resolutions.find((r: any) => r.location?.start === ref.location.start);
             let resolved = false;
 
-            if (matchedResolution && matchedResolution.inputs) {
-                for (const input of matchedResolution.inputs) {
-                    if (input.kind === "column" && input.source) {
-                        localRefs.push({
-                            name: `${normalizeName(input.source)}.${normalizeName(input.name.split('.').pop()!)}`,
-                            uri: normUri,
-                            line: refPos.line,
-                            start: startChar,
-                            end: endChar,
-                            kind: "column",
-                            validateSchema: tablesByName.has(normalizeName(String(input.source))) || tableTypesByName.has(normalizeName(String(input.source)))
-                        });
-                        resolved = true;
-                    } else if (input.kind === "variable") {
-                        localRefs.push({
-                            name: input.name.toLowerCase(),
-                            uri: normUri,
-                            line: refPos.line,
-                            start: startChar,
-                            end: endChar,
-                            kind: "parameter"
-                        });
-                        resolved = true;
+            if (matchedResolution && !matchedResolution.isUnverifiable) {
+                if (matchedResolution.inputs) {
+                    for (const input of matchedResolution.inputs) {
+                        if (input.kind === "column" && input.source) {
+                            localRefs.push({
+                                name: `${normalizeName(input.source)}.${normalizeName(input.name.split('.').pop()!)}`,
+                                uri: normUri,
+                                line: refPos.line,
+                                start: startChar,
+                                end: endChar,
+                                kind: "column",
+                                validateSchema: tablesByName.has(normalizeName(String(input.source))) || tableTypesByName.has(normalizeName(String(input.source)))
+                            });
+                            resolved = true;
+                        } else if (input.kind === "variable") {
+                            localRefs.push({
+                                name: input.name.toLowerCase(),
+                                uri: normUri,
+                                line: refPos.line,
+                                start: startChar,
+                                end: endChar,
+                                kind: "parameter"
+                            });
+                            resolved = true;
+                        }
+                    }
+                }
+                
+                if (!resolved) {
+                    const fallbackCandidates = (matchedResolution as any).candidates ?? (matchedResolution as any).ambiguityCandidates ?? [];
+                    if (fallbackCandidates.length > 0) {
+                        const c = fallbackCandidates[0];
+                        const srcTable = c.source ?? c.table ?? c.owner;
+                        const srcCol = c.name ?? c.column;
+                        if (srcTable && srcCol) {
+                            localRefs.push({
+                                name: `${normalizeName(srcTable)}.${normalizeName(srcCol.split('.').pop()!)}`,
+                                uri: normUri,
+                                line: refPos.line,
+                                start: startChar,
+                                end: endChar,
+                                kind: "column",
+                                validateSchema: false
+                            });
+                            resolved = true;
+                        }
                     }
                 }
             }
 
-                if (!resolved) {
-                    // Scope-based fallback resolution
+            if (!resolved) {
+                // Scope-based fallback resolution
                     if (parts.length === 2) {
                     const aliasOrTable = parts[0].trim();
                     const col = parts[1].trim();
@@ -530,13 +553,6 @@ export function indexText(uri: string, text: string): void {
                 } else if (parts.length === 1) {
                     const colNorm = normalizeName(parts[0]);
                     const candidateTables = collectBareColumnCandidateTablesIncremental(scopeAtPos, colNorm);
-
-                    if (candidateTables.length === 0) {
-                        const updateTarget = resolveUpdateTargetTableAtOffsetFromAst(parsed.ast, parsed.scope?.root, ref.location.start);
-                        if (updateTarget) {
-                            candidateTables.push(normalizeName(updateTarget));
-                        }
-                    }
 
                     if (candidateTables.length > 0) {
                         for (const t of candidateTables) {
@@ -597,39 +613,6 @@ export function indexText(uri: string, text: string): void {
     }
 }
 
-function resolveUpdateTargetTableAtOffsetFromAst(
-    ast: ParseResult["ast"] | null,
-    rootScope: any,
-    offset: number
-): string | null {
-    if (!ast || !rootScope || typeof offset !== "number") {
-        return null;
-    }
-
-    let best: any = null;
-    walkAst(ast, (node: any) => {
-        if (!node || node.type !== "UpdateStatement") {
-            return;
-        }
-        if (typeof node.start !== "number" || typeof node.end !== "number") {
-            return;
-        }
-        if (offset < node.start || offset > node.end) {
-            return;
-        }
-        if (!best || (node.end - node.start) < (best.end - best.start)) {
-            best = node;
-        }
-    });
-
-    if (!best) {
-        return null;
-    }
-
-    const resolved = resolveUpdateTargetTable(best as UpdateNode, rootScope);
-    return resolved ? normalizeName(resolved) : null;
-}
-
 function collectBareColumnCandidateTablesIncremental(scopeAtPos: any, colNorm: string): string[] {
     const out: string[] = [];
     let scope = scopeAtPos;
@@ -663,10 +646,6 @@ function collectBareColumnCandidateTablesIncremental(scopeAtPos: any, colNorm: s
 
         if (level.size > 0) {
             out.push(...Array.from(level.values()));
-            return out;
-        }
-
-        if (String(scope.name ?? "").toLowerCase() === "subquery") {
             return out;
         }
 
