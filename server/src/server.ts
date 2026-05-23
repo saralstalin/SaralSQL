@@ -37,7 +37,6 @@ import {
   , offsetAt
   , getLineStarts
   , offsetToPosition
-  , isDatePartArgument
 } from "./text-utils";
 import {
   setIndexReady
@@ -2242,26 +2241,11 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
     for (const diag of semanticDiags) {
       const diagnostic = toDiagnostic(diag, "SaralSQL Parser");
       if (diagnostic && !shouldSuppressDiagnosticCode(String((diag as any).code ?? diagnostic.code ?? ""), disabledDiagnosticCodes)) {
-        if (diagnostic.code === SARAL_DIAGNOSTIC_CODES.UnknownColumn && typeof diag.start === "number") {
-          const match = /Unknown column '([^']+)'/i.exec(diagnostic.message);
-          if (match && isDatePartArgument(text, diag.start as number, match[1])) {
-            continue;
-          }
-
-          const deepestSelect = getDeepestSelectNode(parsed.ast, diag.start as number);
-          let hasTableVar = false;
-          if (deepestSelect && Array.isArray(deepestSelect.from)) {
-            for (const f of deepestSelect.from) {
-              const tName = typeof f.table === "string" ? f.table : f.table?.name;
-              if (typeof tName === "string" && tName.startsWith("@")) {
-                hasTableVar = true;
-                break;
-              }
+          if ((diagnostic.code === SARAL_DIAGNOSTIC_CODES.UnknownColumn || diagnostic.code === SARAL_DIAGNOSTIC_CODES.AmbiguousColumn) && typeof diag.start === "number") {
+            const resolution = parsed.columns?.resolutions?.find((r: any) => r.location?.start === diag.start);
+            if (resolution?.isUnverifiable) {
+              continue;
             }
-          }
-          if (hasTableVar) {
-            continue;
-          }
         }
         
         diagnostics.push(diagnostic);
@@ -2668,13 +2652,13 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
 
       visitScope(parsed.scope.root);
 
-      for (const diag of collectAmbiguousColumnDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL", diagnosticSeverityOverrides, text)) {
+      for (const diag of collectAmbiguousColumnDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL", diagnosticSeverityOverrides)) {
         if (!shouldSuppressDiagnosticCode(String((diag as any).code ?? ""), disabledDiagnosticCodes)) {
           diagnostics.push(diag);
         }
       }
 
-      for (const diag of collectReadableBareColumnDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL", diagnosticSeverityOverrides, text)) {
+      for (const diag of collectReadableBareColumnDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL", diagnosticSeverityOverrides)) {
         if (!shouldSuppressDiagnosticCode(String((diag as any).code ?? ""), disabledDiagnosticCodes)) {
           diagnostics.push(diag);
         }

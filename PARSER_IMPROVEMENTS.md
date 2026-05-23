@@ -27,6 +27,11 @@ The previously tracked 7 improvement areas are now covered by parser output and 
 - `OUTPUT` clause semantics now include direct qualified pseudo-table references such as `inserted.<col>` and `deleted.<col>`.
 - `INSERT` target-table reference identity/range is hardened for reliable diagnostics anchoring on the target table token.
 - Bare-column semantics now expose probable lineage candidates and single-source promotion when exactly one viable owner exists in scope.
+- CTE scopes inside `RETURN (WITH ... SELECT ...)` inline function bodies are properly pushed into semantic scope.
+- SQLCMD preprocessing (`:r`, `:setvar`, `$(Var)`) is supported with perfect offset mapping back to raw text.
+- Built-in date function date-parts (e.g. `day` in `DATEDIFF`) are safely parsed as `BuiltInArgumentNode`.
+- Bare columns over unverifiable sources (e.g. table variables) are flagged as `isUnverifiable` to prevent outer-scope leakage false positives.
+- `extractReferences` and `documentSymbols` deeply traverse into `TRY...CATCH` blocks, `WHILE` loops, and `RETURN` bodies.
 
 ## Workaround Policy
 
@@ -38,59 +43,4 @@ The previously tracked 7 improvement areas are now covered by parser output and 
 
 ## Next Candidate Improvements
 
-1. Ensure CTE scope symbols are emitted consistently inside function-return query bodies.
-   - Example shape:
-     - `CREATE FUNCTION ... RETURNS TABLE AS RETURN (WITH cteX AS (...) SELECT ... FROM cteX)`
-   - Current gap:
-     - parser may emit `FROM cteX` references without surfacing corresponding `CTE` symbol metadata in scope for this function-return form.
-   - Desired behavior:
-     - CTE definitions inside function-return query bodies should appear in semantic scope the same way they do in top-level/view/procedure query contexts.
-   - Why this matters:
-     - avoids LSP fallback text-pattern CTE suppression in schema validation and keeps CTE ownership/parser lineage parser-native.
-
-2. Add SQLCMD-aware preprocessing with source mapping.
-   - Scope:
-     - directives such as `:r`, `:setvar`, and `$(Var)` substitution semantics (with batch/preprocess behavior compatible enough for editor workflows).
-   - Desired parser contract:
-     - preprocess SQLCMD input into parseable SQL,
-     - preserve a source map from preprocessed text back to original files/offsets (including `:r` includes),
-     - expose directive/expansion diagnostics in a parser-consumable form.
-   - Why this matters:
-     - SQLCMD changes the effective token stream before SQL parsing; parser-native preprocessing avoids LSP-only hacks across diagnostics/hover/definition/reference.
-
-3. Correctly classify unquoted special keywords in built-in functions.
-   - Scope:
-     - Built-in date functions like `DATEDIFF`, `DATEADD`, `DATEPART`, and `DATENAME` which take unquoted interval keywords (`day`, `month`, `yy`, etc.) as their first argument.
-     - Data type arguments in `CAST`, `TRY_CAST`, `CONVERT`, `TRY_CONVERT`, `PARSE`, and `TRY_PARSE`.
-     - ODBC canonical date/time functions like `{fn TIMESTAMPADD(...) }` and `{fn EXTRACT(...) }`.
-     - Special string/analytical function keywords like `BOTH`/`LEADING`/`TRAILING` in `TRIM` and structural keywords in `WITHIN GROUP`.
-   - Current gap:
-     - The parser's lexer currently classifies many of these unquoted special arguments (especially date parts and ODBC intervals) as standard `Identifier` nodes (columns). The semantic engine then reports them as missing columns because they naturally don't exist in the query's tables.
-   - Desired parser contract:
-     - The parser should recognize these specific function signatures grammatically and classify the special arguments as distinct node types (e.g., `DatePartKeyword`, `DataType`, or `BuiltInArgument`), explicitly excluding them from column reference extraction and semantic validation.
-   - Why this matters:
-     - Removes the need for fragile, text-based regex lookbehinds (e.g., `isDatePartArgument`) in the LSP extension.
-     - Suppresses false-positive "Unknown column" diagnostics organically.
-     - Prevents these keywords from improperly polluting the LSP symbol references index.
-
-4. Prevent outer-scope column leakage when inner scope contains unresolved table variables.
-   - Scope:
-     - Queries containing table variables (`@TempTable`) or unresolved temporary tables inside subqueries or derived tables.
-   - Current gap:
-     - When the parser's semantic engine encounters a bare column in a subquery reading from a table variable, it cannot verify the column locally. It then falls back to searching outer scopes, mistakenly binding the column to an outer table (e.g., `TableB`) and emitting a false-positive `Unknown column '...' in 'OuterTable'` diagnostic.
-   - Desired parser contract:
-     - The parser's semantic engine should halt outer-scope fallback for bare columns if the current scope contains unresolved schema sources (like table variables), or it should flag them in a lower-confidence "unverifiable" state rather than emitting a strict outer-table error.
-   - Why this matters:
-     - Removes the need for the AST-traversal suppression workaround (`hasTableVar`) in the LSP extension's diagnostic collection.
-     - Prevents confusing outer-reference error messages for entirely local columns.
-
-5. Extract AST references inside `TRY...CATCH` blocks.
-   - Scope:
-     - Statements located inside the `tryBlock` or `catchBlock` of a `TryCatchStatement` (and potentially other control flow blocks).
-   - Current gap:
-     - The parser's `extractReferences` utility does not recursively traverse into `TryCatchStatement` bodies, meaning table references inside them are omitted from the returned list.
-   - Desired parser contract:
-     - The parser should recursively extract references from all nested blocks across all statement types.
-   - Why this matters:
-     - Prevents the LSP from falling back to placing "Unknown table" errors on column references when the actual table reference coordinates are missing.
-     - Ensures `Go to Definition` and references indexing work consistently for tables inside error handling blocks.
+*(No pending items - all parser issues currently tracked have been resolved and consumed by the LSP!)*

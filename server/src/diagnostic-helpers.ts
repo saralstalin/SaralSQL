@@ -1,5 +1,5 @@
 import { CodeAction, CodeActionKind, Diagnostic, DiagnosticSeverity, TextEdit } from "vscode-languageserver/node";
-import { isSqlKeyword, normalizeName, offsetToPosition, isDatePartArgument } from "./text-utils";
+import { isSqlKeyword, normalizeName, offsetToPosition } from "./text-utils";
 import { getCteColumns, getDisplaySymbolName, resolveAliasTableName } from "./ast-utils";
 import { extractReferences } from "@saralsql/tsql-parser";
 
@@ -169,8 +169,7 @@ export function collectAmbiguousColumnDiagnostics(
   tablesByName: Map<string, any>,
   tableTypesByName: Map<string, any>,
   source = "SaralSQL",
-  severityOverrides = new Map<string, DiagnosticSeverity>(),
-  text?: string
+  severityOverrides = new Map<string, DiagnosticSeverity>()
 ): Diagnostic[] {
   if (!parsed?.ast || !parsed?.scope?.root) {
     return [];
@@ -193,12 +192,12 @@ export function collectAmbiguousColumnDiagnostics(
     if (!name || name.includes(".") || name.startsWith("@") || isSqlKeyword(normalizeName(name))) {
       continue;
     }
-    if (isDatePartArgument(text, ref.location.start as number, name)) {
-      continue;
-    }
 
     const matchedResolution = resolutions.find((r: any) => r.location?.start === ref.location.start);
     const resolvedSources = new Set<string>();
+    if (matchedResolution?.isUnverifiable) {
+      continue;
+    }
     if (matchedResolution?.inputs) {
       for (const input of matchedResolution.inputs) {
         if (input.kind === "column" && input.source) {
@@ -303,8 +302,7 @@ export function collectReadableBareColumnDiagnostics(
   tablesByName: Map<string, any>,
   tableTypesByName: Map<string, any>,
   source = "SaralSQL",
-  severityOverrides = new Map<string, DiagnosticSeverity>(),
-  text?: string
+  severityOverrides = new Map<string, DiagnosticSeverity>()
 ): Diagnostic[] {
   if (!parsed?.ast || !parsed?.scope?.root) {
     return [];
@@ -328,9 +326,6 @@ export function collectReadableBareColumnDiagnostics(
     if (!name || name.includes(".") || name.startsWith("@") || isSqlKeyword(normalizeName(name))) {
       continue;
     }
-    if (isDatePartArgument(text, ref.location.start as number, name)) {
-      continue;
-    }
     if (qualifiedIdentifierStarts.has(ref.location.start)) {
       continue;
     }
@@ -340,6 +335,10 @@ export function collectReadableBareColumnDiagnostics(
 
     const scopeAtPos = parsed.scope.root.findInnermost?.(ref.location.start) ?? parsed.scope.root;
     const colNorm = normalizeName(name);
+    const matchedResolution = parsed?.columns?.resolutions?.find((r: any) => r.location?.start === ref.location.start);
+    if (matchedResolution?.isUnverifiable) {
+      continue;
+    }
     const matches = collectReadableAliasMatchesIncremental(scopeAtPos, colNorm, tablesByName, tableTypesByName);
 
     if (matches.length !== 1) {
