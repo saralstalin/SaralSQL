@@ -56,6 +56,22 @@ const SQL_KEYWORDS = new Set([
     "cursor", "fetch", "open", "close", "deallocate", "print"
 ]);
 
+const DATE_PARTS = new Set([
+    "year", "yy", "yyyy", "quarter", "qq", "q", "month", "mm", "m",
+    "dayofyear", "dy", "y", "day", "dd", "d", "week", "wk", "ww",
+    "weekday", "dw", "w", "hour", "hh", "minute", "mi", "n",
+    "second", "ss", "s", "millisecond", "ms", "microsecond", "mcs",
+    "nanosecond", "ns", "tzoffset", "tz", "iso_week", "isowk", "isow"
+]);
+
+export function isDatePartArgument(text: string | undefined, start: number, colName: string): boolean {
+    if (!text) { return false; }
+    const norm = normalizeName(colName);
+    if (!DATE_PARTS.has(norm)) { return false; }
+    const prefix = text.substring(Math.max(0, start - 80), start);
+    return /(?:dateadd|datediff|datediff_big|datename|datepart|datetrunc)\s*\(\s*(?:\/\*[\s\S]*?\*\/\s*)?$/i.test(prefix);
+}
+
 export function normalizeName(name: string): string {
     if (!name) { return ""; }
 
@@ -141,7 +157,7 @@ export function offsetToPosition(offset: number, lineStarts: number[]): { line: 
         } else {
             high = mid - 1;
         }
-    }
+   }
     const line = Math.max(0, high);
     const character = offset - lineStarts[line];
     return { line, character };

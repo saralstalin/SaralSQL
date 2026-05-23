@@ -1,5 +1,5 @@
 import { CodeAction, CodeActionKind, Diagnostic, DiagnosticSeverity, TextEdit } from "vscode-languageserver/node";
-import { isSqlKeyword, normalizeName, offsetToPosition } from "./text-utils";
+import { isSqlKeyword, normalizeName, offsetToPosition, isDatePartArgument } from "./text-utils";
 import { getCteColumns, getDisplaySymbolName, resolveAliasTableName } from "./ast-utils";
 import { extractReferences } from "@saralsql/tsql-parser";
 
@@ -169,7 +169,8 @@ export function collectAmbiguousColumnDiagnostics(
   tablesByName: Map<string, any>,
   tableTypesByName: Map<string, any>,
   source = "SaralSQL",
-  severityOverrides = new Map<string, DiagnosticSeverity>()
+  severityOverrides = new Map<string, DiagnosticSeverity>(),
+  text?: string
 ): Diagnostic[] {
   if (!parsed?.ast || !parsed?.scope?.root) {
     return [];
@@ -190,6 +191,9 @@ export function collectAmbiguousColumnDiagnostics(
 
     const name = String(ref.name ?? "");
     if (!name || name.includes(".") || name.startsWith("@") || isSqlKeyword(normalizeName(name))) {
+      continue;
+    }
+    if (isDatePartArgument(text, ref.location.start as number, name)) {
       continue;
     }
 
@@ -299,7 +303,8 @@ export function collectReadableBareColumnDiagnostics(
   tablesByName: Map<string, any>,
   tableTypesByName: Map<string, any>,
   source = "SaralSQL",
-  severityOverrides = new Map<string, DiagnosticSeverity>()
+  severityOverrides = new Map<string, DiagnosticSeverity>(),
+  text?: string
 ): Diagnostic[] {
   if (!parsed?.ast || !parsed?.scope?.root) {
     return [];
@@ -321,6 +326,9 @@ export function collectReadableBareColumnDiagnostics(
 
     const name = String(ref.name ?? "");
     if (!name || name.includes(".") || name.startsWith("@") || isSqlKeyword(normalizeName(name))) {
+      continue;
+    }
+    if (isDatePartArgument(text, ref.location.start as number, name)) {
       continue;
     }
     if (qualifiedIdentifierStarts.has(ref.location.start)) {

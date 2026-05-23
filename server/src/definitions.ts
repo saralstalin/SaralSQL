@@ -4,6 +4,7 @@ import {
     , getLineStarts
     , offsetToPosition
     , isSqlKeyword
+    , isDatePartArgument
 } from "./text-utils";
 import * as url from "url";
 import { walkAst, resolveAliasTableName, resolveSymbolCaseInsensitive } from "./ast-utils";
@@ -444,6 +445,9 @@ export function indexText(uri: string, text: string): void {
                 kind: "parameter"
             });
         } else if (ref.kind === "column" || ref.kind === "unknown") {
+            if (isDatePartArgument(text, ref.location.start, ref.name)) {
+                continue;
+            }
             const colName = ref.name.split('.').pop()!;
             const colNameNorm = normalizeName(colName);
             if (isSqlKeyword(colNameNorm)) {

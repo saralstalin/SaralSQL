@@ -37,6 +37,7 @@ import {
   , offsetAt
   , getLineStarts
   , offsetToPosition
+  , isDatePartArgument
 } from "./text-utils";
 import {
   setIndexReady
@@ -2241,6 +2242,28 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
     for (const diag of semanticDiags) {
       const diagnostic = toDiagnostic(diag, "SaralSQL Parser");
       if (diagnostic && !shouldSuppressDiagnosticCode(String((diag as any).code ?? diagnostic.code ?? ""), disabledDiagnosticCodes)) {
+        if (diagnostic.code === SARAL_DIAGNOSTIC_CODES.UnknownColumn && typeof diag.start === "number") {
+          const match = /Unknown column '([^']+)'/i.exec(diagnostic.message);
+          if (match && isDatePartArgument(text, diag.start as number, match[1])) {
+            continue;
+          }
+
+          const deepestSelect = getDeepestSelectNode(parsed.ast, diag.start as number);
+          let hasTableVar = false;
+          if (deepestSelect && Array.isArray(deepestSelect.from)) {
+            for (const f of deepestSelect.from) {
+              const tName = typeof f.table === "string" ? f.table : f.table?.name;
+              if (typeof tName === "string" && tName.startsWith("@")) {
+                hasTableVar = true;
+                break;
+              }
+            }
+          }
+          if (hasTableVar) {
+            continue;
+          }
+        }
+        
         diagnostics.push(diagnostic);
       }
     }
@@ -2294,15 +2317,11 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         if (shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.UnknownTable, disabledDiagnosticCodes)) {return;}
 
         const clean = normalizeName(name);
-        const preferredRef = getSchemaEquivalentTableRefCandidates(clean)
-          .find((r) => r.validateSchema !== false && (r.context === "insert-target" || r.context === "from" || r.context === "join" || r.context === "update-target" || r.context === "delete-target"))
-          ?? getSchemaEquivalentTableRefCandidates(clean).find((r) => r.validateSchema !== false);
-        if (preferredRef) {
-          startLine = preferredRef.line;
-          startChar = preferredRef.start;
-          endLine = preferredRef.line;
-          endChar = preferredRef.end;
-        }
+        
+        const key = `${clean}:${startLine}:${startChar}`;
+        if (seenTables.has(key)) {return;}
+        seenTables.add(key);
+
         const refOffset = (lineStarts[startLine] ?? 0) + startChar;
         if (resolveCteSymbolAtOffset(clean, refOffset)) {return;}
         if (cteNames.has(clean)) {return;}
@@ -2310,9 +2329,6 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         if (clean.startsWith("#") || clean.startsWith("@")) {return;}
         if (isSystemTableReference(clean)) {return;}
         if (tableExists(clean)) {return;}
-
-        if (seenTables.has(clean)) {return;}
-        seenTables.add(clean);
 
         diagnostics.push({
           code: SARAL_DIAGNOSTIC_CODES.UnknownTable,
@@ -2637,13 +2653,13 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
 
       visitScope(parsed.scope.root);
 
-      for (const diag of collectAmbiguousColumnDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL", diagnosticSeverityOverrides)) {
+      for (const diag of collectAmbiguousColumnDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL", diagnosticSeverityOverrides, text)) {
         if (!shouldSuppressDiagnosticCode(String((diag as any).code ?? ""), disabledDiagnosticCodes)) {
           diagnostics.push(diag);
         }
       }
 
-      for (const diag of collectReadableBareColumnDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL", diagnosticSeverityOverrides)) {
+      for (const diag of collectReadableBareColumnDiagnostics(parsed, lineStarts, tablesByName, tableTypesByName, "SaralSQL", diagnosticSeverityOverrides, text)) {
         if (!shouldSuppressDiagnosticCode(String((diag as any).code ?? ""), disabledDiagnosticCodes)) {
           diagnostics.push(diag);
         }

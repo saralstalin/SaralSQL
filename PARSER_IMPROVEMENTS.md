@@ -57,3 +57,29 @@ The previously tracked 7 improvement areas are now covered by parser output and 
      - expose directive/expansion diagnostics in a parser-consumable form.
    - Why this matters:
      - SQLCMD changes the effective token stream before SQL parsing; parser-native preprocessing avoids LSP-only hacks across diagnostics/hover/definition/reference.
+
+3. Correctly classify unquoted special keywords in built-in functions.
+   - Scope:
+     - Built-in date functions like `DATEDIFF`, `DATEADD`, `DATEPART`, and `DATENAME` which take unquoted interval keywords (`day`, `month`, `yy`, etc.) as their first argument.
+     - Data type arguments in `CAST`, `TRY_CAST`, `CONVERT`, `TRY_CONVERT`, `PARSE`, and `TRY_PARSE`.
+     - ODBC canonical date/time functions like `{fn TIMESTAMPADD(...) }` and `{fn EXTRACT(...) }`.
+     - Special string/analytical function keywords like `BOTH`/`LEADING`/`TRAILING` in `TRIM` and structural keywords in `WITHIN GROUP`.
+   - Current gap:
+     - The parser's lexer currently classifies many of these unquoted special arguments (especially date parts and ODBC intervals) as standard `Identifier` nodes (columns). The semantic engine then reports them as missing columns because they naturally don't exist in the query's tables.
+   - Desired parser contract:
+     - The parser should recognize these specific function signatures grammatically and classify the special arguments as distinct node types (e.g., `DatePartKeyword`, `DataType`, or `BuiltInArgument`), explicitly excluding them from column reference extraction and semantic validation.
+   - Why this matters:
+     - Removes the need for fragile, text-based regex lookbehinds (e.g., `isDatePartArgument`) in the LSP extension.
+     - Suppresses false-positive "Unknown column" diagnostics organically.
+     - Prevents these keywords from improperly polluting the LSP symbol references index.
+
+4. Prevent outer-scope column leakage when inner scope contains unresolved table variables.
+   - Scope:
+     - Queries containing table variables (`@TempTable`) or unresolved temporary tables inside subqueries or derived tables.
+   - Current gap:
+     - When the parser's semantic engine encounters a bare column in a subquery reading from a table variable, it cannot verify the column locally. It then falls back to searching outer scopes, mistakenly binding the column to an outer table (e.g., `TableB`) and emitting a false-positive `Unknown column '...' in 'OuterTable'` diagnostic.
+   - Desired parser contract:
+     - The parser's semantic engine should halt outer-scope fallback for bare columns if the current scope contains unresolved schema sources (like table variables), or it should flag them in a lower-confidence "unverifiable" state rather than emitting a strict outer-table error.
+   - Why this matters:
+     - Removes the need for the AST-traversal suppression workaround (`hasTableVar`) in the LSP extension's diagnostic collection.
+     - Prevents confusing outer-reference error messages for entirely local columns.
