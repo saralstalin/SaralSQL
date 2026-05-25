@@ -1,7 +1,7 @@
 import * as assert from "assert";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { parseSql } from "../sql-parser";
-import { getDisplaySymbolName, resolveAliasFromAst, resolveColumnFromAst } from "../ast-utils";
+import { getCteColumns, getDisplaySymbolName, resolveAliasFromAst, resolveColumnFromAst } from "../ast-utils";
 import { getLineStarts, normalizeName, offsetAt } from "../text-utils";
 import { collectAmbiguousColumnDiagnostics } from "../diagnostic-helpers";
 import {
@@ -82,6 +82,31 @@ FROM cteEmp c;
   assert.ok(getRefs("cteemp").length > 0, "CTE table references should be indexed");
   assert.ok(getRefs("cteemp.employeeid").length > 0, "CTE projected columns should resolve via alias usage");
   assert.ok(getRefs("cteemp.departmentid").length > 0, "CTE projected columns should resolve via alias usage");
+});
+
+runCase("multi-cte-resolution-relies-on-scope-not-text-fallback", () => {
+  const uri = "file:///regression/multi-cte-scope-only.sql";
+  const sql = `
+WITH c1 AS (
+  SELECT EmployeeId FROM Employee
+),
+c2 AS (
+  SELECT EmployeeId FROM c1
+)
+SELECT EmployeeId
+FROM c2;
+`;
+
+  const parsed = parseSql(sql);
+  const c1 = findSymbol(parsed?.scope?.root, "CTE", "c1");
+  const c2 = findSymbol(parsed?.scope?.root, "CTE", "c2");
+  assert.ok(c1, "First CTE should exist in parser scope");
+  assert.ok(c2, "Second CTE should exist in parser scope");
+  assert.ok(getCteColumns(c2).some(c => normalizeName(c.name) === "employeeid"), "Second CTE should expose projected EmployeeId in scope metadata");
+
+  indexText(uri, sql);
+  assert.ok(getRefs("c1").length > 0, "First CTE should be indexed from parser scope");
+  assert.ok(getRefs("c2").length > 0, "Second CTE should be indexed from parser scope");
 });
 
 runCase("non-build-files-do-not-contribute-workspace-schema", () => {
@@ -536,6 +561,46 @@ END;
   
   const taxRefs = getRefs("@localtax");
   assert.ok(taxRefs.length >= 2, "Variable @LocalTax references should be indexed"); // declaration + usage
+});
+
+runCase("qualified-tvp-columns-do-not-get-overlaid-by-joined-table-lineage", () => {
+  const uri = "file:///regression/qualified-tvp-columns.sql";
+  const sql = `
+CREATE TYPE dbo.TransportRequestsType AS TABLE (
+  EmployeeId INT,
+  RequestDate DATE,
+  PickLocation VARCHAR(100),
+  DropLocation VARCHAR(100)
+);
+CREATE TABLE TransportRequests (
+  RequestId INT PRIMARY KEY,
+  EmployeeId INT NOT NULL,
+  RequestDate DATE NOT NULL,
+  PickLocation VARCHAR(100) NOT NULL,
+  DropLocation VARCHAR(100) NOT NULL
+);
+CREATE PROC testfortemp @temp AS dbo.TransportRequestsType READONLY
+AS
+BEGIN
+  DECLARE @temp2 AS dbo.TransportRequestsType;
+  INSERT INTO @temp2
+  SELECT @temp.EmployeeId, @temp.RequestDate, @temp.PickLocation, @temp.DropLocation
+  FROM @temp
+  JOIN TransportRequests tr ON @temp.EmployeeId = tr.EmployeeId;
+END;
+`;
+
+  indexText(uri, sql);
+  const refs = getReferencesForUri(uri).filter(r => r.kind === "column");
+  const tempEmployeeRefs = refs.filter(r => normalizeName(r.name) === "@temp.employeeid");
+  const overlaidTransportEmployeeRefs = refs.filter(r => normalizeName(r.name) === "transportrequests.employeeid" && r.line === tempEmployeeRefs[0]?.line && r.start === tempEmployeeRefs[0]?.start);
+
+  assert.ok(tempEmployeeRefs.length > 0, "Qualified TVP column should be indexed against @temp");
+  assert.strictEqual(
+    overlaidTransportEmployeeRefs.length,
+    0,
+    "Qualified TVP column token must not be overlaid with joined table lineage at the same location"
+  );
 });
 
 runCase("offset-at-honors-crlf-line-endings", () => {

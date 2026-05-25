@@ -473,6 +473,35 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
             const parts = ref.name.split('.');
             const scopeAtPos = parsed.scope?.root?.findInnermost(ref.location.start);
             const visibleSymbols = scopeAtPos ? scopeAtPos.getVisibleSymbols() : [];
+            const qualifierNorm = parts.length === 2 ? normalizeName(parts[0].trim()) : "";
+            const explicitQualified = parts.length === 2 && qualifierNorm.length > 0;
+            let explicitQualifiedTarget: string | null = null;
+            if (explicitQualified) {
+                if (qualifierNorm.startsWith("@") || qualifierNorm.startsWith("#")) {
+                    explicitQualifiedTarget = qualifierNorm;
+                } else {
+                    for (const sym of visibleSymbols) {
+                        if (sym.kind === "Alias" && normalizeName(sym.name) === qualifierNorm) {
+                            explicitQualifiedTarget = normalizeName(resolveAliasTableName(sym) ?? "");
+                            break;
+                        }
+                        if ((sym.kind === "Table" || sym.kind === "TempTable" || sym.kind === "CTE") && normalizeName(sym.name) === qualifierNorm) {
+                            explicitQualifiedTarget = normalizeName(String(sym.name ?? ""));
+                            break;
+                        }
+                    }
+
+                    if (!explicitQualifiedTarget) {
+                        const fileAliases = aliasesByUri.get(normUri);
+                        const matchedTable = fileAliases?.get(qualifierNorm);
+                        if (matchedTable && matchedTable.toLowerCase() !== "__subquery__") {
+                            explicitQualifiedTarget = normalizeName(matchedTable);
+                        } else {
+                            explicitQualifiedTarget = qualifierNorm;
+                        }
+                    }
+                }
+            }
 
             const matchedResolution = resolutions.find((r: any) => r.location?.start === ref.location.start);
             let resolved = false;
@@ -481,6 +510,12 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                 if (matchedResolution.inputs && matchedResolution.inputs.length > 0) {
                     for (const input of matchedResolution.inputs) {
                         if (input.kind === "column" && input.source) {
+                            if (explicitQualifiedTarget) {
+                                const inputSourceNorm = normalizeName(String(input.source));
+                                if (inputSourceNorm !== explicitQualifiedTarget) {
+                                    continue;
+                                }
+                            }
                             localRefs.push({
                                 name: `${normalizeName(input.source)}.${normalizeName(input.name.split('.').pop()!)}`,
                                 uri: normUri,
@@ -611,8 +646,41 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
 
     definitions.set(normUri, defs);
 
+    const preferredRefs = new Map<string, ReferenceDef[]>();
+    for (const ref of localRefs) {
+        if (ref.kind !== "column") {
+            const bucket = preferredRefs.get(`other:${ref.line}:${ref.start}:${ref.end}:${ref.kind}`) ?? [];
+            bucket.push(ref);
+            preferredRefs.set(`other:${ref.line}:${ref.start}:${ref.end}:${ref.kind}`, bucket);
+            continue;
+        }
+
+        const key = `${ref.line}:${ref.start}:${ref.end}:column`;
+        const bucket = preferredRefs.get(key) ?? [];
+        bucket.push(ref);
+        preferredRefs.set(key, bucket);
+    }
+
+    const normalizedRefs: ReferenceDef[] = [];
+    for (const [key, bucket] of preferredRefs.entries()) {
+        if (!key.endsWith(":column")) {
+            normalizedRefs.push(...bucket);
+            continue;
+        }
+
+        const variableQualified = bucket.filter((r) => {
+            const qualifier = normalizeName(String(r.name).split(".")[0] ?? "");
+            return qualifier.startsWith("@") || qualifier.startsWith("#");
+        });
+        if (variableQualified.length > 0) {
+            normalizedRefs.push(...variableQualified);
+            continue;
+        }
+        normalizedRefs.push(...bucket);
+    }
+
     const byName = new Map<string, ReferenceDef[]>();
-    for (const ref of localRefs) { const arr = byName.get(ref.name) || []; arr.push(ref); byName.set(ref.name, arr); }
+    for (const ref of normalizedRefs) { const arr = byName.get(ref.name) || []; arr.push(ref); byName.set(ref.name, arr); }
     for (const [name, arr] of byName) {
         const seen = new Set<string>();
         const dedup = arr.filter(r => { const k = `${r.line}:${r.start}:${r.end}`; if (seen.has(k)) { return false; } seen.add(k); return true; });

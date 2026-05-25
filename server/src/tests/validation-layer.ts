@@ -340,6 +340,246 @@ runCase("quick-fix-removes-only-nolock-when-other-hints-exist", () => {
   assert.strictEqual(action?.edit?.changes?.[uri]?.[0]?.newText, "WITH (INDEX(IX_Employee_1))");
 });
 
+runCase("ambiguity-not-emitted-for-unaliased-column-from-temp-table-scope", () => {
+  const schemaUri = "file:///validation/temp-scope-schema.sql";
+  const queryUri = "file:///validation/temp-scope-query.sql";
+
+  const schemaSql = `
+CREATE TABLE Employee (
+  EmployeeId INT
+);
+`;
+
+  const querySql = `
+SELECT EmployeeId INTO #EmpTemp FROM Employee;
+SELECT EmployeeId FROM #EmpTemp;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'EmployeeId'")),
+    "Unaliased columns from local temp-table scope should not be reported as ambiguous"
+  );
+});
+
+runCase("ambiguity-not-emitted-for-temp-table-column-with-global-collisions", () => {
+  const schemaUri = "file:///validation/temp-collision-schema.sql";
+  const queryUri = "file:///validation/temp-collision-query.sql";
+
+  const schemaSql = `
+CREATE TABLE Employee (
+  EmployeeId INT
+);
+CREATE TABLE Department (
+  EmployeeId INT
+);
+`;
+
+  const querySql = `
+SELECT EmployeeId INTO #EmpTemp FROM Employee;
+SELECT EmployeeId FROM #EmpTemp;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'EmployeeId'")),
+    "Temp-table local scope must win over unrelated global column owners"
+  );
+});
+
+runCase("ambiguity-not-emitted-for-unaliased-column-from-tvp-variable-scope", () => {
+  const queryUri = "file:///validation/tvp-var-scope-query.sql";
+
+  const querySql = `
+CREATE TYPE dbo.ItemType AS TABLE (
+  ItemId INT,
+  Name NVARCHAR(50)
+);
+GO
+DECLARE @items dbo.ItemType;
+SELECT ItemId FROM @items;
+`;
+
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'ItemId'")),
+    "Unaliased columns from local TVP/table-variable scope should not be reported as ambiguous"
+  );
+});
+
+runCase("ambiguity-not-emitted-for-unaliased-column-from-inline-table-variable-scope", () => {
+  const queryUri = "file:///validation/inline-table-var-scope-query.sql";
+
+  const querySql = `
+DECLARE @items TABLE (
+  ItemId INT,
+  Name NVARCHAR(50)
+);
+SELECT ItemId FROM @items;
+`;
+
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'ItemId'")),
+    "Unaliased columns from inline table-variable scope should not be reported as ambiguous"
+  );
+});
+
+runCase("nested-alias-local-bare-column-does-not-fallback-to-global-collision", () => {
+  const schemaUri = "file:///validation/nested-alias-collision-schema.sql";
+  const queryUri = "file:///validation/nested-alias-collision-query.sql";
+
+  const schemaSql = `
+CREATE TABLE Employee (
+  EmployeeId INT
+);
+CREATE TABLE Department (
+  EmployeeId INT
+);
+`;
+
+  const querySql = `
+DECLARE @items TABLE (
+  EmployeeId INT
+);
+SELECT EmployeeId
+FROM (
+  SELECT i.EmployeeId
+  FROM @items i
+) x;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'EmployeeId'")),
+    "Bare column must resolve within nested/local select scope and not fall back to colliding global owners"
+  );
+});
+
+runCase("table-variable-local-bare-column-in-join-does-not-fallback-to-global-collision", () => {
+  const schemaUri = "file:///validation/table-var-join-local-schema.sql";
+  const queryUri = "file:///validation/table-var-join-local-query.sql";
+
+  const schemaSql = `
+CREATE TABLE Employee (
+  EmployeeId INT,
+  FirstName NVARCHAR(50)
+);
+CREATE TABLE Department (
+  FirstName2 NVARCHAR(50)
+);
+`;
+
+  const querySql = `
+DECLARE @Emp TABLE (
+  EmployeeId INT,
+  FirstName2 NVARCHAR(50)
+);
+
+SELECT te.FirstName2
+FROM @Emp te
+JOIN Employee e ON te.EmployeeId = e.EmployeeId AND e.FirstName <> FirstName2;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'FirstName2'")),
+    "Bare join predicate column should stay local to table-variable scope and must not fallback to colliding global owners"
+  );
+});
+
+runCase("insert-select-bare-columns-do-not-count-insert-target-as-ambiguity-owner", () => {
+  const queryUri = "file:///validation/insert-select-target-leak-query.sql";
+
+  const querySql = `
+CREATE TABLE #TempStoreMigration (
+  StoreId VARCHAR(50),
+  ProcessStatus CHAR(1)
+);
+CREATE TABLE #TempStoreData (
+  StoreId VARCHAR(50)
+);
+
+INSERT INTO #TempStoreData (StoreId)
+SELECT StoreId
+FROM #TempStoreMigration
+WHERE ProcessStatus = 'I';
+`;
+
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'StoreId'")),
+    "INSERT ... SELECT bare source column should not treat insert target as an ambiguity owner"
+  );
+});
+
 runCase("readable-bare-column-not-emitted-for-qualified-derived-join-columns", () => {
   const schemaUri = "file:///validation/readable-derived-schema.sql";
   const queryUri = "file:///validation/readable-derived-query.sql";

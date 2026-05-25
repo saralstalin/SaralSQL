@@ -1,6 +1,7 @@
 import { CodeAction, CodeActionKind, Diagnostic, DiagnosticSeverity, TextEdit } from "vscode-languageserver/node";
 import { isSqlKeyword, normalizeName, offsetToPosition } from "./text-utils";
-import { getCteColumns, getDisplaySymbolName, normalizeAstTableName, resolveAliasTableName } from "./ast-utils";
+import { getCteColumns, getDisplaySymbolName, normalizeAstTableName, resolveAliasTableName, resolveSymbolCaseInsensitive } from "./ast-utils";
+import { collectNearestScopeColumnOwners } from "./scope-column-resolver";
 import { extractReferences } from "@saralsql/tsql-parser";
 
 export const SARAL_DIAGNOSTIC_CODES = {
@@ -180,6 +181,8 @@ export function collectAmbiguousColumnDiagnostics(
   const refs = extractReferences(parsed.ast) ?? [];
   const resolutions = parsed.columns?.resolutions ?? [];
   const orderByAliasStarts = collectOrderByAliasStarts(parsed.ast);
+  const orderByDuplicateAliasStarts = collectOrderByDuplicateAliasStarts(parsed.ast);
+  const insertSelectTargets = collectInsertSelectTargetRanges(parsed.ast);
 
   for (const ref of refs) {
     if (!ref || (ref.kind !== "column" && ref.kind !== "unknown")) {
@@ -193,7 +196,27 @@ export function collectAmbiguousColumnDiagnostics(
     if (!name || name.includes(".") || name.startsWith("@") || isSqlKeyword(normalizeName(name))) {
       continue;
     }
+    const colNorm = normalizeName(name);
     if (orderByAliasStarts.has(ref.location.start)) {
+      continue;
+    }
+    if (orderByDuplicateAliasStarts.has(ref.location.start)) {
+      const startPos = offsetToPosition(ref.location.start, lineStarts);
+      const endPos = offsetToPosition(ref.location.end ?? ref.location.start, lineStarts);
+      const key = `${startPos.line}:${startPos.character}:${colNorm}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        diagnostics.push({
+          code: SARAL_DIAGNOSTIC_CODES.AmbiguousColumn,
+          severity: resolveDiagnosticSeverity(SARAL_DIAGNOSTIC_CODES.AmbiguousColumn, DiagnosticSeverity.Warning, severityOverrides),
+          range: {
+            start: { line: startPos.line, character: startPos.character },
+            end: { line: endPos.line, character: endPos.character }
+          },
+          message: `Ambiguous column '${name}' could refer to multiple sources`,
+          source
+        });
+      }
       continue;
     }
 
@@ -211,8 +234,11 @@ export function collectAmbiguousColumnDiagnostics(
     }
 
     const scopeAtPos = parsed.scope.root.findInnermost?.(ref.location.start) ?? parsed.scope.root;
-    const colNorm = normalizeName(name);
     const owners = collectAmbiguityOwnersIncremental(scopeAtPos, colNorm, tablesByName, tableTypesByName);
+    const insertSelectTarget = findInsertSelectTargetAtOffset(insertSelectTargets, ref.location.start);
+    if (insertSelectTarget) {
+      owners.delete(insertSelectTarget);
+    }
 
     if (owners.size <= 1) {
       continue;
@@ -239,6 +265,60 @@ export function collectAmbiguousColumnDiagnostics(
   }
 
   return diagnostics;
+}
+
+function collectInsertSelectTargetRanges(ast: any): Array<{ start: number; end: number; target: string }> {
+  const out: Array<{ start: number; end: number; target: string }> = [];
+
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+
+    if (node.type === "InsertStatement" && node.selectQuery && typeof node.selectQuery.start === "number" && typeof node.selectQuery.end === "number") {
+      const target = normalizeAstTableName(node.table);
+      const targetNorm = normalizeName(String(target ?? ""));
+      if (targetNorm) {
+        out.push({
+          start: Number(node.selectQuery.start),
+          end: Number(node.selectQuery.end),
+          target: targetNorm
+        });
+      }
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+
+  visit(ast);
+  return out;
+}
+
+function findInsertSelectTargetAtOffset(
+  ranges: Array<{ start: number; end: number; target: string }>,
+  offset: number
+): string | null {
+  let best: { start: number; end: number; target: string } | null = null;
+  for (const range of ranges) {
+    if (offset < range.start || offset > range.end) {
+      continue;
+    }
+    if (!best || (range.end - range.start) < (best.end - best.start)) {
+      best = range;
+    }
+  }
+  return best?.target ?? null;
 }
 
 function collectOrderByAliasStarts(ast: any): Set<number> {
@@ -294,60 +374,117 @@ function collectOrderByAliasStarts(ast: any): Set<number> {
   return starts;
 }
 
+function collectOrderByDuplicateAliasStarts(ast: any): Set<number> {
+  const starts = new Set<number>();
+
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+
+    if (node.type === "SelectStatement" && Array.isArray(node.columns) && Array.isArray(node.orderBy)) {
+      const aliasCounts = new Map<string, number>();
+      for (const col of node.columns) {
+        const alias = normalizeName(String(col?.alias ?? col?.outputName ?? ""));
+        if (alias) {
+          aliasCounts.set(alias, (aliasCounts.get(alias) ?? 0) + 1);
+        }
+      }
+
+      if (aliasCounts.size > 0) {
+        for (const order of node.orderBy) {
+          const expr = order?.expression;
+          if (expr?.type !== "Identifier") {
+            continue;
+          }
+
+          const raw = Array.isArray(expr.parts) && expr.parts.length > 0
+            ? String(expr.parts[expr.parts.length - 1] ?? "")
+            : String(expr.name ?? "");
+          const norm = normalizeName(raw);
+          if (norm && (aliasCounts.get(norm) ?? 0) > 1 && typeof expr.start === "number") {
+            starts.add(expr.start);
+          }
+        }
+      }
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+
+  visit(ast);
+  return starts;
+}
+
 function collectAmbiguityOwnersIncremental(
   scopeAtPos: any,
   colNorm: string,
   tablesByName: Map<string, any>,
   tableTypesByName: Map<string, any>
 ): Set<string> {
-  const owners = new Set<string>();
-  let scope = scopeAtPos;
-
-  while (scope) {
-    const symbols = typeof scope.getOwnSymbols === "function"
-      ? scope.getOwnSymbols()
-      : Object.values(scope.symbols ?? {});
-
-    const levelOwners = new Set<string>();
-    for (const sym of symbols) {
-      if (sym.kind === "CTE") {
-        const cteCols = getCteColumns(sym);
-        if (cteCols.some(c => normalizeName(c.name) === colNorm)) {
-          levelOwners.add(normalizeName(String(sym.name ?? "")));
-        }
-        continue;
-      }
-
-      let tableName = "";
-      if (sym.kind === "Alias") {
-        tableName = normalizeName(resolveAliasTableName(sym) ?? "");
-      } else if (sym.kind === "Table" || sym.kind === "TempTable") {
-        tableName = normalizeName(String(sym.name ?? ""));
-      }
-
-      if (!tableName) {
-        continue;
-      }
-
-      const stripped = tableName.replace(/^dbo\./, "");
-      const def = tablesByName.get(tableName) || tablesByName.get(stripped) || tableTypesByName.get(tableName) || tableTypesByName.get(stripped);
-      if (def?.columns?.some((c: any) => normalizeName(c.name) === colNorm)) {
-        levelOwners.add(normalizeName(def.rawName ?? def.name));
-      }
-    }
-
-    if (levelOwners.size > 0) {
-      return levelOwners;
-    }
-
-    if (String(scope.name ?? "").toLowerCase() === "subquery") {
-      return owners;
-    }
-
-    scope = scope.parent ?? null;
+  const owners = collectNearestScopeColumnOwners(scopeAtPos, colNorm, tablesByName, tableTypesByName);
+  const out = new Set<string>();
+  for (const o of owners) {
+    out.add(normalizeName(String(o.ownerName ?? "")));
   }
+  return out;
+}
 
-  return owners;
+function collectReadableAliasMatchesIncremental(
+  scopeAtPos: any,
+  colNorm: string,
+  tablesByName: Map<string, any>,
+  tableTypesByName: Map<string, any>
+): Array<{ alias: string; displayAlias: string }> {
+  const owners = collectNearestScopeColumnOwners(scopeAtPos, colNorm, tablesByName, tableTypesByName);
+  const matches: Array<{ alias: string; displayAlias: string }> = [];
+  for (const o of owners) {
+    if (o.alias && o.displayAlias) {
+      matches.push({ alias: o.alias, displayAlias: o.displayAlias });
+    }
+  }
+  return matches;
+}
+
+function collectQualifiedIdentifierStarts(ast: any): Set<number> {
+  const starts = new Set<number>();
+
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+
+    if (node.type === "Identifier" && Array.isArray(node.parts) && node.parts.length > 1 && typeof node.start === "number") {
+      starts.add(node.start);
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+
+  visit(ast);
+  return starts;
 }
 
 export function collectReadableBareColumnDiagnostics(
@@ -389,7 +526,6 @@ export function collectReadableBareColumnDiagnostics(
 
     const scopeAtPos = parsed.scope.root.findInnermost?.(ref.location.start) ?? parsed.scope.root;
     const colNorm = normalizeName(name);
-    const matchedResolution = parsed?.columns?.resolutions?.find((r: any) => r.location?.start === ref.location.start);
     const matches = collectReadableAliasMatchesIncremental(scopeAtPos, colNorm, tablesByName, tableTypesByName);
 
     if (matches.length !== 1) {
@@ -425,101 +561,6 @@ export function collectReadableBareColumnDiagnostics(
   }
 
   return diagnostics;
-}
-
-function collectReadableAliasMatchesIncremental(
-  scopeAtPos: any,
-  colNorm: string,
-  tablesByName: Map<string, any>,
-  tableTypesByName: Map<string, any>
-): Array<{ alias: string; displayAlias: string }> {
-  let scope = scopeAtPos;
-
-  while (scope) {
-    const symbols = typeof scope.getOwnSymbols === "function"
-      ? scope.getOwnSymbols()
-      : Object.values(scope.symbols ?? {});
-
-    const levelMatches: Array<{ alias: string; displayAlias: string }> = [];
-    let hasLocalOwner = false;
-    for (const sym of symbols) {
-      if (sym.kind === "Alias") {
-        const resolved = resolveReadableAliasColumn(sym, colNorm, tablesByName, tableTypesByName);
-        if (!resolved) {
-          continue;
-        }
-        hasLocalOwner = true;
-        levelMatches.push({
-          alias: normalizeName(String(sym.name ?? "")),
-          displayAlias: getDisplaySymbolName(sym) ?? normalizeName(String(sym.name ?? ""))
-        });
-        continue;
-      }
-
-      if (sym.kind === "CTE") {
-        if (getCteColumns(sym).some(c => normalizeName(c.name) === colNorm)) {
-          hasLocalOwner = true;
-        }
-        continue;
-      }
-
-      if (sym.kind === "Table" || sym.kind === "TempTable") {
-        const tableName = normalizeName(String(sym.name ?? ""));
-        if (!tableName) {
-          continue;
-        }
-        const stripped = tableName.replace(/^dbo\./, "");
-        const def = tablesByName.get(tableName) || tablesByName.get(stripped) || tableTypesByName.get(tableName) || tableTypesByName.get(stripped);
-        if (def?.columns?.some((c: any) => normalizeName(c.name) === colNorm)) {
-          hasLocalOwner = true;
-        }
-      }
-    }
-
-    if (levelMatches.length > 0) {
-      return levelMatches;
-    }
-    if (hasLocalOwner) {
-      return [];
-    }
-    if (String(scope.name ?? "").toLowerCase() === "subquery") {
-      return [];
-    }
-
-    scope = scope.parent ?? null;
-  }
-
-  return [];
-}
-
-function collectQualifiedIdentifierStarts(ast: any): Set<number> {
-  const starts = new Set<number>();
-
-  const visit = (node: any): void => {
-    if (!node || typeof node !== "object") {
-      return;
-    }
-
-    if (node.type === "Identifier" && Array.isArray(node.parts) && node.parts.length > 1 && typeof node.start === "number") {
-      starts.add(node.start);
-    }
-
-    if (Array.isArray(node)) {
-      for (const item of node) {
-        visit(item);
-      }
-      return;
-    }
-
-    for (const value of Object.values(node)) {
-      if (value && typeof value === "object") {
-        visit(value);
-      }
-    }
-  };
-
-  visit(ast);
-  return starts;
 }
 
 function collectOutputPseudoColumnStarts(ast: any): Set<number> {
@@ -593,19 +634,19 @@ export function buildUpdateNoLockCodeAction(
 
   const diagStart = positionToOffset(diagnostic.range.start.line, diagnostic.range.start.character, lineStarts);
   const diagEnd = positionToOffset(diagnostic.range.end.line, diagnostic.range.end.character, lineStarts);
-  const noLockMatch = findNoLockNearRange(text, diagStart, diagEnd);
+  const noLockMatch = findNearestWordCaseInsensitive(text, "nolock", diagStart, diagEnd);
   if (!noLockMatch) {
     return null;
   }
 
-  const withRange = findWithHintRange(text, noLockMatch.start);
+  const withRange = findWithHintRangeNoRegex(text, noLockMatch.start);
   if (!withRange) {
     return null;
   }
 
   const hintBody = text.slice(withRange.openParen + 1, withRange.closeParen);
   const hints = splitTopLevelByComma(hintBody);
-  const kept = hints.filter(h => normalizeName(h.replace(/[\[\]]/g, "")) !== "nolock");
+  const kept = hints.filter((h: string) => normalizeName(h.replace(/[\[\]]/g, "")) !== "nolock");
   if (kept.length === hints.length) {
     return null;
   }
@@ -639,38 +680,85 @@ function positionToOffset(line: number, character: number, lineStarts: number[])
   return (lineStarts[line] ?? 0) + character;
 }
 
-function findNoLockNearRange(text: string, start: number, end: number): { start: number; end: number } | null {
-  const re = /\bnolock\b/gi;
+function isWordBoundary(ch: string | undefined): boolean {
+  if (!ch) {
+    return true;
+  }
+  const code = ch.charCodeAt(0);
+  const isAlphaNum = (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+  return !isAlphaNum && ch !== "_" && ch !== "$" && ch !== "#";
+}
+
+function isWhitespace(ch: string | undefined): boolean {
+  return ch === " " || ch === "\t" || ch === "\r" || ch === "\n";
+}
+
+function findNearestWordCaseInsensitive(
+  text: string,
+  word: string,
+  start: number,
+  end: number
+): { start: number; end: number } | null {
+  const lower = text.toLowerCase();
+  const target = word.toLowerCase();
+  let idx = -1;
   let best: { start: number; end: number; score: number } | null = null;
-  for (let m = re.exec(text); m; m = re.exec(text)) {
-    const ms = m.index;
-    const me = ms + m[0].length;
-    const overlaps = !(me < start || ms > end);
-    const score = overlaps ? 0 : Math.min(Math.abs(ms - start), Math.abs(ms - end));
+
+  while (true) {
+    idx = lower.indexOf(target, idx + 1);
+    if (idx < 0) {
+      break;
+    }
+    const before = idx > 0 ? text[idx - 1] : undefined;
+    const after = idx + target.length < text.length ? text[idx + target.length] : undefined;
+    if (!isWordBoundary(before) || !isWordBoundary(after)) {
+      continue;
+    }
+    const tokenEnd = idx + target.length;
+    const overlaps = !(tokenEnd < start || idx > end);
+    const score = overlaps ? 0 : Math.min(Math.abs(idx - start), Math.abs(idx - end));
     if (!best || score < best.score) {
-      best = { start: ms, end: me, score };
+      best = { start: idx, end: tokenEnd, score };
     }
     if (overlaps) {
       break;
     }
   }
+
   return best ? { start: best.start, end: best.end } : null;
 }
 
-function findWithHintRange(
+function findWithHintRangeNoRegex(
   text: string,
   noLockStart: number
 ): { withStart: number; openParen: number; closeParen: number } | null {
-  const re = /with\s*\(/gi;
+  const lower = text.toLowerCase();
+  let cursor = 0;
   let candidate: { withStart: number; openParen: number } | null = null;
-  for (let m = re.exec(text); m; m = re.exec(text)) {
-    const withStart = m.index;
-    const openParen = text.indexOf("(", withStart);
-    if (openParen < 0 || openParen > noLockStart) {
+
+  while (cursor < lower.length) {
+    const withStart = lower.indexOf("with", cursor);
+    if (withStart < 0 || withStart > noLockStart) {
+      break;
+    }
+
+    const before = withStart > 0 ? text[withStart - 1] : undefined;
+    const after = withStart + 4 < text.length ? text[withStart + 4] : undefined;
+    if (!isWordBoundary(before) || !isWordBoundary(after)) {
+      cursor = withStart + 4;
       continue;
     }
-    candidate = { withStart, openParen };
+
+    let i = withStart + 4;
+    while (i < text.length && isWhitespace(text[i])) {
+      i++;
+    }
+    if (i < text.length && text[i] === "(" && i <= noLockStart) {
+      candidate = { withStart, openParen: i };
+    }
+    cursor = withStart + 4;
   }
+
   if (!candidate) {
     return null;
   }
@@ -690,6 +778,7 @@ function findWithHintRange(
       }
     }
   }
+
   return null;
 }
 
@@ -713,6 +802,7 @@ function splitTopLevelByComma(input: string): string[] {
       start = i + 1;
     }
   }
+
   const tail = input.slice(start).trim();
   if (tail) {
     parts.push(tail);
@@ -759,7 +849,7 @@ export function buildSelectStarExpansionCodeActions(
           continue;
         }
 
-        const expansion = expandWildcardForSelect(node, expr, tablesByName, tableTypesByName);
+        const expansion = expandWildcardForSelect(parsed, node, expr, tablesByName, tableTypesByName, start);
         if (!expansion) {
           continue;
         }
@@ -802,10 +892,12 @@ export function buildSelectStarExpansionCodeActions(
 }
 
 function expandWildcardForSelect(
+  parsed: any,
   selectNode: any,
   wildcardExpr: any,
   tablesByName: Map<string, any>,
-  tableTypesByName: Map<string, any>
+  tableTypesByName: Map<string, any>,
+  offset: number
 ): string | null {
   const sources = collectSelectSources(selectNode.from ?? []);
   if (sources.length === 0) {
@@ -826,11 +918,11 @@ function expandWildcardForSelect(
 
   const cols: string[] = [];
   for (const src of targetSources) {
-    const def = resolveTableDefinition(src.tableName, tablesByName, tableTypesByName);
-    if (!def?.columns?.length) {
+    const sourceCols = getSourceColumns(src, parsed, offset, tablesByName, tableTypesByName);
+    if (!sourceCols.length) {
       continue;
     }
-    for (const c of def.columns) {
+    for (const c of sourceCols) {
       const rawCol = String(c?.rawName ?? c?.name ?? "").trim();
       if (!rawCol) {
         continue;
@@ -899,6 +991,83 @@ function resolveTableDefinition(
     || tableTypesByName.get(tableName)
     || tableTypesByName.get(stripped)
     || null;
+}
+
+function getSourceColumns(
+  src: { qualifier: string; tableName: string },
+  parsed: any,
+  offset: number,
+  tablesByName: Map<string, any>,
+  tableTypesByName: Map<string, any>
+): any[] {
+  const def = resolveTableDefinition(src.tableName, tablesByName, tableTypesByName);
+  if (def?.columns?.length) {
+    return def.columns;
+  }
+
+  const scopeAtPos = parsed?.scope?.root?.findInnermost?.(offset) ?? parsed?.scope?.root;
+  if (!scopeAtPos) {
+    return [];
+  }
+
+  let scope = scopeAtPos;
+  const targetAlias = normalizeName(src.qualifier);
+  const targetTable = normalizeName(src.tableName);
+  while (scope) {
+    const symbols = typeof scope.getOwnSymbols === "function"
+      ? scope.getOwnSymbols()
+      : Object.values(scope.symbols ?? {});
+
+    for (const sym of symbols) {
+      const symName = normalizeName(String(sym?.name ?? ""));
+      if (symName === targetAlias && Array.isArray(sym?.columns) && sym.columns.length > 0) {
+        return sym.columns;
+      }
+
+      if (symName === targetAlias && sym?.kind === "Alias") {
+        const aliasedTable = normalizeName(resolveAliasTableName(sym) ?? "");
+        if (aliasedTable) {
+          const aliasedSym = resolveSymbolCaseInsensitive(scope, aliasedTable);
+          if (aliasedSym) {
+            if (Array.isArray(aliasedSym.columns) && aliasedSym.columns.length > 0) {
+              return aliasedSym.columns;
+            }
+            const typeName = normalizeName(String(aliasedSym.dataType ?? ""));
+            if (typeName) {
+              const typeDef = tableTypesByName.get(typeName) || tablesByName.get(typeName);
+              if (typeDef?.columns?.length) {
+                return typeDef.columns;
+              }
+            }
+          }
+        }
+      }
+
+      if ((sym?.kind === "Table" || sym?.kind === "TempTable" || sym?.kind === "CTE")
+        && symName === targetTable
+        && Array.isArray(sym?.columns)
+        && sym.columns.length > 0) {
+        return sym.columns;
+      }
+
+      if (symName === targetTable) {
+        if (Array.isArray(sym?.columns) && sym.columns.length > 0) {
+          return sym.columns;
+        }
+        const typeName = normalizeName(String(sym?.dataType ?? ""));
+        if (typeName) {
+          const typeDef = tableTypesByName.get(typeName) || tablesByName.get(typeName);
+          if (typeDef?.columns?.length) {
+            return typeDef.columns;
+          }
+        }
+      }
+    }
+
+    scope = scope.parent ?? null;
+  }
+
+  return [];
 }
 
 type StringLikeSqlType = "varchar" | "nvarchar";
@@ -1041,44 +1210,6 @@ function getStringLikeType(typeText: string): StringLikeSqlType | null {
   return null;
 }
 
-function resolveReadableAliasColumn(
-  sym: any,
-  colNorm: string,
-  tablesByName: Map<string, any>,
-  tableTypesByName: Map<string, any>
-): boolean {
-  if (!sym || sym.kind !== "Alias") {
-    return false;
-  }
-
-  if (Array.isArray(sym.columns)) {
-    if (sym.columns.some((c: any) => normalizeName(c?.rawName ?? c?.name) === colNorm || normalizeName(c?.name) === colNorm)) {
-      return true;
-    }
-  }
-
-  const tableName = normalizeName(resolveAliasTableName(sym) ?? "");
-  if (!tableName) {
-    return false;
-  }
-
-  const stripped = tableName.replace(/^dbo\./, "");
-  const def = tablesByName.get(tableName) || tablesByName.get(stripped) || tableTypesByName.get(tableName) || tableTypesByName.get(stripped);
-  if (!def?.columns) {
-    return false;
-  }
-
-  if (def.columns.some((c: any) => normalizeName(c.rawName ?? c.name) === colNorm || normalizeName(c.name) === colNorm)) {
-    return true;
-  }
-
-  const cteCols = getCteColumns(sym);
-  if (cteCols.some(c => normalizeName(c.name) === colNorm)) {
-    return true;
-  }
-
-  return false;
-}
 
 function resolveTableForQualifier(
   scopeAtPos: any,

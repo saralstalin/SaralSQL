@@ -46,3 +46,15 @@ The previously tracked 7 improvement areas are now covered by parser output and 
 1. Property-access semantic shape for typed columns.
    - Example: `SELECT GeoPoint.Lat, GeoPoint.Long FROM dbo.Store`
    - Goal: parser should emit explicit member/property-access semantics (base expression + member) so LSP does not misclassify these as table-qualified column references and can do type-aware member validation.
+
+2. Parser-native local owner/ambiguity decisions for bare columns.
+   - Examples: unaliased columns over local temp tables, table variables, TVPs, nested derived scopes, and `ORDER BY` alias interactions.
+   - Goal: parser should expose nearest-scope owner decisions and ambiguity outcomes directly in semantic output so LSP does not re-implement scope-walk ownership inference and can rely on parser truth first.
+
+3. Structured local-column metadata for table variables and TVP-backed aliases.
+   - Example: `DECLARE @Emp TABLE (...)` with references like `te.FirstName2` and bare `FirstName2` in join predicates.
+   - Goal: parser scope symbols should expose local columns as structured entries (raw name + normalized name + data type + location), not string-only arrays, so hover/definition/references/diagnostics can resolve consistently without LSP-side shape normalization and can always show data type when available.
+
+4. DML read-scope source exposure for INSERT/UPDATE/DELETE statement bodies.
+   - Examples: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... FROM` with bare columns.
+   - Goal: parser scope/lineage should expose read-side source ownership at token offsets without mutation-target leakage, so LSP ambiguity diagnostics do not need statement-type filtering to avoid false ambiguous-column reports.
