@@ -26,7 +26,10 @@ export function activate(context: vscode.ExtensionContext) {
 	const clientOptions: LanguageClientOptions = {
 		documentSelector: [{ scheme: 'file', language: 'sql' }],
 		synchronize: {
-			fileEvents: vscode.workspace.createFileSystemWatcher('**/*.sql'),
+			fileEvents: [
+				vscode.workspace.createFileSystemWatcher('**/*.sql'),
+				vscode.workspace.createFileSystemWatcher('**/*.sqlproj')
+			],
 			configurationSection: "saralsql" 
 		},
 		// ✅ Explicitly advertise support for workspace folders

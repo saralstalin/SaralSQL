@@ -1,6 +1,6 @@
 # SaralSQL — SQL IntelliSense & LSP for VS Code
 
-> **Instant “Go to Definition” & IntelliSense for SQL — no database connection required.**  
+> **Instant Parser-First SQL Diagnostics, Navigation, and IntelliSense — No Database Connection Required.**  
 > Built for teams that keep their entire schema in `.sql` files.  
 > ⚡ **Indexes large projects (2000+ files) within a minute, and stays updated as you type**
 
@@ -10,7 +10,7 @@
 
 - **Offline-friendly** – works entirely from your source code, no live DB needed  
 - **Privacy-friendly** – **no tracking; all code and actions stay in your workspace**  
-- **Lightweight & fast** – advanced T-SQL parser engine keeps typing latency low  
+- **Lightweight & fast** – advanced TypeScript based T-SQL parser, built for speed and accuracy
 - **Code-centric** – ideal for projects that version-control schema scripts  
 - **Zero-config** – open a folder of `.sql` files and start coding with real-time diagnostics  
 - **Scales to large projects** – indexes **2000+ SQL files in under 1 minute**
@@ -65,6 +65,11 @@
 
   Diagnostics are enabled by default with `saralsql.showDiagnostics`. Parser issues are hidden by default with `saralsql.showParseIssues`; when parser issues are hidden, SaralSQL only shows other diagnostics after the document parses successfully. Schema diagnostics (unknown table/column and ambiguous bare columns) are opt-in via `saralsql.enableSchemaValidation` (default: off). Each diagnostic has an enable setting such as `saralsql.diagnostics.unknownTable` and a severity setting such as `saralsql.diagnostics.unknownTableSeverity`; an advanced `saralsql.disabledDiagnostics` setting remains available if you want to suppress by code.
 
+  For SSDT projects with `.sqlproj` files, SaralSQL can align workspace schema contribution with project membership:
+  - `saralsql.sqlproj.strictBuildMembership` (default: `true`): only `Build` items contribute to workspace schema.
+  - `saralsql.sqlproj.warnMissingProjectFile` (default: `true`): warns when a SQL file is missing from all `.sqlproj` items.
+  - `saralsql.sqlproj.missingProjectFileSeverity` (default: `warning`): severity for missing-project-file warnings (`SSDT001`).
+
 ![Self-comparison diagnostic](Images/DiagnosticsSelfComparison.png)
 
 ![UPDATE without WHERE diagnostic](Images/DiagnosticsUnsafeUpdate.png)
@@ -105,7 +110,6 @@ This is an **Early-Access Preview**:
 - Dialects like Postgres or MySQL may partially work but are not officially supported.  
 - Real-time diagnostics now available for syntax and semantic validation, if you enable it from settings
 - Column and reference detection uses parser-backed indexing and analysis
-- Some editor behaviors around more complex statements are still being polished, even though the parser already understands constructs like `TOP(@Variable)`, `MERGE`, and `OUTPUT INTO`
 
 We’re releasing early to gather real-world feedback before expanding the feature set.
 
@@ -126,16 +130,6 @@ We’re releasing early to gather real-world feedback before expanding the featu
 
 This extension is intentionally lightweight and does **not** do full SQL semantic analysis.  
 Be aware of these trade-offs:
-
-- **Column References**  
-  Column references are resolved from parser-backed scope and workspace index data.  
-  When a column name is shared by multiple visible tables, the extension may warn that it is ambiguous rather than guessing.  
-  Teams using explicit names like `EmployeeId` and `DepartmentId` are less affected.
-
-- **Bare Columns**  
-  Bare columns (`SELECT EmployeeId`) resolve to their table using advanced T-SQL parsing.  
-  When the column is uniquely owned by a visible alias, SaralSQL can suggest qualifying it for readability and offer a quick fix.  
-  Aliased usage (`e.EmployeeId`) is still the most explicit form.
 
 - **Schemas**  
   `dbo.TableName` and `TableName` are treated the same.  

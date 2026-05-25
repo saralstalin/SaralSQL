@@ -30,6 +30,7 @@ import { TextDocument } from "vscode-languageserver-textdocument";
 import * as fs from "fs";
 import * as fg from "fast-glob";
 import * as url from "url";
+import * as path from "path";
 import {
   normalizeName
   , getWordRangeAtPosition
@@ -58,7 +59,7 @@ import {
   , tempTablesByUri
 } from "./definitions";
 import { parseSql, type ParseResult } from "./sql-parser";
-import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, normalizeSaralSqlSettings, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "./diagnostic-helpers";
+import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, buildSelectStarExpansionCodeActions, buildUpdateNoLockCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, normalizeSaralSqlSettings, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "./diagnostic-helpers";
 import { getCteColumns, resolveAliasTableName, resolveSymbolCaseInsensitive, normalizeAstTableName, resolveAliasFromAst, getDisplaySymbolName } from "./ast-utils";
 import { LruCache } from "./lru-cache";
 
@@ -70,10 +71,16 @@ const parsedDocumentCache = new LruCache();
 let enableValidation = true;
 let showParseIssues = false;
 let enableSchemaValidation = false;
+let sqlProjStrictBuildMembership = true;
+let sqlProjWarnMissingFile = true;
+let sqlProjMissingFileSeverity: DiagnosticSeverity = DiagnosticSeverity.Warning;
 let disabledDiagnosticCodes = new Set<string>();
 let diagnosticSeverityOverrides = new Map<string, DiagnosticSeverity>();
 const DEBUG = process.env.SARALSQL_DEBUG === "1";
 const dbg = (...args: any[]) => { if (DEBUG) { console.debug("[SaralSQL]", ...args); } };
+type SqlProjItemKind = "build" | "none" | "preDeploy" | "postDeploy" | "other";
+const sqlProjItemKindBySqlUri = new Map<string, SqlProjItemKind>();
+let hasSqlProjInWorkspace = false;
 
 // Call this after building the definitions index
 async function markIndexReady() {
@@ -169,6 +176,112 @@ function toNormUri(rawUri: string) {
   }
 }
 
+function isSqlProjectFileUri(rawUri: string): boolean {
+  return toNormUri(rawUri).toLowerCase().endsWith(".sqlproj");
+}
+
+function shouldContributeToWorkspaceSchema(rawUri: string): boolean {
+  return shouldContributeToWorkspaceSchemaFor(sqlProjItemKindBySqlUri, hasSqlProjInWorkspace, rawUri);
+}
+
+function shouldContributeToWorkspaceSchemaFor(
+  membership: Map<string, SqlProjItemKind>,
+  hasSqlProj: boolean,
+  rawUri: string
+): boolean {
+  if (!sqlProjStrictBuildMembership) {
+    return true;
+  }
+  if (!hasSqlProj) {
+    return true;
+  }
+  const kind = membership.get(toNormUri(rawUri));
+  return kind === "build";
+}
+
+function maybePushSqlProjMissingFileDiagnostic(uri: string, text: string, diagnostics: Diagnostic[]): void {
+  if (!hasSqlProjInWorkspace || !sqlProjWarnMissingFile) {
+    return;
+  }
+  if (sqlProjItemKindBySqlUri.has(toNormUri(uri))) {
+    return;
+  }
+  diagnostics.push({
+    code: "SSDT001",
+    severity: sqlProjMissingFileSeverity,
+    range: {
+      start: { line: 0, character: 0 },
+      end: { line: 0, character: Math.min(1, text.length) }
+    },
+    message: "File is not included in any .sqlproj item. It is validated locally but excluded from workspace schema contribution.",
+    source: "SaralSQL"
+  });
+}
+
+function decodeXmlAttribute(value: string): string {
+  return value
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
+function registerSqlProjItem(projectDir: string, includeValue: string, kind: SqlProjItemKind): void {
+  const trimmed = decodeXmlAttribute(String(includeValue ?? "").trim());
+  if (!trimmed || !trimmed.toLowerCase().endsWith(".sql")) {
+    return;
+  }
+
+  const absPath = path.isAbsolute(trimmed)
+    ? trimmed
+    : path.resolve(projectDir, trimmed);
+  const sqlUri = toNormUri(url.pathToFileURL(absPath).toString());
+  sqlProjItemKindBySqlUri.set(sqlUri, kind);
+}
+
+function ingestSqlProj(absSqlProjPath: string): void {
+  const projectXml = fs.readFileSync(absSqlProjPath, "utf8");
+  const projectDir = path.dirname(absSqlProjPath);
+
+  const collect = (tagName: string, kind: SqlProjItemKind): void => {
+    const rx = new RegExp(`<${tagName}\\b[^>]*\\bInclude\\s*=\\s*\"([^\"]+)\"[^>]*>`, "gi");
+    for (const m of projectXml.matchAll(rx)) {
+      registerSqlProjItem(projectDir, String(m[1] ?? ""), kind);
+    }
+  };
+
+  collect("Build", "build");
+  collect("None", "none");
+  collect("PreDeploy", "preDeploy");
+  collect("PostDeploy", "postDeploy");
+  collect("Content", "other");
+}
+
+async function rebuildSqlProjMembershipFromWorkspace(): Promise<void> {
+  const folders = await connection.workspace.getWorkspaceFolders?.();
+  sqlProjItemKindBySqlUri.clear();
+  hasSqlProjInWorkspace = false;
+  if (!folders) {
+    return;
+  }
+
+  for (const folder of folders) {
+    const folderPath = url.fileURLToPath(folder.uri);
+    const sqlProjFiles = await fg.glob("**/*.sqlproj", { cwd: folderPath, absolute: true });
+    if (sqlProjFiles.length > 0) {
+      hasSqlProjInWorkspace = true;
+    }
+    for (const sqlProjFile of sqlProjFiles) {
+      try {
+        ingestSqlProj(sqlProjFile);
+      } catch (err) {
+        safeError(`Failed to parse ${sqlProjFile}`, err);
+      }
+    }
+  }
+}
+
 function safeLog(msg: string): void {
   if (process.env.SARALSQL_DEBUG) {
     connection.console.log(`[SaralSQL] ${msg}`);
@@ -202,10 +315,31 @@ function applySaralSqlSettings(settings: any): void {
   showParseIssues =
     settings?.showParseIssues ?? false;
   enableSchemaValidation = settings?.enableSchemaValidation ?? false;
+  sqlProjStrictBuildMembership = settings?.sqlproj?.strictBuildMembership ?? true;
+  sqlProjWarnMissingFile = settings?.sqlproj?.warnMissingProjectFile ?? true;
+  sqlProjMissingFileSeverity = parseSeveritySetting(settings?.sqlproj?.missingProjectFileSeverity, DiagnosticSeverity.Warning);
 
   safeLog(
-    `Validation ${enableValidation ? "enabled" : "disabled"}, parse issues ${showParseIssues ? "enabled" : "disabled"}, schema validation ${enableSchemaValidation ? "enabled" : "disabled"}, disabled diagnostics ${disabledDiagnosticCodes.size}`
+    `Validation ${enableValidation ? "enabled" : "disabled"}, parse issues ${showParseIssues ? "enabled" : "disabled"}, schema validation ${enableSchemaValidation ? "enabled" : "disabled"}, sqlproj strict build membership ${sqlProjStrictBuildMembership ? "enabled" : "disabled"}, disabled diagnostics ${disabledDiagnosticCodes.size}`
   );
+}
+
+function parseSeveritySetting(value: unknown, fallback: DiagnosticSeverity): DiagnosticSeverity {
+  const norm = String(value ?? "").trim().toLowerCase();
+  switch (norm) {
+    case "error":
+      return DiagnosticSeverity.Error;
+    case "warning":
+    case "warn":
+      return DiagnosticSeverity.Warning;
+    case "information":
+    case "info":
+      return DiagnosticSeverity.Information;
+    case "hint":
+      return DiagnosticSeverity.Hint;
+    default:
+      return fallback;
+  }
 }
 
 async function indexWorkspace(): Promise<void> {
@@ -215,6 +349,16 @@ async function indexWorkspace(): Promise<void> {
       return;
     }
 
+    workspaceDocuments.clear();
+    definitions.clear();
+    referencesIndex.clear();
+    columnsByTable.clear();
+    tablesByName.clear();
+    tableTypesByName.clear();
+    aliasesByUri.clear();
+    tempTablesByUri.clear();
+    await rebuildSqlProjMembershipFromWorkspace();
+
     for (const folder of folders) {
       const folderPath = url.fileURLToPath(folder.uri);
       const files = await fg.glob("**/*.sql", { cwd: folderPath, absolute: true });
@@ -223,7 +367,7 @@ async function indexWorkspace(): Promise<void> {
           const text = fs.readFileSync(file, "utf8");
           const uri = url.pathToFileURL(file).toString();
           workspaceDocuments.set(uri, TextDocument.create(uri, "sql", 0, text));
-          indexText(uri, text);
+          indexText(uri, text, { includeInWorkspaceSchema: shouldContributeToWorkspaceSchema(uri) });
         } catch (err) {
           safeError(`Failed to index ${file}`, err);
         }
@@ -273,9 +417,63 @@ connection.onInitialized(async () => {
   }
 });
 
+connection.onDidChangeWatchedFiles(async (change) => {
+  try {
+    const hasSqlProjChange = (change?.changes ?? []).some(c => toNormUri(c.uri).toLowerCase().endsWith(".sqlproj"));
+    if (!hasSqlProjChange) {
+      return;
+    }
+
+    connection.console.log("[watch] .sqlproj change detected; running incremental schema sync");
+    const previousMembership = new Map(sqlProjItemKindBySqlUri);
+    const previousHasSqlProj = hasSqlProjInWorkspace;
+
+    await rebuildSqlProjMembershipFromWorkspace();
+
+    const impactedUris = new Set<string>();
+    for (const uri of workspaceDocuments.keys()) {
+      const before = shouldContributeToWorkspaceSchemaFor(previousMembership, previousHasSqlProj, uri);
+      const after = shouldContributeToWorkspaceSchema(uri);
+      if (before !== after) {
+        impactedUris.add(uri);
+      }
+    }
+
+    for (const uri of new Set<string>([...previousMembership.keys(), ...sqlProjItemKindBySqlUri.keys()])) {
+      const beforeKind = previousMembership.get(uri) ?? null;
+      const afterKind = sqlProjItemKindBySqlUri.get(uri) ?? null;
+      if (beforeKind !== afterKind) {
+        impactedUris.add(uri);
+      }
+    }
+
+    for (const uri of impactedUris) {
+      const doc = workspaceDocuments.get(uri);
+      if (!doc) {
+        continue;
+      }
+      indexText(uri, doc.getText(), { includeInWorkspaceSchema: shouldContributeToWorkspaceSchema(uri) });
+    }
+
+    for (const uri of impactedUris) {
+      const openDoc = documents.get(uri);
+      const doc = openDoc ?? workspaceDocuments.get(uri);
+      if (doc) {
+        await validateTextDocument(doc);
+      }
+    }
+  } catch (err) {
+    safeError("Watched file change handling failed", err);
+  }
+});
+
 documents.onDidOpen(async (e) => {
   workspaceDocuments.set(e.document.uri, e.document);
-  indexText(e.document.uri, e.document.getText());
+  if (isSqlProjectFileUri(e.document.uri)) {
+    await indexWorkspace();
+  } else {
+    indexText(e.document.uri, e.document.getText(), { includeInWorkspaceSchema: shouldContributeToWorkspaceSchema(e.document.uri) });
+  }
 
   if (enableValidation) {
     await validateTextDocument(e.document);
@@ -305,7 +503,11 @@ documents.onDidChangeContent((e) => {
         connection.console.log("[change] debounce run");
 
         workspaceDocuments.set(uri, e.document);
-        indexText(uri, e.document.getText());
+        if (isSqlProjectFileUri(uri)) {
+          await indexWorkspace();
+        } else {
+          indexText(uri, e.document.getText(), { includeInWorkspaceSchema: shouldContributeToWorkspaceSchema(uri) });
+        }
         connection.console.log("[change] indexed");
 
         connection.console.log(
@@ -1569,11 +1771,41 @@ connection.onReferences((params: ReferenceParams): Location[] => {
 connection.onCodeAction((params: CodeActionParams): CodeAction[] => {
   try {
     const actions: CodeAction[] = [];
+    const doc = documents.get(params.textDocument.uri);
+    const docText = doc?.getText() ?? "";
+    const lineStarts = doc ? getLineStarts(docText) : [];
     for (const diagnostic of params.context.diagnostics ?? []) {
       const action = buildReadableBareColumnCodeAction(params.textDocument.uri, diagnostic);
       if (action) {
         actions.push(action);
       }
+      if (doc) {
+        const noLockAction = buildUpdateNoLockCodeAction(
+          params.textDocument.uri,
+          diagnostic,
+          docText,
+          lineStarts
+        );
+        if (noLockAction) {
+          actions.push(noLockAction);
+        }
+      }
+    }
+    if (doc) {
+      const parsed = getParsedDocument(doc);
+      const startOffset = (lineStarts[params.range.start.line] ?? 0) + params.range.start.character;
+      const endOffset = (lineStarts[params.range.end.line] ?? 0) + params.range.end.character;
+      actions.push(
+        ...buildSelectStarExpansionCodeActions(
+          params.textDocument.uri,
+          parsed,
+          lineStarts,
+          tablesByName,
+          tableTypesByName,
+          startOffset,
+          endOffset
+        )
+      );
     }
     return actions;
   } catch (err) {
@@ -2254,6 +2486,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
   }
 
   if (!parsed?.scope?.root) {
+    maybePushSqlProjMissingFileDiagnostic(doc.uri, text, diagnostics);
     connection.sendDiagnostics({
       uri: doc.uri,
       diagnostics
@@ -2698,6 +2931,8 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
   connection.console.log(
     `[validate] sending diagnostics count=${diagnostics.length}`
   );
+
+  maybePushSqlProjMissingFileDiagnostic(doc.uri, text, diagnostics);
 
   connection.sendDiagnostics({
     uri: doc.uri,

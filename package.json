@@ -14,7 +14,7 @@
     "database development"
   ],
   "license": "MIT",
-  "version": "0.3.14",
+  "version": "0.3.16",
   "engines": {
     "vscode": "^1.103.0"
   },
@@ -55,6 +55,30 @@
           "type": "boolean",
           "default": false,
           "description": "Enable schema diagnostics such as unknown table/column and ambiguous bare columns."
+        },
+        "saralsql.sqlproj.strictBuildMembership": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a .sqlproj exists, only Build items contribute to workspace schema. None/PreDeploy/PostDeploy files are still validated locally.",
+          "order": 90
+        },
+        "saralsql.sqlproj.warnMissingProjectFile": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show SSDT001 when a .sql file is not included in any .sqlproj item.",
+          "order": 91
+        },
+        "saralsql.sqlproj.missingProjectFileSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "warning",
+          "description": "SSDT001: Severity for SQL files missing from all .sqlproj items.",
+          "order": 92
         },
         "saralsql.diagnostics.unknownTable": {
           "type": "boolean",

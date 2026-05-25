@@ -84,6 +84,20 @@ FROM cteEmp c;
   assert.ok(getRefs("cteemp.departmentid").length > 0, "CTE projected columns should resolve via alias usage");
 });
 
+runCase("non-build-files-do-not-contribute-workspace-schema", () => {
+  const uri = "file:///regression/non-build-schema-exclusion.sql";
+  const sql = `
+CREATE TABLE dbo.ExcludedTable (
+  Id INT
+);
+`;
+
+  indexText(uri, sql, { includeInWorkspaceSchema: false });
+  assert.ok(definitions.get(uri)?.length, "File should still be indexed for local editor features");
+  assert.ok(!tablesByName.has("dbo.excludedtable"), "Excluded file should not contribute table to workspace schema");
+  assert.ok(!columnsByTable.has("dbo.excludedtable"), "Excluded file should not contribute columns to workspace schema");
+});
+
 runCase("cte-column-validation-preconditions", () => {
   const uri = "file:///regression/cte-column-validation-preconditions.sql";
   const sql = `

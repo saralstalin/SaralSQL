@@ -43,4 +43,6 @@ The previously tracked 7 improvement areas are now covered by parser output and 
 
 ## Next Candidate Improvements
 
-*(No pending items - all parser issues currently tracked have been resolved and consumed by the LSP!)*
+1. Property-access semantic shape for typed columns.
+   - Example: `SELECT GeoPoint.Lat, GeoPoint.Long FROM dbo.Store`
+   - Goal: parser should emit explicit member/property-access semantics (base expression + member) so LSP does not misclassify these as table-qualified column references and can do type-aware member validation.

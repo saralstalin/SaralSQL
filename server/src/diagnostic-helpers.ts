@@ -1,6 +1,6 @@
 import { CodeAction, CodeActionKind, Diagnostic, DiagnosticSeverity, TextEdit } from "vscode-languageserver/node";
 import { isSqlKeyword, normalizeName, offsetToPosition } from "./text-utils";
-import { getCteColumns, getDisplaySymbolName, resolveAliasTableName } from "./ast-utils";
+import { getCteColumns, getDisplaySymbolName, normalizeAstTableName, resolveAliasTableName } from "./ast-utils";
 import { extractReferences } from "@saralsql/tsql-parser";
 
 export const SARAL_DIAGNOSTIC_CODES = {
@@ -179,6 +179,7 @@ export function collectAmbiguousColumnDiagnostics(
   const seen = new Set<string>();
   const refs = extractReferences(parsed.ast) ?? [];
   const resolutions = parsed.columns?.resolutions ?? [];
+  const orderByAliasStarts = collectOrderByAliasStarts(parsed.ast);
 
   for (const ref of refs) {
     if (!ref || (ref.kind !== "column" && ref.kind !== "unknown")) {
@@ -190,6 +191,9 @@ export function collectAmbiguousColumnDiagnostics(
 
     const name = String(ref.name ?? "");
     if (!name || name.includes(".") || name.startsWith("@") || isSqlKeyword(normalizeName(name))) {
+      continue;
+    }
+    if (orderByAliasStarts.has(ref.location.start)) {
       continue;
     }
 
@@ -235,6 +239,59 @@ export function collectAmbiguousColumnDiagnostics(
   }
 
   return diagnostics;
+}
+
+function collectOrderByAliasStarts(ast: any): Set<number> {
+  const starts = new Set<number>();
+
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+
+    if (node.type === "SelectStatement" && Array.isArray(node.columns) && Array.isArray(node.orderBy)) {
+      const aliasCounts = new Map<string, number>();
+      for (const col of node.columns) {
+        const alias = normalizeName(String(col?.alias ?? col?.outputName ?? ""));
+        if (alias) {
+          aliasCounts.set(alias, (aliasCounts.get(alias) ?? 0) + 1);
+        }
+      }
+
+      if (aliasCounts.size > 0) {
+        for (const order of node.orderBy) {
+          const expr = order?.expression;
+          if (expr?.type !== "Identifier") {
+            continue;
+          }
+
+          const raw = Array.isArray(expr.parts) && expr.parts.length > 0
+            ? String(expr.parts[expr.parts.length - 1] ?? "")
+            : String(expr.name ?? "");
+          const norm = normalizeName(raw);
+          if (norm && (aliasCounts.get(norm) ?? 0) === 1 && typeof expr.start === "number") {
+            starts.add(expr.start);
+          }
+        }
+      }
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+
+  visit(ast);
+  return starts;
 }
 
 function collectAmbiguityOwnersIncremental(
@@ -522,6 +579,326 @@ export function buildReadableBareColumnCodeAction(uri: string, diagnostic: Diagn
       }
     }
   };
+}
+
+export function buildUpdateNoLockCodeAction(
+  uri: string,
+  diagnostic: Diagnostic,
+  text: string,
+  lineStarts: number[]
+): CodeAction | null {
+  if (String(diagnostic.code ?? "").toUpperCase() !== "DML004" || !diagnostic.range) {
+    return null;
+  }
+
+  const diagStart = positionToOffset(diagnostic.range.start.line, diagnostic.range.start.character, lineStarts);
+  const diagEnd = positionToOffset(diagnostic.range.end.line, diagnostic.range.end.character, lineStarts);
+  const noLockMatch = findNoLockNearRange(text, diagStart, diagEnd);
+  if (!noLockMatch) {
+    return null;
+  }
+
+  const withRange = findWithHintRange(text, noLockMatch.start);
+  if (!withRange) {
+    return null;
+  }
+
+  const hintBody = text.slice(withRange.openParen + 1, withRange.closeParen);
+  const hints = splitTopLevelByComma(hintBody);
+  const kept = hints.filter(h => normalizeName(h.replace(/[\[\]]/g, "")) !== "nolock");
+  if (kept.length === hints.length) {
+    return null;
+  }
+
+  const editStart = withRange.withStart;
+  const editEnd = withRange.closeParen + 1;
+  const replacement = kept.length === 0 ? "" : `WITH (${kept.join(", ")})`;
+
+  const startPos = offsetToPosition(editStart, lineStarts);
+  const endPos = offsetToPosition(editEnd, lineStarts);
+  const title = kept.length === 0
+    ? "Remove WITH (NOLOCK)"
+    : "Remove NOLOCK table hint";
+
+  return {
+    title,
+    kind: CodeActionKind.QuickFix,
+    diagnostics: [diagnostic],
+    edit: {
+      changes: {
+        [uri]: [TextEdit.replace({
+          start: { line: startPos.line, character: startPos.character },
+          end: { line: endPos.line, character: endPos.character }
+        }, replacement)]
+      }
+    }
+  };
+}
+
+function positionToOffset(line: number, character: number, lineStarts: number[]): number {
+  return (lineStarts[line] ?? 0) + character;
+}
+
+function findNoLockNearRange(text: string, start: number, end: number): { start: number; end: number } | null {
+  const re = /\bnolock\b/gi;
+  let best: { start: number; end: number; score: number } | null = null;
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    const ms = m.index;
+    const me = ms + m[0].length;
+    const overlaps = !(me < start || ms > end);
+    const score = overlaps ? 0 : Math.min(Math.abs(ms - start), Math.abs(ms - end));
+    if (!best || score < best.score) {
+      best = { start: ms, end: me, score };
+    }
+    if (overlaps) {
+      break;
+    }
+  }
+  return best ? { start: best.start, end: best.end } : null;
+}
+
+function findWithHintRange(
+  text: string,
+  noLockStart: number
+): { withStart: number; openParen: number; closeParen: number } | null {
+  const re = /with\s*\(/gi;
+  let candidate: { withStart: number; openParen: number } | null = null;
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    const withStart = m.index;
+    const openParen = text.indexOf("(", withStart);
+    if (openParen < 0 || openParen > noLockStart) {
+      continue;
+    }
+    candidate = { withStart, openParen };
+  }
+  if (!candidate) {
+    return null;
+  }
+
+  let depth = 0;
+  for (let i = candidate.openParen; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "(") {
+      depth++;
+    } else if (ch === ")") {
+      depth--;
+      if (depth === 0) {
+        if (i >= noLockStart) {
+          return { withStart: candidate.withStart, openParen: candidate.openParen, closeParen: i };
+        }
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+function splitTopLevelByComma(input: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (ch === "(") {
+      depth++;
+    } else if (ch === ")") {
+      if (depth > 0) {
+        depth--;
+      }
+    } else if (ch === "," && depth === 0) {
+      const piece = input.slice(start, i).trim();
+      if (piece) {
+        parts.push(piece);
+      }
+      start = i + 1;
+    }
+  }
+  const tail = input.slice(start).trim();
+  if (tail) {
+    parts.push(tail);
+  }
+  return parts;
+}
+
+export function buildSelectStarExpansionCodeActions(
+  uri: string,
+  parsed: any,
+  lineStarts: number[],
+  tablesByName: Map<string, any>,
+  tableTypesByName: Map<string, any>,
+  selectionStartOffset: number,
+  selectionEndOffset: number
+): CodeAction[] {
+  if (!parsed?.ast) {
+    return [];
+  }
+
+  const actions: CodeAction[] = [];
+
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+
+    if (node.type === "SelectStatement" && Array.isArray(node.columns) && Array.isArray(node.from)) {
+      for (const col of node.columns) {
+        if (col?.type !== "Column" || col?.wildcard !== true) {
+          continue;
+        }
+        const expr = col.expression;
+        if (!expr || expr.type !== "WildcardExpression") {
+          continue;
+        }
+
+        const start = Number(expr.start);
+        const end = Number(expr.end);
+        if (!Number.isFinite(start) || !Number.isFinite(end)) {
+          continue;
+        }
+        if (end < selectionStartOffset || start > selectionEndOffset) {
+          continue;
+        }
+
+        const expansion = expandWildcardForSelect(node, expr, tablesByName, tableTypesByName);
+        if (!expansion) {
+          continue;
+        }
+
+        const startPos = offsetToPosition(start, lineStarts);
+        const endPos = offsetToPosition(end, lineStarts);
+        const label = expr.tablePrefix?.name ? `${expr.tablePrefix.name}.*` : "*";
+
+        actions.push({
+          title: `Expand ${label} to explicit columns`,
+          kind: CodeActionKind.QuickFix,
+          edit: {
+            changes: {
+              [uri]: [TextEdit.replace({
+                start: { line: startPos.line, character: startPos.character },
+                end: { line: endPos.line, character: endPos.character }
+              }, expansion)]
+            }
+          }
+        });
+      }
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+
+  visit(parsed.ast);
+  return actions;
+}
+
+function expandWildcardForSelect(
+  selectNode: any,
+  wildcardExpr: any,
+  tablesByName: Map<string, any>,
+  tableTypesByName: Map<string, any>
+): string | null {
+  const sources = collectSelectSources(selectNode.from ?? []);
+  if (sources.length === 0) {
+    return null;
+  }
+
+  const prefix = wildcardExpr?.tablePrefix?.name
+    ? normalizeName(String(wildcardExpr.tablePrefix.name))
+    : "";
+
+  const targetSources = prefix
+    ? sources.filter(s => normalizeName(s.qualifier) === prefix)
+    : sources;
+
+  if (targetSources.length === 0) {
+    return null;
+  }
+
+  const cols: string[] = [];
+  for (const src of targetSources) {
+    const def = resolveTableDefinition(src.tableName, tablesByName, tableTypesByName);
+    if (!def?.columns?.length) {
+      continue;
+    }
+    for (const c of def.columns) {
+      const rawCol = String(c?.rawName ?? c?.name ?? "").trim();
+      if (!rawCol) {
+        continue;
+      }
+      cols.push(`${src.qualifier}.${rawCol}`);
+    }
+  }
+
+  if (cols.length === 0) {
+    return null;
+  }
+  return cols.join(", ");
+}
+
+function collectSelectSources(fromNodes: any[]): Array<{ qualifier: string; tableName: string }> {
+  const sources: Array<{ qualifier: string; tableName: string }> = [];
+
+  for (const tableRef of fromNodes ?? []) {
+    const own = collectSourceFromTableLike(tableRef);
+    if (own) {
+      sources.push(own);
+    }
+
+    for (const join of tableRef?.joins ?? []) {
+      const joined = collectSourceFromTableLike(join);
+      if (joined) {
+        sources.push(joined);
+      }
+    }
+  }
+
+  return sources;
+}
+
+function collectSourceFromTableLike(node: any): { qualifier: string; tableName: string } | null {
+  const tableName = normalizeName(normalizeAstTableName(node?.table) ?? "");
+  if (!tableName) {
+    return null;
+  }
+
+  const alias = String(node?.alias ?? "").trim();
+  const qualifier = alias || getIdentifierTail(node?.table) || tableName;
+  return { qualifier, tableName };
+}
+
+function getIdentifierTail(identifierNode: any): string {
+  if (Array.isArray(identifierNode?.parts) && identifierNode.parts.length > 0) {
+    return String(identifierNode.parts[identifierNode.parts.length - 1] ?? "");
+  }
+  if (typeof identifierNode?.name === "string") {
+    const raw = String(identifierNode.name);
+    const parts = raw.split(".");
+    return parts[parts.length - 1] ?? raw;
+  }
+  return "";
+}
+
+function resolveTableDefinition(
+  tableName: string,
+  tablesByName: Map<string, any>,
+  tableTypesByName: Map<string, any>
+): any {
+  const stripped = tableName.replace(/^dbo\./, "");
+  return tablesByName.get(tableName)
+    || tablesByName.get(stripped)
+    || tableTypesByName.get(tableName)
+    || tableTypesByName.get(stripped)
+    || null;
 }
 
 type StringLikeSqlType = "varchar" | "nvarchar";

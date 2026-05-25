@@ -310,8 +310,9 @@ function parserViewColumnDefinition(col: any, text: string, lineStarts: number[]
 }
 
 // ---------- Indexing ----------
-export function indexText(uri: string, text: string): void {
+export function indexText(uri: string, text: string, options?: { includeInWorkspaceSchema?: boolean }): void {
     const normUri = normalizeIndexUri(uri);
+    const includeInWorkspaceSchema = options?.includeInWorkspaceSchema ?? true;
 
     if (normUri.toLowerCase().includes(`/${DEPLOY_BLOCK_SUBSTRING}`) || normUri.toLowerCase().includes(`\\${DEPLOY_BLOCK_SUBSTRING}`)) {
         return;
@@ -385,7 +386,7 @@ export function indexText(uri: string, text: string): void {
         const columns = getParserColumns(node, text, lineStarts);
         if (columns.length > 0) {
             sym.columns = columns;
-            if (!norm.startsWith("#")) {
+            if (includeInWorkspaceSchema && !norm.startsWith("#")) {
                 columnsByTable.set(norm, new Set(columns.map(col => normalizeName(col.name))));
             }
 
@@ -642,6 +643,9 @@ export function indexText(uri: string, text: string): void {
     for (const def of defs) {
         if (!def.columns || !Array.isArray(def.columns) || def.columns.length === 0) { continue; }
         const kindNorm = (def.kind || "").toUpperCase();
+        if (!includeInWorkspaceSchema) {
+            continue;
+        }
         if ((kindNorm === "TABLE" || kindNorm === "VIEW") && !def.name.startsWith("#")) {
             tablesByName.set(def.name, def);
         } else if (kindNorm === "TYPE") {
@@ -718,10 +722,68 @@ function collectBareColumnCandidateTablesIncremental(scopeAtPos: any, colNorm: s
             return out;
         }
 
+        if (String(scope.name ?? "").toLowerCase() === "subquery") {
+            if (out.length === 0 && ast && typeof offset === "number") {
+                const localSelectTables = collectTablesFromDeepestSelectAtOffset(ast, offset);
+                if (localSelectTables.length > 0) {
+                    out.push(...localSelectTables);
+                }
+            }
+            return out;
+        }
+
         scope = scope.parent ?? null;
     }
 
     return out;
+}
+
+function collectTablesFromDeepestSelectAtOffset(ast: ParseResult["ast"] | null, offset: number): string[] {
+    if (!ast || typeof offset !== "number") {
+        return [];
+    }
+
+    let best: any = null;
+    walkAst(ast, (node: any) => {
+        if (!node || node.type !== "SelectStatement") {
+            return;
+        }
+        if (typeof node.start !== "number" || typeof node.end !== "number") {
+            return;
+        }
+        if (offset < node.start || offset > node.end) {
+            return;
+        }
+        if (!best || (node.end - node.start) < (best.end - best.start)) {
+            best = node;
+        }
+    });
+
+    if (!best) {
+        return [];
+    }
+
+    const tables = new Set<string>();
+    const addFromNode = (tableNode: any): void => {
+        const raw = String(tableNode?.name ?? tableNode?.table?.name ?? "").trim();
+        const norm = normalizeName(raw);
+        if (norm) {
+            tables.add(norm);
+        }
+    };
+
+    if (Array.isArray(best.from)) {
+        for (const src of best.from) {
+            addFromNode(src?.table ?? src);
+            if (Array.isArray(src?.joins)) {
+                for (const j of src.joins) {
+                    addFromNode(j?.table ?? j);
+                }
+            }
+        }
+    }
+
+    return Array.from(tables.values());
 }
 
 function indexSelectIntoTempTablesFromAst(

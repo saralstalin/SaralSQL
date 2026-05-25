@@ -2,7 +2,7 @@ import * as assert from "assert";
 import { DiagnosticSeverity } from "vscode-languageserver/node";
 import { parseSql } from "../sql-parser";
 import { getLineStarts } from "../text-utils";
-import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "../diagnostic-helpers";
+import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, buildSelectStarExpansionCodeActions, buildUpdateNoLockCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "../diagnostic-helpers";
 import { indexText, definitions, referencesIndex, columnsByTable, tablesByName, tableTypesByName, aliasesByUri } from "../definitions";
 
 function resetState(): void {
@@ -210,6 +210,136 @@ WHERE EmployeeId > 0;
   assert.ok(action?.edit?.changes?.[queryUri]?.[0]?.newText === "e.EmployeeId", "Code action should qualify the bare column");
 });
 
+runCase("quick-fix-expands-select-star", () => {
+  const schemaUri = "file:///validation/star-expand-schema.sql";
+  const queryUri = "file:///validation/star-expand-query.sql";
+
+  const schemaSql = `
+CREATE TABLE Employee (
+  EmployeeId INT,
+  Name VARCHAR(100)
+);
+CREATE TABLE Department (
+  DepartmentId INT
+);
+`;
+
+  const querySql = `
+SELECT *
+FROM Employee e
+JOIN Department d ON d.DepartmentId = e.EmployeeId;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const lineStarts = getLineStarts(querySql);
+  const starOffset = querySql.indexOf("*");
+  const actions = buildSelectStarExpansionCodeActions(
+    queryUri,
+    parsed,
+    lineStarts,
+    tablesByName,
+    tableTypesByName,
+    starOffset,
+    starOffset
+  );
+
+  const action = actions.find(a => String(a.title).includes("Expand *"));
+  assert.ok(action, "SELECT * should offer expansion quick fix");
+  const replacement = action?.edit?.changes?.[queryUri]?.[0]?.newText ?? "";
+  assert.strictEqual(
+    replacement,
+    "e.EmployeeId, e.Name, d.DepartmentId",
+    "SELECT * should expand to explicit visible source columns in source order"
+  );
+});
+
+runCase("quick-fix-expands-select-alias-star", () => {
+  const schemaUri = "file:///validation/star-expand-alias-schema.sql";
+  const queryUri = "file:///validation/star-expand-alias-query.sql";
+
+  const schemaSql = `
+CREATE TABLE Employee (
+  EmployeeId INT,
+  Name VARCHAR(100)
+);
+CREATE TABLE Department (
+  DepartmentId INT
+);
+`;
+
+  const querySql = `
+SELECT e.*
+FROM Employee e
+JOIN Department d ON d.DepartmentId = e.EmployeeId;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const lineStarts = getLineStarts(querySql);
+  const starOffset = querySql.indexOf("e.*") + 2;
+  const actions = buildSelectStarExpansionCodeActions(
+    queryUri,
+    parsed,
+    lineStarts,
+    tablesByName,
+    tableTypesByName,
+    starOffset,
+    starOffset
+  );
+
+  const action = actions.find(a => String(a.title).includes("Expand e.*"));
+  assert.ok(action, "SELECT alias.* should offer expansion quick fix");
+  const replacement = action?.edit?.changes?.[queryUri]?.[0]?.newText ?? "";
+  assert.strictEqual(
+    replacement,
+    "e.EmployeeId, e.Name",
+    "SELECT alias.* should expand to explicit columns from that alias only"
+  );
+});
+
+runCase("quick-fix-removes-update-with-nolock", () => {
+  const uri = "file:///validation/update-nolock-remove.sql";
+  const sql = "UPDATE t WITH (NOLOCK) SET Col = 1 FROM dbo.Employee t;";
+  const lineStarts = getLineStarts(sql);
+  const tokenStart = sql.indexOf("NOLOCK");
+  const tokenEnd = tokenStart + "NOLOCK".length;
+  const diagnostic = {
+    code: "DML004",
+    range: {
+      start: { line: 0, character: tokenStart },
+      end: { line: 0, character: tokenEnd }
+    }
+  } as any;
+
+  const action = buildUpdateNoLockCodeAction(uri, diagnostic, sql, lineStarts);
+  assert.ok(action, "DML004 on WITH (NOLOCK) should provide quick fix");
+  assert.strictEqual(action?.title, "Remove WITH (NOLOCK)");
+  assert.strictEqual(action?.edit?.changes?.[uri]?.[0]?.newText, "");
+});
+
+runCase("quick-fix-removes-only-nolock-when-other-hints-exist", () => {
+  const uri = "file:///validation/update-nolock-remove-only.sql";
+  const sql = "UPDATE t WITH (NOLOCK, INDEX(IX_Employee_1)) SET Col = 1 FROM dbo.Employee t;";
+  const lineStarts = getLineStarts(sql);
+  const tokenStart = sql.indexOf("NOLOCK");
+  const tokenEnd = tokenStart + "NOLOCK".length;
+  const diagnostic = {
+    code: "DML004",
+    range: {
+      start: { line: 0, character: tokenStart },
+      end: { line: 0, character: tokenEnd }
+    }
+  } as any;
+
+  const action = buildUpdateNoLockCodeAction(uri, diagnostic, sql, lineStarts);
+  assert.ok(action, "DML004 on mixed hints should provide quick fix");
+  assert.strictEqual(action?.title, "Remove NOLOCK table hint");
+  assert.strictEqual(action?.edit?.changes?.[uri]?.[0]?.newText, "WITH (INDEX(IX_Employee_1))");
+});
+
 runCase("readable-bare-column-not-emitted-for-qualified-derived-join-columns", () => {
   const schemaUri = "file:///validation/readable-derived-schema.sql";
   const queryUri = "file:///validation/readable-derived-query.sql";
@@ -405,6 +535,82 @@ JOIN Department d ON e.DepartmentId = d.DepartmentId;
     diagnostics.length,
     0,
     "Qualified columns should not create ambiguity diagnostics"
+  );
+});
+
+runCase("ambiguity-not-emitted-for-order-by-select-alias", () => {
+  const schemaUri = "file:///validation/ambiguity-orderby-alias-schema.sql";
+  const queryUri = "file:///validation/ambiguity-orderby-alias-query.sql";
+
+  const schemaSql = `
+CREATE TABLE EmployeeTraining (
+  EmployeeId INT
+);
+CREATE TABLE Employee (
+  EmployeeId INT
+);
+`;
+
+  const querySql = `
+SELECT e.EmployeeId EmployeeId
+FROM EmployeeTraining et
+JOIN dbo.Employee e ON e.EmployeeId = et.EmployeeId
+ORDER BY EmployeeId DESC;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.strictEqual(
+    diagnostics.length,
+    0,
+    "ORDER BY references to SELECT aliases should not be reported as ambiguous bare columns"
+  );
+});
+
+runCase("ambiguity-emitted-for-order-by-duplicate-select-alias", () => {
+  const schemaUri = "file:///validation/ambiguity-orderby-duplicate-alias-schema.sql";
+  const queryUri = "file:///validation/ambiguity-orderby-duplicate-alias-query.sql";
+
+  const schemaSql = `
+CREATE TABLE EmployeeTraining (
+  EmployeeId INT
+);
+CREATE TABLE Employee (
+  EmployeeId INT
+);
+`;
+
+  const querySql = `
+SELECT e.EmployeeId EmployeeId,
+       et.EmployeeId EmployeeId
+FROM EmployeeTraining et
+JOIN dbo.Employee e ON e.EmployeeId = et.EmployeeId
+ORDER BY EmployeeId DESC;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    diagnostics.some(d => String(d.message).includes("Ambiguous column 'EmployeeId'")),
+    "ORDER BY on duplicate SELECT aliases should still be reported as ambiguous"
   );
 });
 
