@@ -580,6 +580,169 @@ WHERE ProcessStatus = 'I';
   );
 });
 
+runCase("insert-select-bare-columns-do-not-count-dbo-target-as-ambiguity-owner", () => {
+  const queryUri = "file:///validation/insert-select-dbo-target-leak-query.sql";
+
+  const querySql = `
+CREATE TABLE dbo.StoreMigration (
+  StoreId VARCHAR(50),
+  ProcessStatus CHAR(1)
+);
+CREATE TABLE #TempStoreMigration (
+  StoreId VARCHAR(50),
+  ProcessStatus CHAR(1)
+);
+
+INSERT INTO dbo.StoreMigration (StoreId, ProcessStatus)
+SELECT StoreId, ProcessStatus
+FROM #TempStoreMigration
+WHERE ProcessStatus = 'I';
+`;
+
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'StoreId'")),
+    "INSERT ... SELECT bare source columns should not treat dbo target as ambiguity owner"
+  );
+});
+
+runCase("insert-select-bare-columns-do-not-count-table-type-or-insert-target-as-ambiguity-owner", () => {
+  const queryUri = "file:///validation/insert-select-table-type-target-leak-query.sql";
+
+  const querySql = `
+CREATE TYPE dbo.StoreMigrationType AS TABLE
+(
+  StoreMigrationBatchId VARCHAR(100),
+  StoreId VARCHAR(150),
+  BusinessUnitId INT,
+  SegmentCode VARCHAR(10),
+  ProcessStatus CHAR(1)
+);
+
+CREATE TABLE dbo.StoreMigration
+(
+  StoreMigrationBatchId VARCHAR(100),
+  StoreId VARCHAR(150),
+  BusinessUnitId INT,
+  SegmentCode VARCHAR(10),
+  ProcessStatus CHAR(1)
+);
+
+CREATE TABLE #TempStoreMigration
+(
+  StoreMigrationBatchId VARCHAR(100),
+  StoreId VARCHAR(150),
+  BusinessUnitId INT,
+  SegmentCode VARCHAR(10),
+  ProcessStatus CHAR(1)
+);
+
+INSERT INTO dbo.StoreMigration
+(
+  StoreMigrationBatchId,
+  StoreId,
+  BusinessUnitId,
+  SegmentCode,
+  ProcessStatus
+)
+SELECT
+  StoreMigrationBatchId,
+  StoreId,
+  BusinessUnitId,
+  SegmentCode,
+  ProcessStatus
+FROM #TempStoreMigration
+WHERE ProcessStatus = 'I';
+`;
+
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'StoreId'")),
+    "INSERT ... SELECT bare columns should resolve from source table without table-type or insert-target leakage"
+  );
+});
+
+runCase("simple-update-bare-where-column-uses-update-target-not-global-collisions", () => {
+  const queryUri = "file:///validation/simple-update-bare-where-target-query.sql";
+  const querySql = `
+CREATE TABLE Employee (
+  Column1 INT,
+  Column2 INT
+);
+CREATE TABLE Department (
+  Column2 INT
+);
+
+UPDATE Employee
+SET Column1 = 1
+WHERE Column2 = 2;
+`;
+
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'Column2'")),
+    "Simple UPDATE bare WHERE column should bind to update target table and not global collisions"
+  );
+});
+
+runCase("simple-delete-bare-where-column-uses-delete-target-not-global-collisions", () => {
+  const queryUri = "file:///validation/simple-delete-bare-where-target-query.sql";
+  const querySql = `
+CREATE TABLE Employee (
+  Column1 INT,
+  Column2 INT
+);
+CREATE TABLE Department (
+  Column2 INT
+);
+
+DELETE Employee
+WHERE Column2 = 2;
+`;
+
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'Column2'")),
+    "Simple DELETE bare WHERE column should bind to delete target table and not global collisions"
+  );
+});
+
 runCase("readable-bare-column-not-emitted-for-qualified-derived-join-columns", () => {
   const schemaUri = "file:///validation/readable-derived-schema.sql";
   const queryUri = "file:///validation/readable-derived-query.sql";

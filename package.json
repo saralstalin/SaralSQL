@@ -14,13 +14,14 @@
     "database development"
   ],
   "license": "MIT",
-  "version": "0.4.2",
+  "version": "0.4.4",
   "engines": {
     "vscode": "^1.103.0"
   },
   "categories": [
     "Programming Languages"
   ],
+  "icon": "Images/SaralSQL-Icon.png",
   "main": "./dist/extension.js",
   "activationEvents": [
     "onLanguage:sql"

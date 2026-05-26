@@ -183,6 +183,9 @@ export function collectAmbiguousColumnDiagnostics(
   const orderByAliasStarts = collectOrderByAliasStarts(parsed.ast);
   const orderByDuplicateAliasStarts = collectOrderByDuplicateAliasStarts(parsed.ast);
   const insertSelectTargets = collectInsertSelectTargetRanges(parsed.ast);
+  const selectSourceRanges = collectSelectSourceRanges(parsed.ast);
+  const simpleUpdateTargets = collectSimpleUpdateTargetRanges(parsed.ast);
+  const simpleDeleteTargets = collectSimpleDeleteTargetRanges(parsed.ast);
 
   for (const ref of refs) {
     if (!ref || (ref.kind !== "column" && ref.kind !== "unknown")) {
@@ -238,6 +241,61 @@ export function collectAmbiguousColumnDiagnostics(
     const insertSelectTarget = findInsertSelectTargetAtOffset(insertSelectTargets, ref.location.start);
     if (insertSelectTarget) {
       owners.delete(insertSelectTarget);
+      owners.delete(insertSelectTarget.replace(/^dbo\./, ""));
+      if (!insertSelectTarget.startsWith("dbo.")) {
+        owners.delete(`dbo.${insertSelectTarget}`);
+      }
+    }
+    const statementSources = findSelectSourcesAtOffset(selectSourceRanges, ref.location.start);
+    if (statementSources && statementSources.size > 0) {
+      const allowed = new Set<string>();
+      for (const source of statementSources) {
+        const norm = normalizeName(source);
+        if (!norm) {
+          continue;
+        }
+        allowed.add(norm);
+        allowed.add(norm.replace(/^dbo\./, ""));
+        if (!norm.startsWith("dbo.")) {
+          allowed.add(`dbo.${norm}`);
+        }
+      }
+      for (const owner of Array.from(owners)) {
+        const ownerNorm = normalizeName(owner);
+        if (!allowed.has(ownerNorm)) {
+          owners.delete(owner);
+        }
+      }
+    }
+    const simpleUpdateTarget = findSimpleUpdateTargetAtOffset(simpleUpdateTargets, ref.location.start);
+    if (simpleUpdateTarget) {
+      const allowed = new Set<string>([
+        simpleUpdateTarget,
+        simpleUpdateTarget.replace(/^dbo\./, "")
+      ]);
+      if (!simpleUpdateTarget.startsWith("dbo.")) {
+        allowed.add(`dbo.${simpleUpdateTarget}`);
+      }
+      for (const owner of Array.from(owners)) {
+        if (!allowed.has(normalizeName(owner))) {
+          owners.delete(owner);
+        }
+      }
+    }
+    const simpleDeleteTarget = findSimpleDeleteTargetAtOffset(simpleDeleteTargets, ref.location.start);
+    if (simpleDeleteTarget) {
+      const allowed = new Set<string>([
+        simpleDeleteTarget,
+        simpleDeleteTarget.replace(/^dbo\./, "")
+      ]);
+      if (!simpleDeleteTarget.startsWith("dbo.")) {
+        allowed.add(`dbo.${simpleDeleteTarget}`);
+      }
+      for (const owner of Array.from(owners)) {
+        if (!allowed.has(normalizeName(owner))) {
+          owners.delete(owner);
+        }
+      }
     }
 
     if (owners.size <= 1) {
@@ -303,6 +361,189 @@ function collectInsertSelectTargetRanges(ast: any): Array<{ start: number; end: 
 
   visit(ast);
   return out;
+}
+
+function collectSelectSourceRanges(ast: any): Array<{ start: number; end: number; sources: Set<string> }> {
+  const out: Array<{ start: number; end: number; sources: Set<string> }> = [];
+
+  const collectFromTableLike = (tableLike: any, sources: Set<string>): void => {
+    const tableName = normalizeAstTableName(tableLike?.table);
+    const tableNorm = normalizeName(String(tableName ?? ""));
+    if (tableNorm) {
+      sources.add(tableNorm);
+    }
+    for (const join of tableLike?.joins ?? []) {
+      const joinTableName = normalizeAstTableName(join?.table);
+      const joinNorm = normalizeName(String(joinTableName ?? ""));
+      if (joinNorm) {
+        sources.add(joinNorm);
+      }
+    }
+  };
+
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+
+    if (node.type === "SelectStatement" && typeof node.start === "number" && typeof node.end === "number") {
+      const sources = new Set<string>();
+      for (const tableLike of node.from ?? []) {
+        collectFromTableLike(tableLike, sources);
+      }
+      out.push({
+        start: Number(node.start),
+        end: Number(node.end),
+        sources
+      });
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+
+  visit(ast);
+  return out;
+}
+
+function findSelectSourcesAtOffset(
+  ranges: Array<{ start: number; end: number; sources: Set<string> }>,
+  offset: number
+): Set<string> | null {
+  let best: { start: number; end: number; sources: Set<string> } | null = null;
+  for (const range of ranges) {
+    if (offset < range.start || offset > range.end) {
+      continue;
+    }
+    if (!best || (range.end - range.start) < (best.end - best.start)) {
+      best = range;
+    }
+  }
+  return best?.sources ?? null;
+}
+
+function collectSimpleUpdateTargetRanges(ast: any): Array<{ start: number; end: number; target: string }> {
+  const out: Array<{ start: number; end: number; target: string }> = [];
+
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+
+    if (node.type === "UpdateStatement" && typeof node.start === "number" && typeof node.end === "number") {
+      const hasFrom = Array.isArray(node.from) && node.from.length > 0;
+      if (!hasFrom) {
+        const target = normalizeName(String(normalizeAstTableName(node.target) ?? ""));
+        if (target) {
+          out.push({
+            start: Number(node.start),
+            end: Number(node.end),
+            target
+          });
+        }
+      }
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+
+  visit(ast);
+  return out;
+}
+
+function findSimpleUpdateTargetAtOffset(
+  ranges: Array<{ start: number; end: number; target: string }>,
+  offset: number
+): string | null {
+  let best: { start: number; end: number; target: string } | null = null;
+  for (const range of ranges) {
+    if (offset < range.start || offset > range.end) {
+      continue;
+    }
+    if (!best || (range.end - range.start) < (best.end - best.start)) {
+      best = range;
+    }
+  }
+  return best?.target ?? null;
+}
+
+function collectSimpleDeleteTargetRanges(ast: any): Array<{ start: number; end: number; target: string }> {
+  const out: Array<{ start: number; end: number; target: string }> = [];
+
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+
+    if (node.type === "DeleteStatement" && typeof node.start === "number" && typeof node.end === "number") {
+      const hasFrom = Array.isArray(node.from) && node.from.length > 0;
+      if (hasFrom) {
+        // DELETE ... FROM has read-side sources; keep select/from filtering behavior.
+      } else {
+        const target = normalizeName(String(normalizeAstTableName(node.target) ?? ""));
+        if (target) {
+          out.push({
+            start: Number(node.start),
+            end: Number(node.end),
+            target
+          });
+        }
+      }
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+
+  visit(ast);
+  return out;
+}
+
+function findSimpleDeleteTargetAtOffset(
+  ranges: Array<{ start: number; end: number; target: string }>,
+  offset: number
+): string | null {
+  let best: { start: number; end: number; target: string } | null = null;
+  for (const range of ranges) {
+    if (offset < range.start || offset > range.end) {
+      continue;
+    }
+    if (!best || (range.end - range.start) < (best.end - best.start)) {
+      best = range;
+    }
+  }
+  return best?.target ?? null;
 }
 
 function findInsertSelectTargetAtOffset(
