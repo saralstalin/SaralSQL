@@ -1,5 +1,6 @@
 import * as assert from "assert";
 import { TextDocument } from "vscode-languageserver-textdocument";
+import { SqlCmdPreprocessor } from "@saralsql/tsql-parser";
 import { parseSql } from "../sql-parser";
 import { getCteColumns, getDisplaySymbolName, resolveAliasFromAst, resolveColumnFromAst } from "../ast-utils";
 import { getLineStarts, normalizeName, offsetAt } from "../text-utils";
@@ -601,6 +602,45 @@ END;
     0,
     "Qualified TVP column token must not be overlaid with joined table lineage at the same location"
   );
+});
+
+runCase("property-access-does-not-register-member-as-table-reference", () => {
+  const uri = "file:///regression/property-access.sql";
+  const sql = `
+CREATE TABLE T (
+  Geo GEOGRAPHY
+);
+SELECT Geo.Lat FROM T;
+`;
+
+  indexText(uri, sql);
+  const refs = getReferencesForUri(uri);
+  assert.ok(
+    !refs.some(r => r.kind === "table" && normalizeName(r.name) === "geo"),
+    "Property access base should not be indexed as a table reference"
+  );
+  assert.ok(
+    refs.some(r => r.kind === "column" && normalizeName(r.name) === "t.geo"),
+    "Property access should keep base typed column reference"
+  );
+});
+
+runCase("sqlcmd-unresolved-include-is-surfaced", () => {
+  const pre = new SqlCmdPreprocessor();
+  const parsed = pre.process(":r missing.sql\nSELECT 1;");
+  const hasUnresolvedInclude = (parsed?.issues ?? []).some((i: any) => String(i.code ?? "").toUpperCase() === "SQLCMD_UNRESOLVED_INCLUDE");
+  assert.ok(hasUnresolvedInclude, "Unresolved SQLCMD include should be surfaced as parser issue");
+});
+
+runCase("go-batches-do-not-trigger-duplicate-variable-errors", () => {
+  const parsed = parseSql("DECLARE @a INT = 1;\nGO\nDECLARE @a INT = 2;");
+  const semantic = parsed?.semanticDiagnostics ?? [];
+  const duplicateVar = semantic.some((d: any) => {
+    const code = String(d.code ?? "").toUpperCase();
+    const msg = String(d.message ?? "").toLowerCase();
+    return code.includes("DUPLICATE") || msg.includes("duplicate") || msg.includes("already declared");
+  });
+  assert.strictEqual(duplicateVar, false, "GO batch boundary should isolate variable declaration scope");
 });
 
 runCase("offset-at-honors-crlf-line-endings", () => {

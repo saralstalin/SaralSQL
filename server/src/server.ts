@@ -1589,6 +1589,36 @@ function getHoverColumnLabel(column: any, tokenText?: string): string {
   return raw || token || "column";
 }
 
+function getSymbolLocalColumns(sym: any): any[] | undefined {
+  if (!sym) {
+    return undefined;
+  }
+  if (Array.isArray(sym.localColumns) && sym.localColumns.length > 0) {
+    return sym.localColumns.map((c: any) => ({
+      rawName: c?.rawName ?? c?.name ?? "",
+      name: c?.normalizedName ?? normalizeName(String(c?.rawName ?? c?.name ?? "")),
+      type: c?.dataType ?? c?.type ?? undefined,
+      location: c?.location
+    }));
+  }
+  if (Array.isArray(sym.columns) && sym.columns.length > 0) {
+    return sym.columns;
+  }
+  return undefined;
+}
+
+function getPropertyAccessAtOffset(parsed: ParseResult | null, offset: number): any | null {
+  const accesses = parsed?.columns?.propertyAccesses;
+  if (!Array.isArray(accesses) || accesses.length === 0) {
+    return null;
+  }
+  return accesses.find((a: any) => {
+    const s = Number(a?.location?.start);
+    const e = Number(a?.location?.end);
+    return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
+  }) ?? null;
+}
+
 function findStatementLocalColumnOwner(
   statementText: string,
   columnName: string,
@@ -1600,6 +1630,38 @@ function findStatementLocalColumnOwner(
   const colNorm = normalizeName(columnName);
   if (!colNorm) {
     return null;
+  }
+  const resolutionAtOffset = (typeof offset === "number" && parsed?.columns?.resolutions)
+    ? parsed.columns.resolutions.find((r: any) => {
+      const s = Number(r?.location?.start);
+      const e = Number(r?.location?.end);
+      return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
+    })
+    : null;
+  const decisionOwner = normalizeName(
+    String(
+      resolutionAtOffset?.owner
+      ?? resolutionAtOffset?.decision?.owner
+      ?? ""
+    )
+  );
+  if (decisionOwner) {
+    const decisionColumnName = normalizeName(String(columnName).split(".").pop() ?? "");
+    const stripped = decisionOwner.replace(/^dbo\./, "");
+    const def = localDefsByName?.get(decisionOwner)
+      || localDefsByName?.get(stripped)
+      || tablesByName.get(decisionOwner)
+      || tableTypesByName.get(decisionOwner)
+      || tablesByName.get(stripped)
+      || tableTypesByName.get(stripped);
+    const col = def?.columns?.find((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === decisionColumnName);
+    if (col) {
+      return {
+        kindLabel: tableTypesByName.has(decisionOwner) ? "table type" : "table",
+        ownerName: String(def?.rawName ?? def?.name ?? decisionOwner),
+        column: col
+      };
+    }
   }
   const owners = collectNearestScopeColumnOwners(scopeAtPos, colNorm, tablesByName, tableTypesByName, localDefsByName);
   if (owners.length === 1) {
@@ -1627,6 +1689,24 @@ function isAmbiguousBareColumnAtPosition(doc: TextDocument, position: Position, 
   }
 
   const offset = doc.offsetAt(position);
+  const resolutionAtOffset = parsed?.columns?.resolutions?.find((r: any) => {
+    const s = Number(r?.location?.start);
+    const e = Number(r?.location?.end);
+    return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
+  });
+  const ambiguityCandidates = Array.isArray(resolutionAtOffset?.ambiguityCandidates)
+    ? resolutionAtOffset.ambiguityCandidates
+    : Array.isArray(resolutionAtOffset?.decision?.ambiguityCandidates)
+      ? resolutionAtOffset.decision.ambiguityCandidates
+      : [];
+  const decisionReason = normalizeName(String(resolutionAtOffset?.decisionReason ?? resolutionAtOffset?.decision?.decisionReason ?? ""));
+  if (ambiguityCandidates.length > 1 || decisionReason.includes("ambig")) {
+    return true;
+  }
+  const decisionOwner = normalizeName(String(resolutionAtOffset?.owner ?? resolutionAtOffset?.decision?.owner ?? ""));
+  if (decisionOwner) {
+    return false;
+  }
   const normUri = toNormUri(doc.uri);
   const localDefsByName = new Map<string, any>();
   for (const def of definitions.get(normUri) ?? []) {
@@ -1978,6 +2058,18 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
 
     const match = findReferenceAtPosition(normUri, pos.line, pos.character);
     const parsed = getParsedDocument(doc);
+    const propertyAccess = getPropertyAccessAtOffset(parsed, offset);
+    if (propertyAccess) {
+      const member = String(propertyAccess.member ?? "");
+      const baseExpr = String(propertyAccess.baseExpr ?? "");
+      const owner = String(propertyAccess.owner ?? "");
+      const dataType = String(propertyAccess.dataType ?? "");
+      const memberType = String(propertyAccess.memberType ?? "");
+      const typePart = memberType ? ` - ${memberType}` : "";
+      const ownerPart = owner ? `\n\nDefined on **${dataType || "typed"}** column \`${baseExpr}\` in \`${owner}\`` : "";
+      const value = `**Member** \`${member}\`${typePart}${ownerPart}`;
+      return { contents: { kind: MarkupKind.Markdown, value }, range };
+    }
     const localDefs = definitions.get(normUri) ?? [];
     const localDefsByName = new Map<string, any>();
     for (const def of localDefs) {
@@ -2067,8 +2159,9 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
               isTableVariable = true;
             }
           }
-          if (sym.columns && Array.isArray(sym.columns)) {
-            columns = sym.columns;
+          const localCols = getSymbolLocalColumns(sym);
+          if (localCols && localCols.length > 0) {
+            columns = localCols;
             isTableVariable = true;
           }
         }
@@ -2106,8 +2199,9 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
                 isTableVariable = true;
               }
             }
-            if (sym.columns && Array.isArray(sym.columns)) {
-              columns = sym.columns;
+            const localCols = getSymbolLocalColumns(sym);
+            if (localCols && localCols.length > 0) {
+              columns = localCols;
               isTableVariable = true;
             }
           }
@@ -2203,8 +2297,9 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
             const scopeAtPos = parsed.scope.root.findInnermost(offset);
             const sym = resolveSymbolCaseInsensitive(scopeAtPos, tableName);
             if (sym) {
-              if (sym.columns && Array.isArray(sym.columns)) {
-                colDef = sym.columns.find((c: any) => normalizeName(c.rawName ?? c.name ?? c) === colName);
+              const localCols = getSymbolLocalColumns(sym);
+              if (localCols && Array.isArray(localCols)) {
+                colDef = localCols.find((c: any) => normalizeName(c.rawName ?? c.name ?? c) === colName);
                 containerName = sym.rawName ?? sym.name;
               } else if (sym.dataType) {
                 const typeKey = normalizeName(sym.dataType);
@@ -2441,6 +2536,13 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
       const seenColumns = new Set<string>();
       const diagnosticTextCache = new Map<string, string>();
       const tableRefsByName = new Map<string, ReferenceDef[]>();
+      const propertyAccessStarts = new Set<number>(
+        Array.isArray(parsed?.columns?.propertyAccesses)
+          ? parsed.columns.propertyAccesses
+            .map((p: any) => Number(p?.location?.start))
+            .filter((n: number) => Number.isFinite(n))
+          : []
+      );
 
       function makeOffsetRange(start: number, end: number): Range {
         const startPos = offsetToPosition(start, lineStarts);
@@ -2712,6 +2814,9 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         const table = normalizeName(ref.name.slice(0, lastDot));
         const column = normalizeName(ref.name.slice(lastDot + 1));
         const refOffset = (lineStarts[ref.line] ?? 0) + ref.start;
+        if (propertyAccessStarts.has(refOffset)) {
+          continue;
+        }
         const tempTableSym = resolveTempTableSymbolAtOffset(table, refOffset);
         if (tempTableSym) {
           if (!tempTableSymbolHasColumn(tempTableSym, column)) {

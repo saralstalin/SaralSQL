@@ -182,10 +182,6 @@ export function collectAmbiguousColumnDiagnostics(
   const resolutions = parsed.columns?.resolutions ?? [];
   const orderByAliasStarts = collectOrderByAliasStarts(parsed.ast);
   const orderByDuplicateAliasStarts = collectOrderByDuplicateAliasStarts(parsed.ast);
-  const insertSelectTargets = collectInsertSelectTargetRanges(parsed.ast);
-  const selectSourceRanges = collectSelectSourceRanges(parsed.ast);
-  const simpleUpdateTargets = collectSimpleUpdateTargetRanges(parsed.ast);
-  const simpleDeleteTargets = collectSimpleDeleteTargetRanges(parsed.ast);
 
   for (const ref of refs) {
     if (!ref || (ref.kind !== "column" && ref.kind !== "unknown")) {
@@ -224,6 +220,44 @@ export function collectAmbiguousColumnDiagnostics(
     }
 
     const matchedResolution = resolutions.find((r: any) => r.location?.start === ref.location.start);
+    const decisionOwner = normalizeName(
+      String(
+        matchedResolution?.owner
+        ?? matchedResolution?.decision?.owner
+        ?? ""
+      )
+    );
+    const ambiguityCandidates = Array.isArray(matchedResolution?.ambiguityCandidates)
+      ? matchedResolution.ambiguityCandidates
+      : Array.isArray(matchedResolution?.decision?.ambiguityCandidates)
+        ? matchedResolution.decision.ambiguityCandidates
+        : [];
+    const decisionReason = normalizeName(String(matchedResolution?.decisionReason ?? matchedResolution?.decision?.decisionReason ?? ""));
+
+    if (ambiguityCandidates.length > 1 || decisionReason.includes("ambig")) {
+      const startPos = offsetToPosition(ref.location.start, lineStarts);
+      const endPos = offsetToPosition(ref.location.end ?? ref.location.start, lineStarts);
+      const key = `${startPos.line}:${startPos.character}:${colNorm}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        diagnostics.push({
+          code: SARAL_DIAGNOSTIC_CODES.AmbiguousColumn,
+          severity: resolveDiagnosticSeverity(SARAL_DIAGNOSTIC_CODES.AmbiguousColumn, DiagnosticSeverity.Warning, severityOverrides),
+          range: {
+            start: { line: startPos.line, character: startPos.character },
+            end: { line: endPos.line, character: endPos.character }
+          },
+          message: `Ambiguous column '${name}' could refer to multiple sources`,
+          source
+        });
+      }
+      continue;
+    }
+
+    if (decisionOwner) {
+      continue;
+    }
+
     const resolvedSources = new Set<string>();
     if (matchedResolution?.inputs) {
       for (const input of matchedResolution.inputs) {
@@ -232,73 +266,7 @@ export function collectAmbiguousColumnDiagnostics(
         }
       }
     }
-    if (resolvedSources.size <= 1 && resolvedSources.size > 0) {
-      continue;
-    }
-
-    const scopeAtPos = parsed.scope.root.findInnermost?.(ref.location.start) ?? parsed.scope.root;
-    const owners = collectAmbiguityOwnersIncremental(scopeAtPos, colNorm, tablesByName, tableTypesByName);
-    const insertSelectTarget = findInsertSelectTargetAtOffset(insertSelectTargets, ref.location.start);
-    if (insertSelectTarget) {
-      owners.delete(insertSelectTarget);
-      owners.delete(insertSelectTarget.replace(/^dbo\./, ""));
-      if (!insertSelectTarget.startsWith("dbo.")) {
-        owners.delete(`dbo.${insertSelectTarget}`);
-      }
-    }
-    const statementSources = findSelectSourcesAtOffset(selectSourceRanges, ref.location.start);
-    if (statementSources && statementSources.size > 0) {
-      const allowed = new Set<string>();
-      for (const source of statementSources) {
-        const norm = normalizeName(source);
-        if (!norm) {
-          continue;
-        }
-        allowed.add(norm);
-        allowed.add(norm.replace(/^dbo\./, ""));
-        if (!norm.startsWith("dbo.")) {
-          allowed.add(`dbo.${norm}`);
-        }
-      }
-      for (const owner of Array.from(owners)) {
-        const ownerNorm = normalizeName(owner);
-        if (!allowed.has(ownerNorm)) {
-          owners.delete(owner);
-        }
-      }
-    }
-    const simpleUpdateTarget = findSimpleUpdateTargetAtOffset(simpleUpdateTargets, ref.location.start);
-    if (simpleUpdateTarget) {
-      const allowed = new Set<string>([
-        simpleUpdateTarget,
-        simpleUpdateTarget.replace(/^dbo\./, "")
-      ]);
-      if (!simpleUpdateTarget.startsWith("dbo.")) {
-        allowed.add(`dbo.${simpleUpdateTarget}`);
-      }
-      for (const owner of Array.from(owners)) {
-        if (!allowed.has(normalizeName(owner))) {
-          owners.delete(owner);
-        }
-      }
-    }
-    const simpleDeleteTarget = findSimpleDeleteTargetAtOffset(simpleDeleteTargets, ref.location.start);
-    if (simpleDeleteTarget) {
-      const allowed = new Set<string>([
-        simpleDeleteTarget,
-        simpleDeleteTarget.replace(/^dbo\./, "")
-      ]);
-      if (!simpleDeleteTarget.startsWith("dbo.")) {
-        allowed.add(`dbo.${simpleDeleteTarget}`);
-      }
-      for (const owner of Array.from(owners)) {
-        if (!allowed.has(normalizeName(owner))) {
-          owners.delete(owner);
-        }
-      }
-    }
-
-    if (owners.size <= 1) {
+    if (resolvedSources.size <= 1) {
       continue;
     }
 
@@ -323,243 +291,6 @@ export function collectAmbiguousColumnDiagnostics(
   }
 
   return diagnostics;
-}
-
-function collectInsertSelectTargetRanges(ast: any): Array<{ start: number; end: number; target: string }> {
-  const out: Array<{ start: number; end: number; target: string }> = [];
-
-  const visit = (node: any): void => {
-    if (!node || typeof node !== "object") {
-      return;
-    }
-
-    if (node.type === "InsertStatement" && node.selectQuery && typeof node.selectQuery.start === "number" && typeof node.selectQuery.end === "number") {
-      const target = normalizeAstTableName(node.table);
-      const targetNorm = normalizeName(String(target ?? ""));
-      if (targetNorm) {
-        out.push({
-          start: Number(node.selectQuery.start),
-          end: Number(node.selectQuery.end),
-          target: targetNorm
-        });
-      }
-    }
-
-    if (Array.isArray(node)) {
-      for (const item of node) {
-        visit(item);
-      }
-      return;
-    }
-
-    for (const value of Object.values(node)) {
-      if (value && typeof value === "object") {
-        visit(value);
-      }
-    }
-  };
-
-  visit(ast);
-  return out;
-}
-
-function collectSelectSourceRanges(ast: any): Array<{ start: number; end: number; sources: Set<string> }> {
-  const out: Array<{ start: number; end: number; sources: Set<string> }> = [];
-
-  const collectFromTableLike = (tableLike: any, sources: Set<string>): void => {
-    const tableName = normalizeAstTableName(tableLike?.table);
-    const tableNorm = normalizeName(String(tableName ?? ""));
-    if (tableNorm) {
-      sources.add(tableNorm);
-    }
-    for (const join of tableLike?.joins ?? []) {
-      const joinTableName = normalizeAstTableName(join?.table);
-      const joinNorm = normalizeName(String(joinTableName ?? ""));
-      if (joinNorm) {
-        sources.add(joinNorm);
-      }
-    }
-  };
-
-  const visit = (node: any): void => {
-    if (!node || typeof node !== "object") {
-      return;
-    }
-
-    if (node.type === "SelectStatement" && typeof node.start === "number" && typeof node.end === "number") {
-      const sources = new Set<string>();
-      for (const tableLike of node.from ?? []) {
-        collectFromTableLike(tableLike, sources);
-      }
-      out.push({
-        start: Number(node.start),
-        end: Number(node.end),
-        sources
-      });
-    }
-
-    if (Array.isArray(node)) {
-      for (const item of node) {
-        visit(item);
-      }
-      return;
-    }
-
-    for (const value of Object.values(node)) {
-      if (value && typeof value === "object") {
-        visit(value);
-      }
-    }
-  };
-
-  visit(ast);
-  return out;
-}
-
-function findSelectSourcesAtOffset(
-  ranges: Array<{ start: number; end: number; sources: Set<string> }>,
-  offset: number
-): Set<string> | null {
-  let best: { start: number; end: number; sources: Set<string> } | null = null;
-  for (const range of ranges) {
-    if (offset < range.start || offset > range.end) {
-      continue;
-    }
-    if (!best || (range.end - range.start) < (best.end - best.start)) {
-      best = range;
-    }
-  }
-  return best?.sources ?? null;
-}
-
-function collectSimpleUpdateTargetRanges(ast: any): Array<{ start: number; end: number; target: string }> {
-  const out: Array<{ start: number; end: number; target: string }> = [];
-
-  const visit = (node: any): void => {
-    if (!node || typeof node !== "object") {
-      return;
-    }
-
-    if (node.type === "UpdateStatement" && typeof node.start === "number" && typeof node.end === "number") {
-      const hasFrom = Array.isArray(node.from) && node.from.length > 0;
-      if (!hasFrom) {
-        const target = normalizeName(String(normalizeAstTableName(node.target) ?? ""));
-        if (target) {
-          out.push({
-            start: Number(node.start),
-            end: Number(node.end),
-            target
-          });
-        }
-      }
-    }
-
-    if (Array.isArray(node)) {
-      for (const item of node) {
-        visit(item);
-      }
-      return;
-    }
-
-    for (const value of Object.values(node)) {
-      if (value && typeof value === "object") {
-        visit(value);
-      }
-    }
-  };
-
-  visit(ast);
-  return out;
-}
-
-function findSimpleUpdateTargetAtOffset(
-  ranges: Array<{ start: number; end: number; target: string }>,
-  offset: number
-): string | null {
-  let best: { start: number; end: number; target: string } | null = null;
-  for (const range of ranges) {
-    if (offset < range.start || offset > range.end) {
-      continue;
-    }
-    if (!best || (range.end - range.start) < (best.end - best.start)) {
-      best = range;
-    }
-  }
-  return best?.target ?? null;
-}
-
-function collectSimpleDeleteTargetRanges(ast: any): Array<{ start: number; end: number; target: string }> {
-  const out: Array<{ start: number; end: number; target: string }> = [];
-
-  const visit = (node: any): void => {
-    if (!node || typeof node !== "object") {
-      return;
-    }
-
-    if (node.type === "DeleteStatement" && typeof node.start === "number" && typeof node.end === "number") {
-      const hasFrom = Array.isArray(node.from) && node.from.length > 0;
-      if (hasFrom) {
-        // DELETE ... FROM has read-side sources; keep select/from filtering behavior.
-      } else {
-        const target = normalizeName(String(normalizeAstTableName(node.target) ?? ""));
-        if (target) {
-          out.push({
-            start: Number(node.start),
-            end: Number(node.end),
-            target
-          });
-        }
-      }
-    }
-
-    if (Array.isArray(node)) {
-      for (const item of node) {
-        visit(item);
-      }
-      return;
-    }
-
-    for (const value of Object.values(node)) {
-      if (value && typeof value === "object") {
-        visit(value);
-      }
-    }
-  };
-
-  visit(ast);
-  return out;
-}
-
-function findSimpleDeleteTargetAtOffset(
-  ranges: Array<{ start: number; end: number; target: string }>,
-  offset: number
-): string | null {
-  let best: { start: number; end: number; target: string } | null = null;
-  for (const range of ranges) {
-    if (offset < range.start || offset > range.end) {
-      continue;
-    }
-    if (!best || (range.end - range.start) < (best.end - best.start)) {
-      best = range;
-    }
-  }
-  return best?.target ?? null;
-}
-
-function findInsertSelectTargetAtOffset(
-  ranges: Array<{ start: number; end: number; target: string }>,
-  offset: number
-): string | null {
-  let best: { start: number; end: number; target: string } | null = null;
-  for (const range of ranges) {
-    if (offset < range.start || offset > range.end) {
-      continue;
-    }
-    if (!best || (range.end - range.start) < (best.end - best.start)) {
-      best = range;
-    }
-  }
-  return best?.target ?? null;
 }
 
 function collectOrderByAliasStarts(ast: any): Set<number> {
@@ -666,20 +397,6 @@ function collectOrderByDuplicateAliasStarts(ast: any): Set<number> {
 
   visit(ast);
   return starts;
-}
-
-function collectAmbiguityOwnersIncremental(
-  scopeAtPos: any,
-  colNorm: string,
-  tablesByName: Map<string, any>,
-  tableTypesByName: Map<string, any>
-): Set<string> {
-  const owners = collectNearestScopeColumnOwners(scopeAtPos, colNorm, tablesByName, tableTypesByName);
-  const out = new Set<string>();
-  for (const o of owners) {
-    out.add(normalizeName(String(o.ownerName ?? "")));
-  }
-  return out;
 }
 
 function collectReadableAliasMatchesIncremental(
@@ -1313,6 +1030,23 @@ function getSourceColumns(
 
 type StringLikeSqlType = "varchar" | "nvarchar";
 
+function getSymbolColumns(sym: any): any[] {
+  if (!sym) {
+    return [];
+  }
+  if (Array.isArray(sym.localColumns) && sym.localColumns.length > 0) {
+    return sym.localColumns.map((c: any) => ({
+      rawName: c?.rawName ?? c?.name ?? "",
+      name: c?.normalizedName ?? normalizeName(String(c?.rawName ?? c?.name ?? "")),
+      type: c?.dataType ?? c?.type ?? undefined
+    }));
+  }
+  if (Array.isArray(sym.columns)) {
+    return sym.columns;
+  }
+  return [];
+}
+
 export function collectStringComparisonDiagnostics(
   parsed: any,
   lineStarts: number[],
@@ -1475,14 +1209,19 @@ function resolveTableForQualifier(
         if (tableName) {
           return tablesByName.get(tableName) || tableTypesByName.get(tableName);
         }
-        if (Array.isArray(sym.columns)) {
-          return { columns: sym.columns };
+        const localCols = getSymbolColumns(sym);
+        if (localCols.length > 0) {
+          return { columns: localCols };
         }
       }
 
       if ((sym.kind === "Table" || sym.kind === "TempTable" || sym.kind === "CTE") && normalizeName(sym.name) === qualifier) {
         if (sym.kind === "CTE") {
           return { columns: getCteColumns(sym).map((c: any) => ({ rawName: c.rawName, name: c.name })) };
+        }
+        const localCols = getSymbolColumns(sym);
+        if (localCols.length > 0) {
+          return { columns: localCols };
         }
         const tableName = normalizeName(String(sym.name ?? ""));
         return tablesByName.get(tableName) || tableTypesByName.get(tableName);
@@ -1507,22 +1246,27 @@ function resolveSingleColumnOwner(
       : Object.values(scopeAtPos.symbols ?? {}))
     : [];
 
-  const tableCandidates = new Set<string>();
-
   for (const sym of visibleSymbols) {
     let def: any = null;
 
     if (sym.kind === "Alias") {
       const tableName = normalizeName(resolveAliasTableName(sym) ?? "");
       def = tableName ? (tablesByName.get(tableName) || tableTypesByName.get(tableName)) : null;
-      if (!def && Array.isArray(sym.columns)) {
-        const col = sym.columns.find((c: any) => normalizeName(c.rawName ?? c.name) === columnName || normalizeName(c.name) === columnName);
+      if (!def) {
+        const localCols = getSymbolColumns(sym);
+        const col = localCols.find((c: any) => normalizeName(c.rawName ?? c.name) === columnName || normalizeName(c.name) === columnName);
         if (col) {
           matches.push({ column: col });
         }
         continue;
       }
     } else if (sym.kind === "Table" || sym.kind === "TempTable") {
+      const localCols = getSymbolColumns(sym);
+      const localCol = localCols.find((c: any) => normalizeName(c.rawName ?? c.name) === columnName || normalizeName(c.name) === columnName);
+      if (localCol) {
+        matches.push({ column: localCol });
+        continue;
+      }
       const tableName = normalizeName(String(sym.name ?? ""));
       def = tablesByName.get(tableName) || tableTypesByName.get(tableName);
     } else if (sym.kind === "CTE") {
@@ -1536,6 +1280,19 @@ function resolveSingleColumnOwner(
 
     if (def?.columns) {
       const col = def.columns.find((c: any) => normalizeName(c.rawName ?? c.name) === columnName || normalizeName(c.name) === columnName);
+      if (col) {
+        matches.push({ column: col });
+      }
+    }
+  }
+
+  if (matches.length === 0 && statement) {
+    const statementTables = collectTablesFromAstNode(statement);
+    for (const table of statementTables) {
+      const norm = normalizeName(table);
+      const stripped = norm.replace(/^dbo\./, "");
+      const def = tablesByName.get(norm) || tableTypesByName.get(norm) || tablesByName.get(stripped) || tableTypesByName.get(stripped);
+      const col = def?.columns?.find((c: any) => normalizeName(c.rawName ?? c.name) === columnName || normalizeName(c.name) === columnName);
       if (col) {
         matches.push({ column: col });
       }
