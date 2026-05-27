@@ -285,6 +285,8 @@ function resolveMutationTargetOwner(params: ResolveParams, colNorm: string): Sco
     return null;
   }
 
+  const scopeAtPos = params.scopeAtPos ?? params.parsed?.scope?.root?.findInnermost?.(params.offset) ?? params.parsed?.scope?.root;
+
   for (const stmt of ast.body) {
     const start = Number(stmt?.start);
     const end = Number(stmt?.end);
@@ -301,10 +303,58 @@ function resolveMutationTargetOwner(params: ResolveParams, colNorm: string): Sco
       continue;
     }
 
+    const localOwner = resolveLocalScopeOwnerByName(scopeAtPos, targetName, colNorm);
+    if (localOwner) {
+      return localOwner;
+    }
+
     const owner = resolveCandidateOwner(params, targetName, colNorm);
     if (owner) {
       return owner;
     }
+  }
+
+  return null;
+}
+
+function resolveLocalScopeOwnerByName(scopeAtPos: any, targetName: string, colNorm: string): ScopeColumnOwner | null {
+  if (!scopeAtPos || !targetName) {
+    return null;
+  }
+
+  const targetNorm = normalizeName(targetName);
+  let scope = scopeAtPos;
+  while (scope) {
+    const symbols = typeof scope.getOwnSymbols === "function"
+      ? scope.getOwnSymbols()
+      : Object.values(scope.symbols ?? {});
+
+    for (const sym of symbols) {
+      const symName = normalizeName(String(sym?.name ?? ""));
+      if (symName !== targetNorm) {
+        continue;
+      }
+      if (!Array.isArray(sym?.columns) || sym.columns.length === 0) {
+        continue;
+      }
+
+      const col = sym.columns.find((c: any) => {
+        const norm = normalizeName(String(c?.rawName ?? c?.name ?? c));
+        return norm === colNorm;
+      });
+      if (!col) {
+        continue;
+      }
+
+      const isTemp = String(symName).startsWith("#");
+      const kindLabel = isTemp ? "temp table" : "table";
+      return {
+        kindLabel,
+        ownerName: String(sym?.rawName ?? sym?.name ?? targetName),
+        column: col
+      };
+    }
+    scope = scope.parent ?? null;
   }
 
   return null;

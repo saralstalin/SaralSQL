@@ -2970,7 +2970,15 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         const visible = typeof scopeAtPos.getVisibleSymbols === "function"
           ? scopeAtPos.getVisibleSymbols()
           : Object.values(scopeAtPos.symbols ?? {});
-        return (visible as any[]).filter((s: any) => s?.kind === "Alias" && normalizeName(String(s?.name ?? "")) === aliasNorm);
+        return (visible as any[])
+          .filter((s: any) => s?.kind === "Alias" && normalizeName(String(s?.name ?? "")) === aliasNorm)
+          .filter((s: any) => {
+            if (Array.isArray(s?.columns) && s.columns.length > 0) {
+              return true;
+            }
+            const aliasTarget = normalizeName(resolveAliasTableName(s) ?? "");
+            return Boolean(aliasTarget);
+          });
       }
 
       function collectCteNames(scope: any): void {

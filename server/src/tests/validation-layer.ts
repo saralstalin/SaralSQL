@@ -799,6 +799,38 @@ WHERE Column2 = 2;
   );
 });
 
+runCase("simple-update-on-temp-table-bare-where-column-uses-temp-target-not-global-collisions", () => {
+  const queryUri = "file:///validation/simple-update-temp-bare-where-target-query.sql";
+  const querySql = `
+CREATE TABLE Employee (
+  Column1 NVARCHAR(100)
+);
+
+CREATE TABLE #temp (
+  Column1 NVARCHAR(100)
+);
+
+UPDATE #temp
+SET Column1 = 'Value'
+WHERE Column1 = 'Another Value';
+`;
+
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'Column1'")),
+    "Simple UPDATE on temp table should bind bare WHERE column to temp target and not global collisions"
+  );
+});
+
 runCase("simple-delete-bare-where-column-uses-delete-target-not-global-collisions", () => {
   const queryUri = "file:///validation/simple-delete-bare-where-target-query.sql";
   const querySql = `
@@ -1202,6 +1234,39 @@ LEFT JOIN dbo.SomeOtherTable bu ON inr.Column1 = bu.Column1;
   assert.ok(
     ambiguous.every(d => !String(d.message).includes("Column1")),
     "Qualified alias column in JOIN ON should not surface ambiguous-column diagnostics"
+  );
+});
+
+runCase("qualified-column-works-when-select-alias-name-collides-with-table-alias", () => {
+  const schemaUri = "file:///validation/select-alias-table-alias-collision-schema.sql";
+  const queryUri = "file:///validation/select-alias-table-alias-collision-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.Table1 (
+  Column1 INT
+);
+`;
+
+  const querySql = `
+SELECT Alias1.Column1 AS Alias1
+FROM dbo.Table1 AS Alias1;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const lineStarts = getLineStarts(querySql);
+  const ambiguous = collectAmbiguousColumnDiagnostics(
+    parsed,
+    lineStarts,
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    ambiguous.every(d => !String(d.message).includes("Column1")),
+    "Qualified column should resolve through table alias even when SELECT alias has same name"
   );
 });
 
