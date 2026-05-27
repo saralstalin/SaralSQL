@@ -28,7 +28,11 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
   }
 
   const scopeAtPos = params.scopeAtPos ?? params.parsed?.scope?.root?.findInnermost?.(params.offset) ?? params.parsed?.scope?.root;
-  const owners = collectNearestScopeColumnOwners(scopeAtPos, colNorm, params.tablesByName, params.tableTypesByName, params.localDefsByName);
+  const collectedOwners = collectNearestScopeColumnOwners(scopeAtPos, colNorm, params.tablesByName, params.tableTypesByName, params.localDefsByName);
+  const owners = narrowOwnersByReadScope(
+    params,
+    narrowOwnersForRecursiveCteSelfShadow(params, narrowOwnersForInsertReadContext(params, collectedOwners))
+  );
   const matchedResolution = params.parsed?.columns?.resolutions?.find((r: any) => {
     const s = Number(r?.location?.start);
     const e = Number(r?.location?.end);
@@ -72,6 +76,189 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
   }
 
   return { status: "unresolved", owners, matchedResolution, ambiguityCandidates, decisionReason };
+}
+
+function narrowOwnersByReadScope(params: ResolveParams, owners: ScopeColumnOwner[]): ScopeColumnOwner[] {
+  if (!Array.isArray(owners) || owners.length <= 1) {
+    return owners;
+  }
+
+  const readScopes = Array.isArray(params.parsed?.lineage?.readScopes) ? params.parsed.lineage.readScopes : [];
+  if (readScopes.length === 0) {
+    return owners;
+  }
+
+  let bestScope: any = null;
+  for (const rs of readScopes) {
+    const start = Number(rs?.location?.start);
+    const end = Number(rs?.location?.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || params.offset < start || params.offset > end) {
+      continue;
+    }
+    if (!bestScope || (end - start) < (Number(bestScope.location.end) - Number(bestScope.location.start))) {
+      bestScope = rs;
+    }
+  }
+
+  if (!bestScope || !Array.isArray(bestScope.sources) || bestScope.sources.length === 0) {
+    return owners;
+  }
+
+  const sourceNames = new Set<string>();
+  const addName = (value: any): void => {
+    const norm = normalizeName(String(value ?? ""));
+    if (!norm) {
+      return;
+    }
+    sourceNames.add(norm);
+    sourceNames.add(normalizeName(norm.split(".").pop() ?? norm));
+  };
+
+  for (const src of bestScope.sources) {
+    addName(src?.alias);
+    addName(src?.name);
+    addName(src?.baseName);
+    addName(src?.tableName);
+  }
+
+  if (sourceNames.size === 0) {
+    return owners;
+  }
+
+  const filtered = owners.filter((o) => {
+    const ownerNorm = normalizeName(String(o?.ownerName ?? ""));
+    const aliasNorm = normalizeName(String(o?.alias ?? ""));
+    const ownerTail = normalizeName(ownerNorm.split(".").pop() ?? ownerNorm);
+    return sourceNames.has(ownerNorm) || sourceNames.has(ownerTail) || sourceNames.has(aliasNorm);
+  });
+
+  return filtered.length > 0 ? filtered : owners;
+}
+
+function narrowOwnersForRecursiveCteSelfShadow(params: ResolveParams, owners: ScopeColumnOwner[]): ScopeColumnOwner[] {
+  if (!Array.isArray(owners) || owners.length <= 1) {
+    return owners;
+  }
+
+  const selfCte = findContainingCteNameAtOffset(params.parsed?.scope?.root, params.offset);
+  if (!selfCte) {
+    return owners;
+  }
+
+  const selfNorm = normalizeName(selfCte);
+  const withoutSelf = owners.filter((o) => {
+    const isCteOwner = normalizeName(String(o?.kindLabel ?? "")) === "cte";
+    const ownerNorm = normalizeName(String(o?.ownerName ?? ""));
+    return !(isCteOwner && ownerNorm === selfNorm);
+  });
+
+  return withoutSelf.length > 0 ? withoutSelf : owners;
+}
+
+function findContainingCteNameAtOffset(scopeRoot: any, offset: number): string | null {
+  if (!scopeRoot) {
+    return null;
+  }
+
+  let bestName: string | null = null;
+  let bestSpan: number | null = null;
+
+  const visit = (scope: any): void => {
+    if (!scope) {
+      return;
+    }
+
+    const symbols = typeof scope.getOwnSymbols === "function"
+      ? scope.getOwnSymbols()
+      : Object.values(scope.symbols ?? {});
+
+    for (const sym of symbols) {
+      if (sym?.kind !== "CTE") {
+        continue;
+      }
+      const start = Number(sym?.location?.query?.start);
+      const end = Number(sym?.location?.query?.end);
+      if (!Number.isFinite(start) || !Number.isFinite(end)) {
+        continue;
+      }
+      if (offset < start || offset > end) {
+        continue;
+      }
+      const span = end - start;
+      if (bestSpan === null || span < bestSpan) {
+        bestSpan = span;
+        bestName = String(sym?.name ?? "");
+      }
+    }
+
+    const children = typeof scope.getChildren === "function"
+      ? scope.getChildren()
+      : (scope.children ?? []);
+    for (const child of children) {
+      visit(child);
+    }
+  };
+
+  visit(scopeRoot);
+  return bestName;
+}
+
+function narrowOwnersForInsertReadContext(params: ResolveParams, owners: ScopeColumnOwner[]): ScopeColumnOwner[] {
+  if (!Array.isArray(owners) || owners.length <= 1) {
+    return owners;
+  }
+
+  const ast = params.parsed?.ast;
+  if (!ast || !Array.isArray(ast.body)) {
+    return owners;
+  }
+
+  for (const stmt of ast.body) {
+    if (stmt?.type !== "InsertStatement") {
+      continue;
+    }
+
+    const start = Number(stmt?.start);
+    const end = Number(stmt?.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || params.offset < start || params.offset > end) {
+      continue;
+    }
+
+    const selectQuery = stmt?.selectQuery;
+    const selectStart = Number(selectQuery?.start);
+    const selectEnd = Number(selectQuery?.end);
+    const inReadSelect = Number.isFinite(selectStart) && Number.isFinite(selectEnd)
+      && params.offset >= selectStart && params.offset <= selectEnd;
+
+    if (!inReadSelect) {
+      return owners;
+    }
+
+    const targetNorm = normalizeName(normalizeAstTableName(stmt?.table) ?? "");
+    if (!targetNorm) {
+      return owners;
+    }
+
+    const targetTail = normalizeName(targetNorm.split(".").pop() ?? targetNorm);
+    const filtered = owners.filter((o) => {
+      const ownerNorm = normalizeName(String(o?.ownerName ?? ""));
+      if (!ownerNorm) {
+        return true;
+      }
+      if (ownerNorm === targetNorm || ownerNorm === targetTail) {
+        return false;
+      }
+      const ownerTail = normalizeName(ownerNorm.split(".").pop() ?? ownerNorm);
+      if (ownerTail === targetTail) {
+        return false;
+      }
+      return true;
+    });
+
+    return filtered.length > 0 ? filtered : owners;
+  }
+
+  return owners;
 }
 
 function resolveSingleInputOwner(params: ResolveParams, matchedResolution: any, colNorm: string): ScopeColumnOwner | null {

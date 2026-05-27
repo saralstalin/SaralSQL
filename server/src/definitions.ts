@@ -257,8 +257,9 @@ function getParserColumns(node: any, text: string, lineStarts: number[]): Column
             .filter(Boolean) as ColumnDef[];
     }
 
-    if (kind === "VIEW" && Array.isArray(node.body?.columns)) {
-        return node.body.columns
+    if (kind === "VIEW") {
+        const viewColumns = collectProjectionColumns(node.body);
+        return viewColumns
             .filter((col: any) => !col?.wildcard)
             .map((col: any) => parserViewColumnDefinition(col, text, lineStarts))
             .filter(Boolean) as ColumnDef[];
@@ -816,6 +817,30 @@ function collectBareColumnCandidateTablesIncremental(scopeAtPos: any, colNorm: s
     }
 
     return out;
+}
+
+function collectProjectionColumns(query: any): any[] {
+    if (!query || typeof query !== "object") {
+        return [];
+    }
+
+    if (Array.isArray(query.columns) && query.columns.length > 0) {
+        return query.columns;
+    }
+
+    if (query.type === "SetOperator") {
+        const leftCols = collectProjectionColumns(query.left);
+        if (leftCols.length > 0) {
+            return leftCols;
+        }
+        return collectProjectionColumns(query.right);
+    }
+
+    if (query.query && typeof query.query === "object") {
+        return collectProjectionColumns(query.query);
+    }
+
+    return [];
 }
 
 function isWildcardQualifierToken(ref: any, text: string): boolean {

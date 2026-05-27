@@ -232,6 +232,9 @@ export function collectAmbiguousColumnDiagnostics(
       tablesByName,
       tableTypesByName
     });
+    if (hasSingleSelectSourceAtOffset(parsed?.ast, ref.location.start)) {
+      continue;
+    }
     const readSourceCount = getReadScopeSourceCountAtOffset(readScopeRanges, ref.location.start);
     if (readSourceCount === 1) {
       continue;
@@ -295,6 +298,55 @@ export function collectAmbiguousColumnDiagnostics(
   }
 
   return diagnostics;
+}
+
+function hasSingleSelectSourceAtOffset(ast: any, offset: number): boolean {
+  if (!ast || typeof offset !== "number") {
+    return false;
+  }
+
+  let best: any = null;
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+
+    if (node.type === "SelectStatement" && typeof node.start === "number" && typeof node.end === "number") {
+      if (offset >= node.start && offset <= node.end) {
+        if (!best || (node.end - node.start) < (best.end - best.start)) {
+          best = node;
+        }
+      }
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+
+  visit(ast);
+  if (!best || !Array.isArray(best.from) || best.from.length === 0) {
+    return false;
+  }
+
+  let sourceCount = 0;
+  for (const tableRef of best.from) {
+    sourceCount += 1;
+    if (Array.isArray(tableRef?.joins)) {
+      sourceCount += tableRef.joins.length;
+    }
+  }
+
+  return sourceCount === 1;
 }
 
 function collectReadScopeRanges(parsed: any): Array<{ start: number; end: number; sourceCount: number }> {

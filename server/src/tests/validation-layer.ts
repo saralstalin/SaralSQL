@@ -680,6 +680,93 @@ WHERE ProcessStatus = 'I';
   );
 });
 
+runCase("insert-select-from-tvp-variable-does-not-count-insert-target-as-ambiguity-owner", () => {
+  const queryUri = "file:///validation/insert-select-tvp-var-target-leak-query.sql";
+
+  const querySql = `
+CREATE TYPE dbo.OutboundLeadtimeType AS TABLE
+(
+  Id INT,
+  Action VARCHAR(8),
+  OriginFacility VARCHAR(25),
+  DestCountry VARCHAR(10)
+);
+
+CREATE TABLE #ProcessLogisticsOdPairs_Temp
+(
+  Id INT,
+  Action VARCHAR(8),
+  OriginFacility VARCHAR(25),
+  DestCountry VARCHAR(10)
+);
+
+DECLARE @Events dbo.OutboundLeadtimeType;
+
+INSERT INTO #ProcessLogisticsOdPairs_Temp (Id, Action, OriginFacility, DestCountry)
+SELECT [Id], [Action], [OriginFacility], [DestCountry]
+FROM @Events;
+`;
+
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'Id'")),
+    "INSERT ... SELECT from TVP variable should not treat insert target as an ambiguity owner"
+  );
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'OriginFacility'")),
+    "INSERT ... SELECT from TVP variable should keep bare columns bound to read source"
+  );
+});
+
+runCase("recursive-cte-anchor-bare-columns-do-not-ambiguously-bind-to-self-cte", () => {
+  const queryUri = "file:///validation/recursive-cte-anchor-bare-columns.sql";
+  const querySql = `
+;WITH SeedRows AS (
+  SELECT 1 AS KeyId, 'A' AS EntityName, 'X' AS GroupCode, CAST(GETDATE() AS DATE) AS EffectiveDate, 'C' AS ParentEntity, 1 AS MetricValue
+),
+RecursiveRows AS (
+  SELECT KeyId, EntityName, GroupCode, EffectiveDate, ParentEntity, MetricValue
+  FROM SeedRows
+  WHERE KeyId = 1
+  UNION ALL
+  SELECT s.KeyId, s.EntityName, s.GroupCode, s.EffectiveDate,
+         COALESCE(s.ParentEntity, r.ParentEntity) AS ParentEntity,
+         COALESCE(s.MetricValue, r.MetricValue) AS MetricValue
+  FROM SeedRows s
+  JOIN RecursiveRows r ON r.EntityName = s.EntityName AND r.KeyId = s.KeyId - 1
+)
+SELECT EntityName FROM RecursiveRows;
+`;
+
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'KeyId'")),
+    "Recursive CTE anchor bare KeyId should not be ambiguous against self CTE symbol"
+  );
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'EntityName'")),
+    "Recursive CTE anchor bare EntityName should remain local to anchor source"
+  );
+});
+
 runCase("simple-update-bare-where-column-uses-update-target-not-global-collisions", () => {
   const queryUri = "file:///validation/simple-update-bare-where-target-query.sql";
   const querySql = `
@@ -1079,6 +1166,42 @@ LEFT JOIN dbo.Countries c WITH(NOLOCK) ON cso.CountryId = c.CountryId;
   assert.ok(
     diagnostics.every(d => !String(d.message).includes("DisplayOrder")),
     "Schema ownership should suppress parser-only ambiguity for uniquely owned bare columns"
+  );
+});
+
+runCase("join-on-qualified-column-resolves-through-alias-target-even-with-select-alias-name-collision", () => {
+  const schemaUri = "file:///validation/join-on-alias-target-schema.sql";
+  const queryUri = "file:///validation/join-on-alias-target-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.InboundShippingOptionRules (
+  BusinessUnitId INT
+);
+CREATE TABLE dbo.BusinessUnits (
+  BusinessUnitId INT,
+  BusinessUnitCode VARCHAR(20)
+);
+`;
+
+  const querySql = `
+SELECT IIF(CAST(inr.Column1 AS VARCHAR(10)) = -1, 'ALL', CONCAT(bu.Column1, '-', bu.Column1)) AS [BU]
+FROM dbo.SomeTable inr
+LEFT JOIN dbo.SomeOtherTable bu ON inr.Column1 = bu.Column1;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const ambiguous = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+  assert.ok(
+    ambiguous.every(d => !String(d.message).includes("Column1")),
+    "Qualified alias column in JOIN ON should not surface ambiguous-column diagnostics"
   );
 });
 

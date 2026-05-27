@@ -845,4 +845,23 @@ FROM (
   );
 });
 
+runCase("create-view-union-projects-columns-for-indexing", () => {
+  const uri = "file:///regression/create-view-union-projects-columns.sql";
+  const sql = `
+CREATE VIEW [dbo].[SomeView]
+AS
+  SELECT [t0].[Column1] AS Column1
+  FROM [dbo].[Table1] [t0]
+  UNION
+  SELECT [t0].[Column1]
+  FROM [dbo].[Table2] [t0];
+`;
+
+  indexText(uri, sql);
+  assert.ok(
+    getRefs("someview.column1").length > 0,
+    "CREATE VIEW columns should be indexed when view body is a UNION/set-operator shape"
+  );
+});
+
 process.stdout.write("All regression index tests passed.\n");

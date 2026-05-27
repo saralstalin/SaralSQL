@@ -2589,6 +2589,15 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
     return;
   }
 
+  // Publish parser/local diagnostics first so users get quick feedback,
+  // then publish again after slower schema validation completes.
+  if (schemaValidationReady) {
+    connection.sendDiagnostics({
+      uri: doc.uri,
+      diagnostics: [...diagnostics]
+    });
+  }
+
   if (schemaValidationReady) {
     connection.console.log("[validate] entered schema block");
 
@@ -3047,13 +3056,26 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
             .map((sym: any) => {
               const explicitCols = Array.isArray(sym.columns) ? sym.columns : [];
               const explicitHas = explicitCols.some((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === column);
+              const aliasTarget = normalizeName(resolveAliasTableName(sym) ?? "");
+              const aliasTargetStripped = aliasTarget.replace(/^dbo\./, "");
+              const aliasTargetDef = aliasTarget
+                ? (localDefsByName.get(aliasTarget)
+                  || localDefsByName.get(aliasTargetStripped)
+                  || tablesByName.get(aliasTarget)
+                  || tablesByName.get(aliasTargetStripped)
+                  || tableTypesByName.get(aliasTarget)
+                  || tableTypesByName.get(aliasTargetStripped))
+                : null;
+              const targetHas = Array.isArray(aliasTargetDef?.columns)
+                ? aliasTargetDef.columns.some((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === column)
+                : false;
               const projected = getDerivedAliasProjectedColumns(table, sym);
               const projectedHas = projected.has(column);
-              const hasKnowledge = explicitCols.length > 0 || projected.size > 0;
-              return { sym, explicitHas, projectedHas, hasKnowledge };
+              const hasKnowledge = explicitCols.length > 0 || projected.size > 0 || Array.isArray(aliasTargetDef?.columns);
+              return { sym, explicitHas, targetHas, projectedHas, hasKnowledge };
             });
 
-          if (withColumns.some(x => x.explicitHas || x.projectedHas)) {
+          if (withColumns.some(x => x.explicitHas || x.projectedHas || x.targetHas)) {
             continue;
           }
 

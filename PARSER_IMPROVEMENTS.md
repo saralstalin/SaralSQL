@@ -33,6 +33,17 @@ The previously tracked 7 improvement areas are now covered by parser output and 
 - Bare columns over unverifiable sources (e.g. table variables) are flagged as `isUnverifiable` to prevent outer-scope leakage false positives.
 - `extractReferences` and `documentSymbols` deeply traverse into `TRY...CATCH` blocks, `WHILE` loops, and `RETURN` bodies.
 
+## Recently Fixed in SaralSQL (LSP-side)
+
+These were fixed in the extension and should **not** be counted as parser fixes yet:
+
+- Transient early schema errors on unopened/already-open files before index readiness.
+  - Fixed by gating schema-class diagnostics until workspace index is ready.
+- `CREATE VIEW` join alias false unknown-table (`Unknown table 'bu'`).
+  - Fixed by preventing schema validation on alias table tokens discovered from scope.
+- `SetOperator` derived alias qualified-column misses (for example `s.availableInventory`).
+  - Fixed by derived projection reconstruction in LSP for `UNION`/set-operator query shapes.
+
 ## Workaround Policy
 
 - If a parser gap affects editor behavior, keep any workaround local and add a regression test for the exact SQL snippet.
@@ -86,3 +97,22 @@ The previously tracked 7 improvement areas are now covered by parser output and 
 10. Schema diagnostics lifecycle contract.
    - Problem: transient schema diagnostics can appear before workspace schema/index is ready; this is currently gated in LSP as a timing workaround.
    - Goal: parser diagnostics payload should clearly separate parser-only semantic diagnostics from schema-dependent diagnostics (or include readiness intent/flag), so clients can consume parser diagnostics immediately without early false schema noise.
+
+## Ownership Clarification (Not Parser Improvements)
+
+- SQLCMD `:r` include file path resolution and suppression policy are LSP/client responsibilities.
+  - Parser should continue to surface unresolved-include facts (e.g., `SQLCMD_UNRESOLVED_INCLUDE`) from single-file parse context.
+  - LSP should decide whether to suppress/keep that diagnostic based on workspace-relative file existence and project conventions.
+  - Do not track `:r` path-resolution suppression as a parser gap.
+
+## SQLCMD Diagnostic Contract Gap
+
+11. SQLCMD unresolved-include severity/capability contract.
+   - Problem: parser can emit `SQLCMD_UNRESOLVED_INCLUDE` even when running in single-file mode where include resolution/validation is not possible, which creates noisy hard diagnostics.
+   - Goal: parser should mark unresolved `:r` include results as advisory/capability-scoped when include resolution is unavailable (for example via severity tier or explicit metadata flag like `requiresClientResolution`), so clients can present accurate non-blocking signals without blanket suppression.
+
+12. Mixed variable + column assignment semantics in `UPDATE ... SET`.
+   - Example:
+     - `UPDATE ri SET IsCommitted = 1, @DowncountEvent = CASE WHEN ri.IsExpired = 1 THEN ... END FROM ...`
+   - Problem: assignment targets in one `SET` list can mix table-column writes and variable writes, but consumers may treat all targets as table columns and emit incorrect diagnostics/indexing.
+   - Goal: parser should expose per-assignment target kind (`column-target` vs `variable-target`) and keep RHS lineage/column references intact, so LSP can validate table writes and variable writes correctly without heuristics.
