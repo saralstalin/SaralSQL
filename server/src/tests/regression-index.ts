@@ -712,4 +712,31 @@ WHERE d.DepartmentId = 23378
   assert.ok(empFirstNameRefs.some(r => r.uri === queryUri), "Bare FirstName should resolve to Employee when schema is present");
 });
 
+runCase("wildcard-qualifier-does-not-index-fake-column-from-alias-token", () => {
+  const schemaUri = "file:///regression/wildcard-qualifier-schema.sql";
+  const queryUri = "file:///regression/wildcard-qualifier-query.sql";
+  const schemaSql = `
+CREATE TABLE dbo.Department (DepartmentId INT);
+CREATE TABLE dbo.Employee (DepartmentId INT, Address NVARCHAR(50), PhoneNumber NVARCHAR(50));
+CREATE TABLE dbo.DepartmentSalaryInfo (DepartmentId INT);
+`;
+  const querySql = `
+SELECT *
+FROM (
+  SELECT d.*, e.Address, e.PhoneNumber
+  FROM dbo.Department d
+  JOIN dbo.Employee e ON e.DepartmentId = d.DepartmentId
+  JOIN dbo.DepartmentSalaryInfo dsi ON dsi.DepartmentId = d.DepartmentId
+) s
+WHERE s.DepartmentId = 1;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+
+  assert.strictEqual(getRefs("department.d").length, 0, "Alias wildcard token d from d.* must not be indexed as department.d");
+  assert.strictEqual(getRefs("employee.d").length, 0, "Alias wildcard token d from d.* must not be indexed as employee.d");
+  assert.strictEqual(getRefs("departmentsalaryinfo.d").length, 0, "Alias wildcard token d from d.* must not be indexed as departmentsalaryinfo.d");
+});
+
 process.stdout.write("All regression index tests passed.\n");

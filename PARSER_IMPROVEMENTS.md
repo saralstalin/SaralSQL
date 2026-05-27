@@ -58,3 +58,17 @@ The previously tracked 7 improvement areas are now covered by parser output and 
 4. DML read-scope source exposure for INSERT/UPDATE/DELETE statement bodies.
    - Examples: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... FROM` with bare columns.
    - Goal: parser scope/lineage should expose read-side source ownership at token offsets without mutation-target leakage, so LSP ambiguity diagnostics do not need statement-type filtering to avoid false ambiguous-column reports.
+
+5. Schema-agnostic parser diagnostics contract for unknown columns/tables.
+   - Problem: parser currently emits unknown-column style diagnostics even when schema is not available, which can conflict with LSP schema validation and local scope ownership decisions.
+   - Goal: parser semantic output should distinguish scope-resolvable issues from schema-dependent issues, and avoid emitting hard unknown-table/unknown-column diagnostics unless schema context is explicitly provided (or mark them as advisory/non-blocking with a clear flag).
+
+6. Wildcard qualifier token shape for alias star projections.
+   - Example: `SELECT d.* FROM dbo.Department d`.
+   - Problem: parser currently emits an extra `unknown` token for the qualifier (`d`) in `d.*`, which consumers can misinterpret as a bare/qualified column reference.
+   - Goal: parser reference extraction should represent `alias.*` as wildcard projection metadata only (or clearly typed wildcard token nodes), without emitting a standalone unknown-column token for the alias qualifier.
+
+7. Derived-alias projected-column contract for qualified references.
+   - Example: `SELECT s.UnknownColumn FROM (SELECT d.*, e.Address FROM ... ) s`.
+   - Problem: parser can resolve qualified references to derived aliases (`owner: s`) without exposing a strict projected-column existence decision for that alias result shape.
+   - Goal: parser semantic output should provide explicit projected-column membership decisions for derived aliases (exists/missing), so consumers can flag `s.UnknownColumn` directly without LSP-side alias projection reconstruction.

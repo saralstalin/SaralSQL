@@ -60,8 +60,9 @@ import {
 } from "./definitions";
 import { parseSql, type ParseResult } from "./sql-parser";
 import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, buildSelectStarExpansionCodeActions, buildUpdateNoLockCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, normalizeSaralSqlSettings, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "./diagnostic-helpers";
-import { getCteColumns, resolveAliasTableName, resolveSymbolCaseInsensitive, normalizeAstTableName, resolveAliasFromAst, getDisplaySymbolName } from "./ast-utils";
+import { getCteColumns, resolveAliasTableName, resolveSymbolCaseInsensitive, resolveAliasFromAst, getDisplaySymbolName } from "./ast-utils";
 import { collectNearestScopeColumnOwners } from "./scope-column-resolver";
+import { resolveBareColumnAtOffset } from "./column-resolution";
 import { LruCache } from "./lru-cache";
 
 // ---------- Connection + Documents ----------
@@ -1123,7 +1124,7 @@ function getVariableCompletionItems(scopeAtPos: any): CompletionItem[] {
   return items;
 }
 
-function getParserAliasColumnNames(parsed: ParseResult | null | undefined, sym: any): string[] {
+function getParserAliasColumnNames(parsed: ParseResult | null | undefined, sym: any, localDefsByName?: Map<string, any>): string[] {
   const names = new Map<string, string>();
 
   if (Array.isArray(sym?.columns)) {
@@ -1138,6 +1139,43 @@ function getParserAliasColumnNames(parsed: ParseResult | null | undefined, sym: 
 
   const aliasName = normalizeName(sym?.name ?? "");
   const sources = Array.isArray((parsed as any)?.lineage?.sources) ? (parsed as any).lineage.sources : [];
+
+  const addColumnsFromSchemaSourceAlias = (sourceAlias: string): void => {
+    const targetAlias = normalizeName(sourceAlias);
+    if (!targetAlias) {
+      return;
+    }
+    for (const src of sources) {
+      const srcAlias = normalizeName(String(src?.alias ?? src?.name ?? ""));
+      if (srcAlias !== targetAlias) {
+        continue;
+      }
+      const candidates = [
+        normalizeName(String(src?.baseName ?? "")),
+        normalizeName(String(src?.name ?? ""))
+      ].filter(Boolean);
+      for (const candidate of candidates) {
+        const stripped = candidate.replace(/^dbo\./, "");
+        const def = localDefsByName?.get(candidate)
+          || localDefsByName?.get(stripped)
+          || tablesByName.get(candidate)
+          || tablesByName.get(stripped)
+          || tableTypesByName.get(candidate)
+          || tableTypesByName.get(stripped);
+        if (!def || !Array.isArray(def.columns)) {
+          continue;
+        }
+        for (const c of def.columns) {
+          const raw = String(c?.rawName ?? c?.name ?? "").trim();
+          const norm = normalizeName(raw);
+          if (norm) {
+            names.set(norm, raw);
+          }
+        }
+      }
+    }
+  };
+
   for (const source of sources) {
     const sourceName = normalizeName(source?.alias ?? source?.name ?? "");
     if (!aliasName || sourceName !== aliasName || !Array.isArray(source?.projection)) {
@@ -1147,8 +1185,48 @@ function getParserAliasColumnNames(parsed: ParseResult | null | undefined, sym: 
     for (const projection of source.projection) {
       const name = String(projection?.name ?? "").trim();
       const norm = normalizeName(name);
-      if (norm) {
+      if (norm && norm !== "*") {
         names.set(norm, name);
+      }
+    }
+  }
+
+  // Expand wildcard projections in derived/subquery aliases using lineage source projections.
+  // Example: SELECT d.*, e.Address ... FROM ... AS s
+  const queryCols = sym?.location?.table?.query?.columns;
+  if (Array.isArray(queryCols)) {
+    for (const col of queryCols) {
+      if (col?.type !== "Column" || col?.wildcard !== true || col?.expression?.type !== "WildcardExpression") {
+        continue;
+      }
+      const prefix = normalizeName(String(col?.expression?.tablePrefix?.name ?? ""));
+      if (!prefix) {
+        continue;
+      }
+      for (const source of sources) {
+        const sourceName = normalizeName(source?.alias ?? source?.name ?? "");
+        if (sourceName !== prefix || !Array.isArray(source?.projection)) {
+          continue;
+        }
+        for (const projection of source.projection) {
+          const name = String(projection?.name ?? "").trim();
+          const norm = normalizeName(name);
+          if (norm) {
+            names.set(norm, name);
+          }
+        }
+      }
+    }
+    // If wildcard source projection could not be expanded from lineage, hydrate from indexed schema.
+    if (names.size === 0) {
+      for (const col of queryCols) {
+        if (col?.type !== "Column" || col?.wildcard !== true || col?.expression?.type !== "WildcardExpression") {
+          continue;
+        }
+        const prefix = normalizeName(String(col?.expression?.tablePrefix?.name ?? ""));
+        if (prefix) {
+          addColumnsFromSchemaSourceAlias(prefix);
+        }
       }
     }
   }
@@ -1627,48 +1705,35 @@ function findStatementLocalColumnOwner(
   offset?: number,
   localDefsByName?: Map<string, any>
 ): { kindLabel: string; ownerName: string; column: any } | null {
-  const colNorm = normalizeName(columnName);
-  if (!colNorm) {
-    return null;
-  }
-  const resolutionAtOffset = (typeof offset === "number" && parsed?.columns?.resolutions)
-    ? parsed.columns.resolutions.find((r: any) => {
-      const s = Number(r?.location?.start);
-      const e = Number(r?.location?.end);
-      return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
-    })
-    : null;
-  const decisionOwner = normalizeName(
-    String(
-      resolutionAtOffset?.owner
-      ?? resolutionAtOffset?.decision?.owner
-      ?? ""
-    )
-  );
-  if (decisionOwner) {
-    const decisionColumnName = normalizeName(String(columnName).split(".").pop() ?? "");
-    const stripped = decisionOwner.replace(/^dbo\./, "");
-    const def = localDefsByName?.get(decisionOwner)
-      || localDefsByName?.get(stripped)
-      || tablesByName.get(decisionOwner)
-      || tableTypesByName.get(decisionOwner)
-      || tablesByName.get(stripped)
-      || tableTypesByName.get(stripped);
-    const col = def?.columns?.find((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === decisionColumnName);
-    if (col) {
+  if (typeof offset !== "number") {
+    const colNorm = normalizeName(columnName);
+    if (!colNorm) {
+      return null;
+    }
+    const owners = collectNearestScopeColumnOwners(scopeAtPos, colNorm, tablesByName, tableTypesByName, localDefsByName);
+    if (owners.length === 1) {
       return {
-        kindLabel: tableTypesByName.has(decisionOwner) ? "table type" : "table",
-        ownerName: String(def?.rawName ?? def?.name ?? decisionOwner),
-        column: col
+        kindLabel: owners[0].kindLabel,
+        ownerName: owners[0].ownerName,
+        column: owners[0].column
       };
     }
+    return null;
   }
-  const owners = collectNearestScopeColumnOwners(scopeAtPos, colNorm, tablesByName, tableTypesByName, localDefsByName);
-  if (owners.length === 1) {
+  const resolved = resolveBareColumnAtOffset({
+    parsed,
+    offset,
+    columnName,
+    tablesByName,
+    tableTypesByName,
+    scopeAtPos,
+    localDefsByName
+  });
+  if (resolved.status === "resolved" && resolved.owner?.column) {
     return {
-      kindLabel: owners[0].kindLabel,
-      ownerName: owners[0].ownerName,
-      column: owners[0].column
+      kindLabel: resolved.owner.kindLabel,
+      ownerName: resolved.owner.ownerName,
+      column: resolved.owner.column
     };
   }
   return null;
@@ -1689,32 +1754,20 @@ function isAmbiguousBareColumnAtPosition(doc: TextDocument, position: Position, 
   }
 
   const offset = doc.offsetAt(position);
-  const resolutionAtOffset = parsed?.columns?.resolutions?.find((r: any) => {
-    const s = Number(r?.location?.start);
-    const e = Number(r?.location?.end);
-    return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
-  });
-  const ambiguityCandidates = Array.isArray(resolutionAtOffset?.ambiguityCandidates)
-    ? resolutionAtOffset.ambiguityCandidates
-    : Array.isArray(resolutionAtOffset?.decision?.ambiguityCandidates)
-      ? resolutionAtOffset.decision.ambiguityCandidates
-      : [];
-  const decisionReason = normalizeName(String(resolutionAtOffset?.decisionReason ?? resolutionAtOffset?.decision?.decisionReason ?? ""));
-  if (ambiguityCandidates.length > 1 || decisionReason.includes("ambig")) {
-    return true;
-  }
-  const decisionOwner = normalizeName(String(resolutionAtOffset?.owner ?? resolutionAtOffset?.decision?.owner ?? ""));
-  if (decisionOwner) {
-    return false;
-  }
   const normUri = toNormUri(doc.uri);
   const localDefsByName = new Map<string, any>();
   for (const def of definitions.get(normUri) ?? []) {
     localDefsByName.set(normalizeName(def.name), def);
   }
-  const scopeAtPos: any = parsed?.scope?.root?.findInnermost?.(offset) ?? parsed?.scope?.root;
-  const owners = collectNearestScopeColumnOwners(scopeAtPos, colNorm, tablesByName, tableTypesByName, localDefsByName);
-  return owners.length > 1;
+  const resolved = resolveBareColumnAtOffset({
+    parsed,
+    offset,
+    columnName: rawWord,
+    tablesByName,
+    tableTypesByName,
+    localDefsByName
+  });
+  return resolved.status === "ambiguous";
 }
 
 // --- References ---
@@ -2354,7 +2407,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
                     }
                   }
                 }
-                const derivedColumns = getParserAliasColumnNames(parsed, aliasSym);
+                const derivedColumns = getParserAliasColumnNames(parsed, aliasSym, localDefsByName);
                 if (!colDef && derivedColumns.some(c => normalizeName(c) === colName)) {
                   colDef = { name: colName, rawName: colName };
                   containerName = getDisplaySymbolName(aliasSym) ?? tableName;
@@ -2493,6 +2546,11 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         });
 
     for (const diag of semanticDiags) {
+      if (String((diag as any)?.code ?? "").toUpperCase() === "SQLCMD_UNRESOLVED_INCLUDE") {
+        if (resolveExistingSqlCmdInclude(doc.uri, String((diag as any)?.message ?? ""))) {
+          continue;
+        }
+      }
       const diagnostic = toDiagnostic(diag, "SaralSQL Parser");
       if (diagnostic && !shouldSuppressDiagnosticCode(String((diag as any).code ?? diagnostic.code ?? ""), disabledDiagnosticCodes)) {
           if ((diagnostic.code === SARAL_DIAGNOSTIC_CODES.UnknownColumn || diagnostic.code === SARAL_DIAGNOSTIC_CODES.AmbiguousColumn) && typeof diag.start === "number") {
@@ -2743,6 +2801,90 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         return sym.columns.some((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === target);
       }
 
+      function getDerivedAliasProjectedColumns(aliasNorm: string, aliasSym?: any): Set<string> {
+        const out = new Set<string>();
+        const sources = Array.isArray(parsed?.lineage?.sources) ? parsed.lineage.sources : [];
+
+        const addColumnsFromSourceAlias = (sourceAlias: string): void => {
+          const targetAlias = normalizeName(sourceAlias);
+          if (!targetAlias) {
+            return;
+          }
+
+          for (const src of sources) {
+            const srcAlias = normalizeName(String(src?.alias ?? src?.name ?? ""));
+            if (srcAlias !== targetAlias) {
+              continue;
+            }
+            const candidates = [
+              normalizeName(String(src?.baseName ?? "")),
+              normalizeName(String(src?.name ?? ""))
+            ].filter(Boolean);
+            for (const candidate of candidates) {
+              const stripped = candidate.replace(/^dbo\./, "");
+              const def = localDefsByName.get(candidate)
+                || localDefsByName.get(stripped)
+                || tablesByName.get(candidate)
+                || tablesByName.get(stripped)
+                || tableTypesByName.get(candidate)
+                || tableTypesByName.get(stripped);
+              if (!def || !Array.isArray(def.columns)) {
+                continue;
+              }
+              for (const c of def.columns) {
+                const n = normalizeName(String(c?.rawName ?? c?.name ?? ""));
+                if (n) {
+                  out.add(n);
+                }
+              }
+            }
+          }
+        };
+
+        for (const src of sources) {
+          const srcAlias = normalizeName(String(src?.alias ?? src?.name ?? ""));
+          if (!srcAlias || srcAlias !== aliasNorm || !Array.isArray(src?.projection)) {
+            continue;
+          }
+          for (const p of src.projection) {
+            const n = normalizeName(String(p?.name ?? ""));
+            if (n && n !== "*") {
+              out.add(n);
+            }
+          }
+        }
+
+        // Expand wildcard projection parts in derived aliases, e.g. SELECT d.*, e.Address ... AS s
+        const queryCols = aliasSym?.location?.table?.query?.columns;
+        if (Array.isArray(queryCols)) {
+          for (const col of queryCols) {
+            if (col?.type !== "Column" || col?.wildcard !== true || col?.expression?.type !== "WildcardExpression") {
+              continue;
+            }
+            const prefix = normalizeName(String(col?.expression?.tablePrefix?.name ?? ""));
+            if (!prefix) {
+              continue;
+            }
+            for (const src of sources) {
+              const srcName = normalizeName(String(src?.alias ?? src?.name ?? ""));
+              if (srcName !== prefix || !Array.isArray(src?.projection)) {
+                continue;
+              }
+              for (const p of src.projection) {
+                const n = normalizeName(String(p?.name ?? ""));
+                if (n && n !== "*") {
+                  out.add(n);
+                }
+              }
+            }
+            // If parser projection for that source alias is empty or wildcard-only, hydrate from indexed schema.
+            addColumnsFromSourceAlias(prefix);
+          }
+        }
+
+        return out;
+      }
+
       function collectCteNames(scope: any): void {
         const symbols = typeof scope?.getOwnSymbols === "function"
           ? scope.getOwnSymbols()
@@ -2774,11 +2916,10 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
       }
 
       for (const ref of refsForDoc) {
-        if (ref.validateSchema === false) {
-          continue;
-        }
-
         if (ref.kind === "table") {
+          if (ref.validateSchema === false) {
+            continue;
+          }
           if (ref.context === "create-definition") {
             continue;
           }
@@ -2808,12 +2949,48 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
 
         const lastDot = ref.name.lastIndexOf(".");
         if (lastDot <= 0) {
+          if (ref.validateSchema === false) {
+            continue;
+          }
           continue;
         }
 
         const table = normalizeName(ref.name.slice(0, lastDot));
         const column = normalizeName(ref.name.slice(lastDot + 1));
         const refOffset = (lineStarts[ref.line] ?? 0) + ref.start;
+
+        // Validate local derived/alias sources (e.g., subquery alias "s") even when ref.validateSchema is false.
+        const scopeAtPos = parsed?.scope?.root?.findInnermost?.(refOffset) ?? parsed?.scope?.root;
+        const scopedSym = resolveSymbolCaseInsensitive(scopeAtPos, table);
+        if (scopedSym?.kind === "Alias" && Array.isArray(scopedSym.columns) && scopedSym.columns.length > 0) {
+          const hasLocalCol = scopedSym.columns.some((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === column);
+          if (!hasLocalCol) {
+            addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplaySymbolName(scopedSym) || table);
+          }
+          continue;
+        }
+        if (scopedSym?.kind === "Alias") {
+          const projected = getDerivedAliasProjectedColumns(table, scopedSym);
+          if (projected.size > 0) {
+            if (!projected.has(column)) {
+              addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplaySymbolName(scopedSym) || table);
+            }
+            continue;
+          }
+        }
+        if (scopedSym?.kind === "CTE") {
+          const cteCols = getCteColumns(scopedSym);
+          const hasLocalCol = cteCols.some((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === column);
+          if (!hasLocalCol) {
+            addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplaySymbolName(scopedSym) || table);
+          }
+          continue;
+        }
+
+        if (ref.validateSchema === false) {
+          continue;
+        }
+
         if (propertyAccessStarts.has(refOffset)) {
           continue;
         }
@@ -3045,6 +3222,28 @@ function isSystemTableReference(tableName: string): boolean {
 function isOutputPseudoTableReference(tableName: string): boolean {
   const norm = normalizeName(tableName);
   return norm === "inserted" || norm === "deleted";
+}
+
+function resolveExistingSqlCmdInclude(docUri: string, message: string): string | null {
+  const includeMatch = /SQLCMD include was not resolved:\s*(.+?)\.\s*$/i.exec(String(message ?? "").trim());
+  if (!includeMatch) {
+    return null;
+  }
+
+  let includeRaw = String(includeMatch[1] ?? "").trim();
+  if (!includeRaw || includeRaw === "<empty>") {
+    return null;
+  }
+  includeRaw = includeRaw.replace(/^["']|["']$/g, "");
+
+  try {
+    const docFsPath = url.fileURLToPath(docUri);
+    const baseDir = path.dirname(docFsPath);
+    const resolved = path.isAbsolute(includeRaw) ? includeRaw : path.resolve(baseDir, includeRaw);
+    return fs.existsSync(resolved) ? resolved : null;
+  } catch {
+    return null;
+  }
 }
 
 function mapSeverity(severity: unknown, code?: string): DiagnosticSeverity {

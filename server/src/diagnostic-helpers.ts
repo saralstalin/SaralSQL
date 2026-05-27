@@ -3,6 +3,7 @@ import { isSqlKeyword, normalizeName, offsetToPosition } from "./text-utils";
 import { getCteColumns, getDisplaySymbolName, normalizeAstTableName, resolveAliasTableName, resolveSymbolCaseInsensitive } from "./ast-utils";
 import { collectNearestScopeColumnOwners } from "./scope-column-resolver";
 import { extractReferences } from "@saralsql/tsql-parser";
+import { resolveBareColumnAtOffset } from "./column-resolution";
 
 export const SARAL_DIAGNOSTIC_CODES = {
   UnknownTable: "LSP001",
@@ -224,35 +225,19 @@ export function collectAmbiguousColumnDiagnostics(
       continue;
     }
 
-    const matchedResolution = resolutions.find((r: any) => r.location?.start === ref.location.start);
-    const decisionOwner = normalizeName(
-      String(
-        matchedResolution?.owner
-        ?? matchedResolution?.decision?.owner
-        ?? ""
-      )
-    );
-    const ambiguityCandidates = Array.isArray(matchedResolution?.ambiguityCandidates)
-      ? matchedResolution.ambiguityCandidates
-      : Array.isArray(matchedResolution?.decision?.ambiguityCandidates)
-        ? matchedResolution.decision.ambiguityCandidates
-        : [];
-    const decisionReason = normalizeName(String(matchedResolution?.decisionReason ?? matchedResolution?.decision?.decisionReason ?? ""));
+    const resolved = resolveBareColumnAtOffset({
+      parsed,
+      offset: ref.location.start,
+      columnName: name,
+      tablesByName,
+      tableTypesByName
+    });
     const readSourceCount = getReadScopeSourceCountAtOffset(readScopeRanges, ref.location.start);
-    if (readSourceCount === 1 && !decisionReason.includes("ambig")) {
+    if (readSourceCount === 1) {
       continue;
     }
 
-    if (ambiguityCandidates.length > 1 || decisionReason.includes("ambig")) {
-      const narrowedCandidates = narrowAmbiguityCandidatesBySchema(
-        colNorm,
-        ambiguityCandidates,
-        tablesByName,
-        tableTypesByName
-      );
-      if (narrowedCandidates !== null && narrowedCandidates <= 1) {
-        continue;
-      }
+    if (resolved.status === "ambiguous") {
       const startPos = offsetToPosition(ref.location.start, lineStarts);
       const endPos = offsetToPosition(ref.location.end ?? ref.location.start, lineStarts);
       const key = `${startPos.line}:${startPos.character}:${colNorm}`;
@@ -272,10 +257,11 @@ export function collectAmbiguousColumnDiagnostics(
       continue;
     }
 
-    if (decisionOwner) {
+    if (resolved.status === "resolved") {
       continue;
     }
 
+    const matchedResolution = resolutions.find((r: any) => r.location?.start === ref.location.start);
     const resolvedSources = new Set<string>();
     if (matchedResolution?.inputs) {
       for (const input of matchedResolution.inputs) {
@@ -309,96 +295,6 @@ export function collectAmbiguousColumnDiagnostics(
   }
 
   return diagnostics;
-}
-
-function narrowAmbiguityCandidatesBySchema(
-  columnNorm: string,
-  parserCandidates: any[],
-  tablesByName: Map<string, any>,
-  tableTypesByName: Map<string, any>
-): number | null {
-  if (!Array.isArray(parserCandidates) || parserCandidates.length === 0) {
-    return null;
-  }
-
-  let checked = 0;
-  let matched = 0;
-  const seen = new Set<string>();
-
-  for (const candidate of parserCandidates) {
-    const raw = String(candidate ?? "").trim();
-    if (!raw) {
-      continue;
-    }
-    const norm = normalizeName(raw);
-    if (!norm || seen.has(norm)) {
-      continue;
-    }
-    seen.add(norm);
-
-    const tableSym = resolveCandidateSymbol(tablesByName, raw, norm);
-    if (tableSym) {
-      checked++;
-      if (symbolHasColumn(tableSym, columnNorm)) {
-        matched++;
-      }
-      continue;
-    }
-
-    const typeSym = resolveCandidateSymbol(tableTypesByName, raw, norm);
-    if (typeSym) {
-      checked++;
-      if (symbolHasColumn(typeSym, columnNorm)) {
-        matched++;
-      }
-    }
-  }
-
-  if (checked === 0) {
-    return null;
-  }
-  return matched;
-}
-
-function resolveCandidateSymbol(map: Map<string, any>, raw: string, normalizedRaw: string): any {
-  const normalizedAstName = normalizeName(normalizeAstTableName(raw) ?? "");
-  return resolveMapSymbolCaseInsensitive(map, normalizedRaw)
-    ?? resolveMapSymbolCaseInsensitive(map, normalizedAstName)
-    ?? resolveMapSymbolCaseInsensitive(map, normalizeName(raw.split(".").pop() ?? raw));
-}
-
-function resolveMapSymbolCaseInsensitive(map: Map<string, any>, normalizedName: string): any {
-  if (!map || !normalizedName) {
-    return null;
-  }
-
-  const direct = map.get(normalizedName);
-  if (direct) {
-    return direct;
-  }
-
-  const target = normalizedName.toLowerCase();
-  for (const [key, value] of map.entries()) {
-    if (String(key).toLowerCase() === target) {
-      return value;
-    }
-  }
-  return null;
-}
-
-function symbolHasColumn(symbol: any, columnNorm: string): boolean {
-  const cols = Array.isArray(symbol?.localColumns)
-    ? symbol.localColumns
-    : Array.isArray(symbol?.columns)
-      ? symbol.columns
-      : [];
-  for (const col of cols) {
-    const name = normalizeName(String(typeof col === "string" ? col : col?.name ?? ""));
-    if (name && name === columnNorm) {
-      return true;
-    }
-  }
-  return false;
 }
 
 function collectReadScopeRanges(parsed: any): Array<{ start: number; end: number; sourceCount: number }> {
@@ -623,6 +519,17 @@ export function collectReadableBareColumnDiagnostics(
 
     const scopeAtPos = parsed.scope.root.findInnermost?.(ref.location.start) ?? parsed.scope.root;
     const colNorm = normalizeName(name);
+    const resolved = resolveBareColumnAtOffset({
+      parsed,
+      offset: ref.location.start,
+      columnName: name,
+      tablesByName,
+      tableTypesByName,
+      scopeAtPos
+    });
+    if (resolved.status !== "resolved") {
+      continue;
+    }
     const matches = collectReadableAliasMatchesIncremental(scopeAtPos, colNorm, tablesByName, tableTypesByName);
 
     if (matches.length !== 1) {
@@ -1056,11 +963,15 @@ function collectSelectSources(fromNodes: any[]): Array<{ qualifier: string; tabl
 
 function collectSourceFromTableLike(node: any): { qualifier: string; tableName: string } | null {
   const tableName = normalizeName(normalizeAstTableName(node?.table) ?? "");
-  if (!tableName) {
-    return null;
-  }
-
   const alias = String(node?.alias ?? "").trim();
+  if (!tableName) {
+    // Derived source (subquery/APPLY/etc.) can still support alias.* expansion via scope symbol columns.
+    if (!alias) {
+      return null;
+    }
+    const derivedKey = `__derived__.${normalizeName(alias)}`;
+    return { qualifier: alias, tableName: derivedKey };
+  }
   const qualifier = alias || getIdentifierTail(node?.table) || tableName;
   return { qualifier, tableName };
 }

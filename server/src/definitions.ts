@@ -464,6 +464,9 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                 kind: "parameter"
             });
         } else if (ref.kind === "column" || ref.kind === "unknown") {
+            if (isWildcardQualifierToken(ref, text)) {
+                continue;
+            }
             const colName = ref.name.split('.').pop()!;
             const colNameNorm = normalizeName(colName);
             if (isSqlKeyword(colNameNorm)) {
@@ -496,6 +499,8 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                         const matchedTable = fileAliases?.get(qualifierNorm);
                         if (matchedTable && matchedTable.toLowerCase() !== "__subquery__") {
                             explicitQualifiedTarget = normalizeName(matchedTable);
+                        } else if (matchedTable && matchedTable.toLowerCase() === "__subquery__") {
+                            explicitQualifiedTarget = qualifierNorm;
                         } else {
                             explicitQualifiedTarget = qualifierNorm;
                         }
@@ -552,7 +557,7 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                     let resolvedTable: string | null = null;
                     for (const sym of visibleSymbols) {
                         if (sym.kind === "Alias" && normalizeName(sym.name) === aliasOrTableNorm) {
-                            resolvedTable = resolveAliasTableName(sym) ?? null;
+                            resolvedTable = resolveAliasTableName(sym) ?? normalizeName(String(sym.name ?? "")) ?? null;
                             break;
                         } else if ((sym.kind === "Table" || sym.kind === "TempTable" || sym.kind === "CTE") && normalizeName(sym.name) === aliasOrTableNorm) {
                             resolvedTable = sym.name;
@@ -567,6 +572,8 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                         if (matchedTable && matchedTable.toLowerCase() !== "__subquery__") {
                             resolvedTable = matchedTable;
                             resolvedFromFileAlias = true;
+                        } else if (matchedTable && matchedTable.toLowerCase() === "__subquery__") {
+                            resolvedTable = aliasOrTableNorm;
                         }
                     }
 
@@ -696,6 +703,8 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                     const tableName = resolveAliasTableName(sym);
                     if (tableName) {
                         parsedAliases.set(normalizeName(sym.name), normalizeName(tableName));
+                    } else if (Array.isArray(sym.columns) && sym.columns.length > 0) {
+                        parsedAliases.set(normalizeName(sym.name), "__subquery__");
                     }
                 }
             }
@@ -709,7 +718,6 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
     aliasesByUri.set(normUri, parsedAliases);
 
     for (const def of defs) {
-        if (!def.columns || !Array.isArray(def.columns) || def.columns.length === 0) { continue; }
         const kindNorm = (def.kind || "").toUpperCase();
         if (!includeInWorkspaceSchema) {
             continue;
@@ -804,6 +812,18 @@ function collectBareColumnCandidateTablesIncremental(scopeAtPos: any, colNorm: s
     }
 
     return out;
+}
+
+function isWildcardQualifierToken(ref: any, text: string): boolean {
+    if (!ref || typeof ref.name !== "string" || typeof ref.location?.end !== "number") {
+        return false;
+    }
+    // Parser can emit alias token as unknown ("d") for "d.*". Ignore that token for column indexing.
+    if (ref.name.includes(".")) {
+        return false;
+    }
+    const tail = text.slice(ref.location.end, ref.location.end + 6);
+    return /^\s*\.\s*\*/.test(tail);
 }
 
 function collectTablesFromDeepestSelectAtOffset(ast: ParseResult["ast"] | null, offset: number): string[] {
@@ -948,10 +968,8 @@ function indexQualifiedColumnReferencesFromAst(
             return;
         }
 
-        const tableName = resolveAliasTableName(sym);
-        if (!tableName) {
-            return;
-        }
+        const tableName = resolveAliasTableName(sym) ?? normalizeName(String(sym.name ?? ""));
+        if (!tableName) { return; }
 
         const normalizedTableName = tableName ? normalizeName(tableName) : "";
         const isSchemaValidTableAlias = Boolean(normalizedTableName) && (tablesByName.has(normalizedTableName) || tableTypesByName.has(normalizedTableName));
