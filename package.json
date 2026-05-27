@@ -14,7 +14,7 @@
     "database development"
   ],
   "license": "MIT",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "engines": {
     "vscode": "^1.103.0"
   },
