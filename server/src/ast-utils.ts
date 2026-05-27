@@ -342,27 +342,59 @@ export function resolveAliasTableName(sym: any): string | undefined {
 }
 
 export function getCteColumns(sym: any): Array<{ name: string; rawName: string; start?: number; end?: number }> {
-  const cols = sym?.location?.query?.columns;
-  if (!Array.isArray(cols)) {
-    return [];
+  const cols = getQueryProjectionColumns(sym?.location?.query);
+  const out: Array<{ name: string; rawName: string; start?: number; end?: number }> = [];
+  if (Array.isArray(cols)) {
+    for (const col of cols) {
+      const rawName = String(col?.outputName ?? col?.sourceName ?? col?.expression?.name ?? "").trim();
+      if (!rawName || normalizeName(rawName) === "expression") {
+        continue;
+      }
+
+      out.push({
+        name: normalizeName(rawName),
+        rawName,
+        start: typeof col?.start === "number" ? col.start : undefined,
+        end: typeof col?.end === "number" ? col.end : undefined
+      });
+    }
   }
 
-  const out: Array<{ name: string; rawName: string; start?: number; end?: number }> = [];
-  for (const col of cols) {
-    const rawName = String(col?.outputName ?? col?.sourceName ?? col?.expression?.name ?? "").trim();
-    if (!rawName) {
-      continue;
+  if (out.length === 0 && Array.isArray(sym?.location?.columns)) {
+    for (const raw of sym.location.columns) {
+      const rawName = String(raw ?? "").trim();
+      if (!rawName) {
+        continue;
+      }
+      out.push({
+        name: normalizeName(rawName),
+        rawName
+      });
     }
-
-    out.push({
-      name: normalizeName(rawName),
-      rawName,
-      start: typeof col?.start === "number" ? col.start : undefined,
-      end: typeof col?.end === "number" ? col.end : undefined
-    });
   }
 
   return out;
+}
+
+function getQueryProjectionColumns(query: any): any[] {
+  if (!query || typeof query !== "object") {
+    return [];
+  }
+
+  if (Array.isArray(query.columns) && query.columns.length > 0) {
+    return query.columns;
+  }
+
+  // Recursive CTEs and UNION-based CTEs often come as SetOperator nodes.
+  if (query.type === "SetOperator") {
+    const leftCols = getQueryProjectionColumns(query.left);
+    if (leftCols.length > 0) {
+      return leftCols;
+    }
+    return getQueryProjectionColumns(query.right);
+  }
+
+  return [];
 }
 
 export function resolveSymbolCaseInsensitive(scope: any, name: string): any {

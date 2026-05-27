@@ -443,6 +443,10 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
 
         if (ref.kind === "table") {
             const isFunctionCall = functionCallStarts.has(ref.location.start);
+            const scopeAtPos = parsed.scope?.root?.findInnermost(ref.location.start);
+            const scopedSym = resolveSymbolCaseInsensitive(scopeAtPos, ref.name);
+            const isAliasReference = scopedSym?.kind === "Alias"
+                && normalizeName(String(scopedSym?.name ?? "")) === normalizeName(ref.name);
             processedTableRefs.add(`${ref.location.start}:${ref.location.end}`);
             localRefs.push({
                 name: normalizeName(ref.name),
@@ -452,7 +456,7 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                 end: endChar,
                 kind: "table",
                 context: ref.context,
-                validateSchema: ref.context !== "execute-target" && !isFunctionCall
+                validateSchema: ref.context !== "execute-target" && !isFunctionCall && !isAliasReference
             });
         } else if (ref.kind === "variable") {
             localRefs.push({

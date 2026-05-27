@@ -72,3 +72,17 @@ The previously tracked 7 improvement areas are now covered by parser output and 
    - Example: `SELECT s.UnknownColumn FROM (SELECT d.*, e.Address FROM ... ) s`.
    - Problem: parser can resolve qualified references to derived aliases (`owner: s`) without exposing a strict projected-column existence decision for that alias result shape.
    - Goal: parser semantic output should provide explicit projected-column membership decisions for derived aliases (exists/missing), so consumers can flag `s.UnknownColumn` directly without LSP-side alias projection reconstruction.
+
+8. Alias-reference kind for table tokens (avoid schema-validating alias names).
+   - Example: `CREATE VIEW ... LEFT JOIN dbo.BusinessUnits bu ON ...` where `bu` can be surfaced as a table-like token.
+   - Problem: consumers currently infer alias-vs-table using scope at offset; if missed, aliases can be schema-validated and produce false `Unknown table 'bu'`.
+   - Goal: parser `extractReferences` should emit explicit alias-reference kind/context (or a `validateSchema=false` contract for alias tokens), so LSP does not need scope-based alias suppression.
+
+9. Set-operator projection contract for derived aliases.
+   - Example: `FROM (SELECT ... UNION SELECT ... ) s` then `SELECT s.availableInventory`.
+   - Problem: derived alias projection can be incomplete/placeholder-based for `SetOperator` query shapes, forcing LSP to reconstruct projection from branch AST.
+   - Goal: parser should expose finalized projected output columns for set-operator derived queries (raw + normalized names, stable membership), so qualified validation is direct and case-insensitive without LSP rebuild logic.
+
+10. Schema diagnostics lifecycle contract.
+   - Problem: transient schema diagnostics can appear before workspace schema/index is ready; this is currently gated in LSP as a timing workaround.
+   - Goal: parser diagnostics payload should clearly separate parser-only semantic diagnostics from schema-dependent diagnostics (or include readiness intent/flag), so clients can consume parser diagnostics immediately without early false schema noise.

@@ -78,6 +78,13 @@ let sqlProjWarnMissingFile = true;
 let sqlProjMissingFileSeverity: DiagnosticSeverity = DiagnosticSeverity.Warning;
 let disabledDiagnosticCodes = new Set<string>();
 let diagnosticSeverityOverrides = new Map<string, DiagnosticSeverity>();
+const schemaDiagnosticCodes = new Set<string>([
+  SARAL_DIAGNOSTIC_CODES.UnknownTable,
+  SARAL_DIAGNOSTIC_CODES.UnknownColumn,
+  SARAL_DIAGNOSTIC_CODES.AmbiguousColumn,
+  SARAL_DIAGNOSTIC_CODES.ReadabilityQualifyColumn,
+  SARAL_DIAGNOSTIC_CODES.StringComparison
+]);
 const DEBUG = process.env.SARALSQL_DEBUG === "1";
 const dbg = (...args: any[]) => { if (DEBUG) { console.debug("[SaralSQL]", ...args); } };
 type SqlProjItemKind = "build" | "none" | "preDeploy" | "postDeploy" | "other";
@@ -2454,6 +2461,8 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
 
   connection.console.log("[validate] ENTER");
   connection.console.log(`[validate] indexReady=${getIndexReady()}`);
+  const indexReady = typeof getIndexReady === "function" ? getIndexReady() : true;
+  const schemaValidationReady = enableSchemaValidation && indexReady;
 
   const diagnostics: Diagnostic[] = [];
   const text = doc.getText();
@@ -2546,6 +2555,10 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         });
 
     for (const diag of semanticDiags) {
+      const diagCode = String((diag as any)?.code ?? "").toUpperCase();
+      if (!schemaValidationReady && schemaDiagnosticCodes.has(diagCode)) {
+        continue;
+      }
       if (String((diag as any)?.code ?? "").toUpperCase() === "SQLCMD_UNRESOLVED_INCLUDE") {
         if (resolveExistingSqlCmdInclude(doc.uri, String((diag as any)?.message ?? ""))) {
           continue;
@@ -2576,7 +2589,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
     return;
   }
 
-  if (enableSchemaValidation && (typeof getIndexReady !== "function" || getIndexReady())) {
+  if (schemaValidationReady) {
     connection.console.log("[validate] entered schema block");
 
     try {
@@ -2804,6 +2817,26 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
       function getDerivedAliasProjectedColumns(aliasNorm: string, aliasSym?: any): Set<string> {
         const out = new Set<string>();
         const sources = Array.isArray(parsed?.lineage?.sources) ? parsed.lineage.sources : [];
+        const isMeaningfulProjectionName = (value: string): boolean => {
+          const n = normalizeName(value);
+          return Boolean(n && n !== "expression" && n !== "*");
+        };
+        const collectQueryProjectionColumns = (query: any): any[] => {
+          if (!query || typeof query !== "object") {
+            return [];
+          }
+          if (Array.isArray(query.columns) && query.columns.length > 0) {
+            return query.columns;
+          }
+          if (query.type === "SetOperator") {
+            const left = collectQueryProjectionColumns(query.left);
+            if (left.length > 0) {
+              return left;
+            }
+            return collectQueryProjectionColumns(query.right);
+          }
+          return [];
+        };
 
         const addColumnsFromSourceAlias = (sourceAlias: string): void => {
           const targetAlias = normalizeName(sourceAlias);
@@ -2854,8 +2887,44 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
           }
         }
 
+        // Read derived subquery select-list projection names directly from AST shape.
+        // This catches cases where lineage projection emits generic placeholders.
+        const queryCols = collectQueryProjectionColumns(aliasSym?.location?.table?.query);
+        if (Array.isArray(queryCols)) {
+          for (const col of queryCols) {
+            if (!col || col?.wildcard === true) {
+              continue;
+            }
+
+            const directCandidates = [
+              String(col?.alias ?? "").trim(),
+              String(col?.outputName ?? "").trim(),
+              String(col?.sourceName ?? "").trim()
+            ].filter(Boolean);
+
+            let projected = directCandidates.find((v) => isMeaningfulProjectionName(v)) ?? "";
+
+            if (!projected) {
+              const expr = col?.expression;
+              if (expr?.type === "Identifier") {
+                if (Array.isArray(expr.parts) && expr.parts.length > 0) {
+                  projected = String(expr.parts[expr.parts.length - 1] ?? "").trim();
+                } else {
+                  projected = String(expr.name ?? "").trim();
+                }
+              } else if (expr?.type === "MemberExpression") {
+                projected = String(expr.property ?? "").trim();
+              }
+            }
+
+            const n = normalizeName(projected);
+            if (isMeaningfulProjectionName(projected)) {
+              out.add(n);
+            }
+          }
+        }
+
         // Expand wildcard projection parts in derived aliases, e.g. SELECT d.*, e.Address ... AS s
-        const queryCols = aliasSym?.location?.table?.query?.columns;
         if (Array.isArray(queryCols)) {
           for (const col of queryCols) {
             if (col?.type !== "Column" || col?.wildcard !== true || col?.expression?.type !== "WildcardExpression") {
@@ -2872,7 +2941,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
               }
               for (const p of src.projection) {
                 const n = normalizeName(String(p?.name ?? ""));
-                if (n && n !== "*") {
+                if (n && n !== "*" && n !== "expression") {
                   out.add(n);
                 }
               }
@@ -2883,6 +2952,16 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         }
 
         return out;
+      }
+
+      function getAliasCandidatesAtOffset(scopeAtPos: any, aliasNorm: string): any[] {
+        if (!scopeAtPos || !aliasNorm) {
+          return [];
+        }
+        const visible = typeof scopeAtPos.getVisibleSymbols === "function"
+          ? scopeAtPos.getVisibleSymbols()
+          : Object.values(scopeAtPos.symbols ?? {});
+        return (visible as any[]).filter((s: any) => s?.kind === "Alias" && normalizeName(String(s?.name ?? "")) === aliasNorm);
       }
 
       function collectCteNames(scope: any): void {
@@ -2962,6 +3041,30 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         // Validate local derived/alias sources (e.g., subquery alias "s") even when ref.validateSchema is false.
         const scopeAtPos = parsed?.scope?.root?.findInnermost?.(refOffset) ?? parsed?.scope?.root;
         const scopedSym = resolveSymbolCaseInsensitive(scopeAtPos, table);
+        const aliasCandidates = getAliasCandidatesAtOffset(scopeAtPos, table);
+        if (aliasCandidates.length > 0) {
+          const withColumns = aliasCandidates
+            .map((sym: any) => {
+              const explicitCols = Array.isArray(sym.columns) ? sym.columns : [];
+              const explicitHas = explicitCols.some((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === column);
+              const projected = getDerivedAliasProjectedColumns(table, sym);
+              const projectedHas = projected.has(column);
+              const hasKnowledge = explicitCols.length > 0 || projected.size > 0;
+              return { sym, explicitHas, projectedHas, hasKnowledge };
+            });
+
+          if (withColumns.some(x => x.explicitHas || x.projectedHas)) {
+            continue;
+          }
+
+          // Emit missing column only when at least one alias candidate has known projection shape.
+          const known = withColumns.find(x => x.hasKnowledge);
+          if (known) {
+            addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplaySymbolName(known.sym) || table);
+            continue;
+          }
+        }
+
         if (scopedSym?.kind === "Alias" && Array.isArray(scopedSym.columns) && scopedSym.columns.length > 0) {
           const hasLocalCol = scopedSym.columns.some((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === column);
           if (!hasLocalCol) {

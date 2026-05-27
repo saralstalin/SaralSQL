@@ -258,6 +258,27 @@ FROM UnknownTable ut;
   assert.strictEqual(aliasRef?.validateSchema, false, "Alias token should not be schema-validated");
 });
 
+runCase("create-view-join-alias-reference-is-not-schema-validated", () => {
+  const uri = "file:///regression/create-view-join-alias-reference.sql";
+  const sql = `
+CREATE VIEW dbo.InboundShippingOptionRulesView
+AS
+SELECT bu.BusinessUnitId
+FROM [dbo].[InboundShippingOptionRules] [inr]
+LEFT JOIN [dbo].[BusinessUnits] [bu] ON [inr].BusinessUnitId = [bu].BusinessUnitId;
+`;
+
+  indexText(uri, sql);
+  const aliasMap = aliasesByUri.get(uri);
+  assert.ok(aliasMap?.get("bu") === "businessunits" || aliasMap?.get("bu") === "dbo.businessunits", "JOIN alias bu should resolve to BusinessUnits in CREATE VIEW");
+  const refs = getReferencesForUri(uri);
+  const buAliasRefs = refs.filter(r => r.kind === "table" && normalizeName(r.name) === "bu");
+  assert.ok(
+    buAliasRefs.every(r => r.validateSchema === false),
+    "Any JOIN alias token inside CREATE VIEW must not be schema-validated as a physical table"
+  );
+});
+
 runCase("multi-statement-alias-resolution-isolation", () => {
   const uri = "file:///regression/alias-qualified-column-resolution.sql";
   const sql = `
@@ -737,6 +758,91 @@ WHERE s.DepartmentId = 1;
   assert.strictEqual(getRefs("department.d").length, 0, "Alias wildcard token d from d.* must not be indexed as department.d");
   assert.strictEqual(getRefs("employee.d").length, 0, "Alias wildcard token d from d.* must not be indexed as employee.d");
   assert.strictEqual(getRefs("departmentsalaryinfo.d").length, 0, "Alias wildcard token d from d.* must not be indexed as departmentsalaryinfo.d");
+});
+
+runCase("cte-header-columns-are-exposed-when-query-columns-are-generic", () => {
+  const sql = `
+WITH cteTally(N) AS (
+  SELECT 0 UNION ALL
+  SELECT TOP (10) ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+  FROM (SELECT 1 AS X) x
+),
+cteStart(N1) AS (
+  SELECT t.N + 1 FROM cteTally t WHERE t.N = 0
+)
+SELECT s.N1, t.N
+FROM cteStart s
+JOIN cteTally t ON t.N = s.N1;
+`;
+
+  const parsed = parseSql(sql);
+  const cteTally = findSymbol(parsed?.scope?.root, "CTE", "cteTally");
+  const cteStart = findSymbol(parsed?.scope?.root, "CTE", "cteStart");
+  assert.ok(cteTally, "cteTally should exist in parser scope");
+  assert.ok(cteStart, "cteStart should exist in parser scope");
+  assert.ok(getCteColumns(cteTally).some(c => normalizeName(c.name) === "n"), "cteTally should expose header column N");
+  assert.ok(getCteColumns(cteStart).some(c => normalizeName(c.name) === "n1"), "cteStart should expose header column N1");
+});
+
+runCase("recursive-union-cte-columns-are-derived-from-left-branch-select", () => {
+  const sql = `
+;WITH IdRollUp AS (
+  SELECT 1 AS Id, 'I' AS ItemNumber, 'F' AS FacilityCode, 'B' AS BomOrgCode, CAST(GETDATE() AS DATE) AS SupplyDate, 'C' AS ComponentItemNumber, 1 AS RollUpQty
+),
+recurssingQty AS (
+  SELECT Id, ItemNumber, FacilityCode, BomOrgCode, SupplyDate, ComponentItemNumber, RollUpQty
+  FROM IdRollUp
+  WHERE Id = 1
+  UNION ALL
+  SELECT id.Id, id.ItemNumber, id.FacilityCode, id.BomOrgCode, id.SupplyDate,
+         COALESCE(id.ComponentItemNumber, rq.ComponentItemNumber) AS ComponentItemNumber,
+         COALESCE(id.RollUpQty, rq.RollUpQty) AS RollUpQty
+  FROM IdRollUp id
+  JOIN recurssingQty rq ON rq.ItemNumber = id.ItemNumber AND rq.ID = id.ID - 1
+)
+SELECT rq.ComponentItemNumber, rq.RollUpQty
+FROM recurssingQty rq;`;
+
+  const parsed = parseSql(sql);
+  const cte = findSymbol(parsed?.scope?.root, "CTE", "recurssingQty");
+  assert.ok(cte, "recurssingQty should exist in parser scope");
+  const cols = getCteColumns(cte);
+  assert.ok(cols.some(c => normalizeName(c.name) === "componentitemnumber"), "Recursive CTE should expose ComponentItemNumber");
+  assert.ok(cols.some(c => normalizeName(c.name) === "rollupqty"), "Recursive CTE should expose RollUpQty");
+  assert.ok(cols.some(c => normalizeName(c.name) === "itemnumber"), "Recursive CTE should expose ItemNumber");
+});
+
+runCase("derived-union-alias-column-projection-is-available-case-insensitively", () => {
+  const uri = "file:///regression/derived-union-alias-case-insensitive.sql";
+  const sql = `
+CREATE TABLE #tempItemAI (
+  ItemNumber VARCHAR(300),
+  AvailableInventory INT
+);
+CREATE TABLE #tempItemRAI (
+  ItemNumber VARCHAR(300),
+  ComponentRolledUpQuantity INT
+);
+
+SELECT SUM(s.availableInventory) AS TotalAvailableInventory
+FROM (
+  SELECT s1.ItemNumber, s1.AvailableInventory
+  FROM #tempItemAI s1
+  UNION
+  SELECT rgrp.ItemNumber, rgrp.ComponentRolledUpQuantity AS AvailableInventory
+  FROM #tempItemRAI rgrp
+) s;
+`;
+
+  indexText(uri, sql);
+  assert.ok(
+    getRefs("#tempitemai.availableinventory").length > 0,
+    "Derived UNION alias should project AvailableInventory from first branch and resolve case-insensitively"
+  );
+  assert.ok(
+    getRefs("#tempitemrai.componentrolledupquantity").length > 0,
+    "Derived UNION alias should retain second branch projection lineage"
+  );
 });
 
 process.stdout.write("All regression index tests passed.\n");
