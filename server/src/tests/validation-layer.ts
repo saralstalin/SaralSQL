@@ -1017,6 +1017,71 @@ ORDER BY EmployeeId DESC;
   );
 });
 
+runCase("parser-ambiguous-candidates-are-narrowed-by-schema-ownership", () => {
+  const schemaUri = "file:///validation/ambig-schema-narrow.sql";
+  const queryUri = "file:///validation/ambig-schema-narrow-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.ShipmentOptions (
+  ShippingOptionId INT,
+  ShippingOptionCode VARCHAR(20),
+  ShippingOptionDesc VARCHAR(100),
+  DisplayOrder INT,
+  ShipMode VARCHAR(20),
+  IsIncludedByDefault BIT,
+  IsEnabled BIT
+);
+CREATE TABLE dbo.CountryShipmentOptions (
+  ShipmentOptionId INT,
+  CountryId INT
+);
+CREATE TABLE dbo.Countries (
+  CountryId INT,
+  CountryCode2Char CHAR(2),
+  CountryName VARCHAR(100)
+);
+`;
+
+  const querySql = `
+SELECT DISTINCT
+    ShippingOptionCode OptionCode,
+    ShippingOptionDesc Description,
+    DisplayOrder,
+    ShipMode,
+    IsIncludedByDefault DefaultChoice,
+    IsEnabled,
+    c.CountryCode2Char,
+    c.CountryName
+FROM dbo.ShipmentOptions so WITH(NOLOCK)
+LEFT JOIN dbo.CountryShipmentOptions cso WITH(NOLOCK) ON so.ShippingOptionId = cso.ShipmentOptionId
+LEFT JOIN dbo.Countries c WITH(NOLOCK) ON cso.CountryId = c.CountryId;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    diagnostics.every(d => !String(d.message).includes("ShippingOptionCode")),
+    "Schema ownership should suppress parser-only ambiguity for uniquely owned bare columns"
+  );
+  assert.ok(
+    diagnostics.every(d => !String(d.message).includes("ShippingOptionDesc")),
+    "Schema ownership should suppress parser-only ambiguity for uniquely owned bare columns"
+  );
+  assert.ok(
+    diagnostics.every(d => !String(d.message).includes("DisplayOrder")),
+    "Schema ownership should suppress parser-only ambiguity for uniquely owned bare columns"
+  );
+});
+
 runCase("cross-apply-derived-alias-does-not-trigger-unknown-table", () => {
   const uri = "file:///validation/cross-apply-derived-alias.sql";
   const sql = `

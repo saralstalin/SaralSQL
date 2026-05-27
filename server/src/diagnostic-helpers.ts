@@ -182,6 +182,8 @@ export function collectAmbiguousColumnDiagnostics(
   const resolutions = parsed.columns?.resolutions ?? [];
   const orderByAliasStarts = collectOrderByAliasStarts(parsed.ast);
   const orderByDuplicateAliasStarts = collectOrderByDuplicateAliasStarts(parsed.ast);
+  const outputPseudoColumnStarts = collectOutputPseudoColumnStarts(parsed.ast);
+  const readScopeRanges = collectReadScopeRanges(parsed);
 
   for (const ref of refs) {
     if (!ref || (ref.kind !== "column" && ref.kind !== "unknown")) {
@@ -196,6 +198,9 @@ export function collectAmbiguousColumnDiagnostics(
       continue;
     }
     const colNorm = normalizeName(name);
+    if (outputPseudoColumnStarts.has(ref.location.start)) {
+      continue;
+    }
     if (orderByAliasStarts.has(ref.location.start)) {
       continue;
     }
@@ -233,8 +238,21 @@ export function collectAmbiguousColumnDiagnostics(
         ? matchedResolution.decision.ambiguityCandidates
         : [];
     const decisionReason = normalizeName(String(matchedResolution?.decisionReason ?? matchedResolution?.decision?.decisionReason ?? ""));
+    const readSourceCount = getReadScopeSourceCountAtOffset(readScopeRanges, ref.location.start);
+    if (readSourceCount === 1 && !decisionReason.includes("ambig")) {
+      continue;
+    }
 
     if (ambiguityCandidates.length > 1 || decisionReason.includes("ambig")) {
+      const narrowedCandidates = narrowAmbiguityCandidatesBySchema(
+        colNorm,
+        ambiguityCandidates,
+        tablesByName,
+        tableTypesByName
+      );
+      if (narrowedCandidates !== null && narrowedCandidates <= 1) {
+        continue;
+      }
       const startPos = offsetToPosition(ref.location.start, lineStarts);
       const endPos = offsetToPosition(ref.location.end ?? ref.location.start, lineStarts);
       const key = `${startPos.line}:${startPos.character}:${colNorm}`;
@@ -291,6 +309,127 @@ export function collectAmbiguousColumnDiagnostics(
   }
 
   return diagnostics;
+}
+
+function narrowAmbiguityCandidatesBySchema(
+  columnNorm: string,
+  parserCandidates: any[],
+  tablesByName: Map<string, any>,
+  tableTypesByName: Map<string, any>
+): number | null {
+  if (!Array.isArray(parserCandidates) || parserCandidates.length === 0) {
+    return null;
+  }
+
+  let checked = 0;
+  let matched = 0;
+  const seen = new Set<string>();
+
+  for (const candidate of parserCandidates) {
+    const raw = String(candidate ?? "").trim();
+    if (!raw) {
+      continue;
+    }
+    const norm = normalizeName(raw);
+    if (!norm || seen.has(norm)) {
+      continue;
+    }
+    seen.add(norm);
+
+    const tableSym = resolveCandidateSymbol(tablesByName, raw, norm);
+    if (tableSym) {
+      checked++;
+      if (symbolHasColumn(tableSym, columnNorm)) {
+        matched++;
+      }
+      continue;
+    }
+
+    const typeSym = resolveCandidateSymbol(tableTypesByName, raw, norm);
+    if (typeSym) {
+      checked++;
+      if (symbolHasColumn(typeSym, columnNorm)) {
+        matched++;
+      }
+    }
+  }
+
+  if (checked === 0) {
+    return null;
+  }
+  return matched;
+}
+
+function resolveCandidateSymbol(map: Map<string, any>, raw: string, normalizedRaw: string): any {
+  const normalizedAstName = normalizeName(normalizeAstTableName(raw) ?? "");
+  return resolveMapSymbolCaseInsensitive(map, normalizedRaw)
+    ?? resolveMapSymbolCaseInsensitive(map, normalizedAstName)
+    ?? resolveMapSymbolCaseInsensitive(map, normalizeName(raw.split(".").pop() ?? raw));
+}
+
+function resolveMapSymbolCaseInsensitive(map: Map<string, any>, normalizedName: string): any {
+  if (!map || !normalizedName) {
+    return null;
+  }
+
+  const direct = map.get(normalizedName);
+  if (direct) {
+    return direct;
+  }
+
+  const target = normalizedName.toLowerCase();
+  for (const [key, value] of map.entries()) {
+    if (String(key).toLowerCase() === target) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function symbolHasColumn(symbol: any, columnNorm: string): boolean {
+  const cols = Array.isArray(symbol?.localColumns)
+    ? symbol.localColumns
+    : Array.isArray(symbol?.columns)
+      ? symbol.columns
+      : [];
+  for (const col of cols) {
+    const name = normalizeName(String(typeof col === "string" ? col : col?.name ?? ""));
+    if (name && name === columnNorm) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function collectReadScopeRanges(parsed: any): Array<{ start: number; end: number; sourceCount: number }> {
+  const out: Array<{ start: number; end: number; sourceCount: number }> = [];
+  const scopes = Array.isArray(parsed?.lineage?.readScopes) ? parsed.lineage.readScopes : [];
+  for (const scope of scopes) {
+    const start = Number(scope?.location?.start);
+    const end = Number(scope?.location?.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) {
+      continue;
+    }
+    const sourceCount = Array.isArray(scope?.sources) ? scope.sources.length : 0;
+    out.push({ start, end, sourceCount });
+  }
+  return out;
+}
+
+function getReadScopeSourceCountAtOffset(
+  ranges: Array<{ start: number; end: number; sourceCount: number }>,
+  offset: number
+): number | null {
+  let best: { start: number; end: number; sourceCount: number } | null = null;
+  for (const r of ranges) {
+    if (offset < r.start || offset > r.end) {
+      continue;
+    }
+    if (!best || (r.end - r.start) < (best.end - best.start)) {
+      best = r;
+    }
+  }
+  return best?.sourceCount ?? null;
 }
 
 function collectOrderByAliasStarts(ast: any): Set<number> {
