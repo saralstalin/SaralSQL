@@ -53,7 +53,6 @@ import {
   , findReferenceAtPosition
   , getReferencesForUri
   , findColumnInTable
-  , findTableOrColumn
   , getRefs
   , tableTypesByName
   , tempTablesByUri
@@ -386,6 +385,17 @@ async function indexWorkspace(): Promise<void> {
         }
       }
     }
+
+    // Pass 2: re-index every workspace SQL document after all definitions are loaded.
+    // This prevents first-pass reference/schema resolution drift caused by file-ordering
+    // during initial workspace warm-up.
+    for (const doc of workspaceDocuments.values()) {
+      try {
+        indexText(doc.uri, doc.getText(), { includeInWorkspaceSchema: shouldContributeToWorkspaceSchema(doc.uri) });
+      } catch (err) {
+        safeError(`Failed second-pass reindex for ${doc.uri}`, err);
+      }
+    }
     safeLog("Workspace indexing complete.");
   } catch (err) {
     safeError("Workspace indexing failed", err);
@@ -563,7 +573,6 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
     }
 
     if (!match) {
-      // Local-first fallback before global lookup.
       const wordRange = getWordRangeAtPosition(doc, params.position);
       if (!wordRange) { return null; }
       const rawWord = doc.getText(wordRange);
@@ -606,8 +615,7 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
         }
         return null;
       }
-      const fallback = findTableOrColumn(word);
-      return fallback.length > 0 ? fallback : null;
+      return null;
     }
 
     if (match.kind === "parameter") {
@@ -684,6 +692,10 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
       if (parts.length === 2) {
         const tableName = parts[0];
         const colName = parts[1];
+        const derivedProjectionLoc = findDerivedAliasProjectedColumnRange(doc, parsed, offset, tableName, colName);
+        if (derivedProjectionLoc && derivedProjectionLoc.length > 0) {
+          return derivedProjectionLoc;
+        }
         const matchedResolution = parsed?.columns?.resolutions?.find((r: any) => {
           const s = Number(r?.location?.start);
           const e = Number(r?.location?.end);
@@ -1704,6 +1716,79 @@ function getPropertyAccessAtOffset(parsed: ParseResult | null, offset: number): 
   }) ?? null;
 }
 
+function findDerivedAliasProjectedColumnRange(
+  doc: TextDocument,
+  parsed: ParseResult | null,
+  offset: number,
+  aliasName: string,
+  columnName: string
+): Location[] | null {
+  if (!parsed?.scope?.root) {
+    return null;
+  }
+  const scopeAtPos = parsed.scope.root.findInnermost(offset);
+  const aliasSym = resolveSymbolCaseInsensitive(scopeAtPos, aliasName);
+  if (!aliasSym || aliasSym.kind !== "Alias" || !aliasSym?.location?.table?.query) {
+    return null;
+  }
+
+  const queryCols = Array.isArray(aliasSym.location.table.query?.columns)
+    ? aliasSym.location.table.query.columns
+    : [];
+  const target = normalizeName(columnName);
+  if (!target || queryCols.length === 0) {
+    return null;
+  }
+
+  for (const col of queryCols) {
+    if (!col || col.wildcard === true) {
+      continue;
+    }
+    const candidates: string[] = [];
+    const pushCandidate = (value: any): void => {
+      const norm = normalizeName(String(value ?? ""));
+      if (norm) {
+        candidates.push(norm);
+      }
+    };
+
+    pushCandidate(col.alias);
+    pushCandidate(col.outputName);
+    pushCandidate(col.sourceName);
+
+    const expr = col.expression;
+    if (expr?.type === "Identifier") {
+      if (Array.isArray(expr.parts) && expr.parts.length > 0) {
+        pushCandidate(expr.parts[expr.parts.length - 1]);
+      } else {
+        pushCandidate(expr.name);
+      }
+    } else if (expr?.type === "MemberExpression") {
+      pushCandidate(expr.property);
+    }
+
+    if (!candidates.includes(target)) {
+      continue;
+    }
+
+    const start = Number(col.start ?? col.expression?.start);
+    const end = Number(col.end ?? col.expression?.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) {
+      continue;
+    }
+
+    return [{
+      uri: doc.uri,
+      range: {
+        start: doc.positionAt(start),
+        end: doc.positionAt(end)
+      }
+    }];
+  }
+
+  return null;
+}
+
 function findStatementLocalColumnOwner(
   statementText: string,
   columnName: string,
@@ -2075,31 +2160,7 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
       return results;
     }
 
-    const parts = rawWord.split('.');
-    const cleanWord = normalizeName(parts.pop() || rawWord);
-
-    const localCandidates: ReferenceDef[] = [];
-    for (const [key, byUri] of referencesIndex.entries()) {
-      if (key === cleanWord || key.endsWith("." + cleanWord)) {
-        localCandidates.push(...(byUri.get(normUri) ?? []));
-      }
-    }
-
-    if (localCandidates.length > 0) {
-      for (const r of localCandidates) {
-        pushLocFromRef(r);
-      }
-    } else {
-      for (const [key, byUri] of referencesIndex.entries()) {
-        if (key === cleanWord || key.endsWith("." + cleanWord)) {
-          for (const arr of byUri.values()) {
-            for (const r of arr) {
-              pushLocFromRef(r);
-            }
-          }
-        }
-      }
-    }
+    return results;
   }
 
   return results;
@@ -2162,15 +2223,6 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
         }
       }
     }
-      const wordStripped = word.replace(/^dbo\./, "");
-      const def = localDefsByName.get(word) || localDefsByName.get(wordStripped) || tablesByName.get(word) || tableTypesByName.get(word);
-      if (def && def.columns) {
-        const rows = def.columns.map((c: any) => `- \`${c.rawName}\`${c.type ? ` ${c.type}` : ""}`);
-        const kindLabel = tablesByName.has(word) ? "Table" : "Table Type";
-        const body = `**${kindLabel}** \`${def.rawName}\`\n\n${rows.join("\n")}`;
-        return { contents: { kind: MarkupKind.Markdown, value: body }, range };
-      }
-
       const updateSetTarget = getUpdateSetTargetTable(parsed, offset);
       if (updateSetTarget) {
         const targetNorm = normalizeName(updateSetTarget);
@@ -2592,6 +2644,12 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
   // Publish parser/local diagnostics first so users get quick feedback,
   // then publish again after slower schema validation completes.
   if (schemaValidationReady) {
+    // Ensure the current document's local schema/references are indexed for this exact text
+    // before running schema-dependent diagnostics.
+    if (!isSqlProjectFileUri(doc.uri)) {
+      indexText(doc.uri, text, { includeInWorkspaceSchema: shouldContributeToWorkspaceSchema(doc.uri) });
+    }
+
     connection.sendDiagnostics({
       uri: doc.uri,
       diagnostics: [...diagnostics]
@@ -3166,11 +3224,11 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
             // The parser resolved the column, but it failed schema validation.
             // Emit the exact error so the user sees the typo!
             for (const input of matchedResolution.inputs) {
-              if (input?.kind !== "column" || !input?.source || !input?.name) {continue};
+              if (input?.kind !== "column" || !input?.source || !input?.name) {continue;};
               const srcTable = normalizeName(String(input.source));
               const srcCol = normalizeName(String(input.name).split(".").pop() ?? "");
-              if (!srcTable || !srcCol) {continue};
-              if (String(input.sourceKind ?? "table") !== "table") {continue};
+              if (!srcTable || !srcCol) {continue;};
+              if (String(input.sourceKind ?? "table") !== "table") {continue;};
               
               if (!tableExistsInContext(srcTable)) {
                 const tableRef = getSchemaEquivalentTableRefCandidates(srcTable)
@@ -3426,18 +3484,18 @@ function isFunctionCallInAst(ast: any, functionNameNorm: string): { isFunc: bool
   let isFunc = false;
   let rawName = functionNameNorm;
   const visit = (n: any) => {
-    if (!n || typeof n !== "object" || isFunc) return;
+    if (!n || typeof n !== "object" || isFunc) {return;}
     if (n.type === "FunctionCall" && normalizeName(n.name) === functionNameNorm) {
       isFunc = true;
-      if (n.name) rawName = n.name;
+      if (n.name) {rawName = n.name;}
       return;
     }
     if (Array.isArray(n)) {
-      for (const item of n) visit(item);
+      for (const item of n) {visit(item);}
       return;
     }
     for (const val of Object.values(n)) {
-      if (val && typeof val === "object") visit(val);
+      if (val && typeof val === "object") {visit(val);}
     }
   };
   visit(ast);

@@ -155,6 +155,23 @@ function resolveSymbolColumns(
 
   if (sym.kind === "Alias") {
     const aliasDisplay = getDisplaySymbolName(sym) ?? normalizeName(String(sym.name ?? ""));
+    const isDerivedAlias = Boolean(sym?.location?.table?.query);
+
+    // Derived/subquery alias boundaries are sealed: only projected alias columns are visible outside.
+    if (isDerivedAlias) {
+      const projected = findColumn(Array.isArray(sym.columns) ? sym.columns : undefined, colNorm);
+      if (projected) {
+        return {
+          kindLabel: "derived table",
+          ownerName: String(sym.rawName ?? sym.name ?? ""),
+          column: projected,
+          alias: normalizeName(String(sym.name ?? "")),
+          displayAlias: aliasDisplay
+        };
+      }
+      return null;
+    }
+
     const targetName = normalizeName(resolveAliasTableName(sym) ?? "");
     if (!targetName) {
       return null;

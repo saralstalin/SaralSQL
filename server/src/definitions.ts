@@ -445,9 +445,13 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
         if (ref.kind === "table") {
             const isFunctionCall = functionCallStarts.has(ref.location.start);
             const scopeAtPos = parsed.scope?.root?.findInnermost(ref.location.start);
-            const scopedSym = resolveSymbolCaseInsensitive(scopeAtPos, ref.name);
-            const isAliasReference = scopedSym?.kind === "Alias"
-                && normalizeName(String(scopedSym?.name ?? "")) === normalizeName(ref.name);
+            const visibleSymbols = scopeAtPos && typeof scopeAtPos.getVisibleSymbols === "function"
+                ? scopeAtPos.getVisibleSymbols()
+                : [];
+            const refNorm = normalizeName(ref.name);
+            const isAliasReference = visibleSymbols.some((sym: any) =>
+                sym?.kind === "Alias" && normalizeName(String(sym?.name ?? "")) === refNorm
+            );
             processedTableRefs.add(`${ref.location.start}:${ref.location.end}`);
             localRefs.push({
                 name: normalizeName(ref.name),

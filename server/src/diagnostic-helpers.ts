@@ -199,6 +199,10 @@ export function collectAmbiguousColumnDiagnostics(
       continue;
     }
     const colNorm = normalizeName(name);
+    const containingSelect = findContainingSelectAtOffset(parsed?.ast, ref.location.start);
+    if (containingSelect && (!Array.isArray(containingSelect.from) || containingSelect.from.length === 0)) {
+      continue;
+    }
     if (outputPseudoColumnStarts.has(ref.location.start)) {
       continue;
     }
@@ -235,6 +239,9 @@ export function collectAmbiguousColumnDiagnostics(
     if (hasSingleSelectSourceAtOffset(parsed?.ast, ref.location.start)) {
       continue;
     }
+    if (hasSingleSelectVariableSourceAtOffset(parsed?.ast, ref.location.start)) {
+      continue;
+    }
     const readSourceCount = getReadScopeSourceCountAtOffset(readScopeRanges, ref.location.start);
     if (readSourceCount === 1) {
       continue;
@@ -261,6 +268,10 @@ export function collectAmbiguousColumnDiagnostics(
     }
 
     if (resolved.status === "resolved") {
+      continue;
+    }
+
+    if (isBareColumnInMutationStatementAtOffset(parsed?.ast, ref.location.start)) {
       continue;
     }
 
@@ -300,41 +311,33 @@ export function collectAmbiguousColumnDiagnostics(
   return diagnostics;
 }
 
-function hasSingleSelectSourceAtOffset(ast: any, offset: number): boolean {
+function isBareColumnInMutationStatementAtOffset(ast: any, offset: number): boolean {
   if (!ast || typeof offset !== "number") {
     return false;
   }
 
-  let best: any = null;
-  const visit = (node: any): void => {
-    if (!node || typeof node !== "object") {
-      return;
+  const body = Array.isArray(ast?.body) ? ast.body : [];
+  for (const stmt of body) {
+    const start = Number(stmt?.start);
+    const end = Number(stmt?.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || offset < start || offset > end) {
+      continue;
     }
 
-    if (node.type === "SelectStatement" && typeof node.start === "number" && typeof node.end === "number") {
-      if (offset >= node.start && offset <= node.end) {
-        if (!best || (node.end - node.start) < (best.end - best.start)) {
-          best = node;
-        }
-      }
+    if (stmt?.type === "UpdateStatement" || stmt?.type === "DeleteStatement") {
+      return true;
     }
+  }
 
-    if (Array.isArray(node)) {
-      for (const item of node) {
-        visit(item);
-      }
-      return;
-    }
+  return false;
+}
 
-    for (const value of Object.values(node)) {
-      if (value && typeof value === "object") {
-        visit(value);
-      }
-    }
-  };
-
-  visit(ast);
-  if (!best || !Array.isArray(best.from) || best.from.length === 0) {
+function hasSingleSelectSourceAtOffset(ast: any, offset: number): boolean {
+  const best = findContainingSelectAtOffset(ast, offset);
+  if (!best) {
+    return false;
+  }
+  if (!Array.isArray(best.from) || best.from.length === 0) {
     return false;
   }
 
@@ -347,6 +350,47 @@ function hasSingleSelectSourceAtOffset(ast: any, offset: number): boolean {
   }
 
   return sourceCount === 1;
+}
+
+function hasSingleSelectVariableSourceAtOffset(ast: any, offset: number): boolean {
+  const best = findContainingSelectAtOffset(ast, offset);
+  if (!best || !Array.isArray(best.from) || best.from.length !== 1) {
+    return false;
+  }
+  const tableName = String(best.from[0]?.table?.name ?? "");
+  return tableName.startsWith("@") || tableName.startsWith("#");
+}
+
+function findContainingSelectAtOffset(ast: any, offset: number): any | null {
+  if (!ast || typeof offset !== "number") {
+    return null;
+  }
+  let best: any = null;
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+    if (node.type === "SelectStatement" && typeof node.start === "number" && typeof node.end === "number") {
+      if (offset >= node.start && offset <= node.end) {
+        if (!best || (node.end - node.start) < (best.end - best.start)) {
+          best = node;
+        }
+      }
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+  visit(ast);
+  return best;
 }
 
 function collectReadScopeRanges(parsed: any): Array<{ start: number; end: number; sourceCount: number }> {

@@ -4,6 +4,7 @@ import { parseSql } from "../sql-parser";
 import { getLineStarts } from "../text-utils";
 import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, buildSelectStarExpansionCodeActions, buildUpdateNoLockCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "../diagnostic-helpers";
 import { indexText, definitions, referencesIndex, columnsByTable, tablesByName, tableTypesByName, aliasesByUri } from "../definitions";
+import { resolveBareColumnAtOffset } from "../column-resolution";
 
 function resetState(): void {
   aliasesByUri.clear();
@@ -831,6 +832,71 @@ WHERE Column1 = 'Another Value';
   );
 });
 
+runCase("update-where-bare-columns-do-not-fallback-to-parser-multi-input-ambiguity", () => {
+  const schemaUri = "file:///validation/update-where-parser-multi-input-schema.sql";
+  const queryUri = "file:///validation/update-where-parser-multi-input-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.ItemFacilityDispositionAvailability (
+  ItemNumber VARCHAR(60),
+  FacilityCode VARCHAR(20),
+  DispositionId INT,
+  ReservationQty INT,
+  CommitQty INT
+);
+CREATE TABLE dbo.ItemFacilityDispositionReservationsCommits (
+  ItemNumber VARCHAR(60),
+  FacilityCode VARCHAR(20),
+  DispositionId INT,
+  Qty INT,
+  IsCommitted BIT,
+  IsActive BIT
+);
+`;
+
+  const querySql = `
+DECLARE @ItemNumber VARCHAR(60), @TargetFacilityCode VARCHAR(20), @DispositionId INT;
+UPDATE [dbo].[ItemFacilityDispositionAvailability]
+SET ReservationQty = (
+      SELECT ISNULL(SUM(Qty), 0)
+      FROM [dbo].[ItemFacilityDispositionReservationsCommits]
+      WHERE ItemNumber = @ItemNumber
+        AND FacilityCode = @TargetFacilityCode
+        AND DispositionId = @DispositionId
+        AND IsCommitted = 0
+        AND IsActive = 1
+    ),
+    CommitQty = (
+      SELECT ISNULL(SUM(Qty), 0)
+      FROM [dbo].[ItemFacilityDispositionReservationsCommits]
+      WHERE ItemNumber = @ItemNumber
+        AND FacilityCode = @TargetFacilityCode
+        AND DispositionId = @DispositionId
+        AND IsCommitted = 1
+        AND IsActive = 1
+    )
+WHERE ItemNumber = @ItemNumber
+  AND FacilityCode = @TargetFacilityCode
+  AND DispositionId = @DispositionId;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'FacilityCode'")),
+    "UPDATE WHERE bare columns should not be marked ambiguous by parser multi-input fallback when mutation target binding is available"
+  );
+});
+
 runCase("simple-delete-bare-where-column-uses-delete-target-not-global-collisions", () => {
   const queryUri = "file:///validation/simple-delete-bare-where-target-query.sql";
   const querySql = `
@@ -1270,6 +1336,40 @@ FROM dbo.Table1 AS Alias1;
   );
 });
 
+runCase("single-table-variable-select-bare-columns-are-not-ambiguous", () => {
+  const queryUri = "file:///validation/single-table-variable-select-bare.sql";
+  const querySql = `
+CREATE PROCEDURE dbo.p
+AS
+BEGIN
+  DECLARE @OutputTable TABLE (
+    FacilityCode VARCHAR(20),
+    AvailableQty INT,
+    DispositionCode VARCHAR(50),
+    DispositionName VARCHAR(100)
+  );
+
+  SELECT FacilityCode, AvailableQty, DispositionCode, DispositionName
+  FROM @OutputTable;
+END;
+`;
+
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    diagnostics.every(d => !String(d.message).includes("FacilityCode")),
+    "Bare columns from a single table-variable source should not be reported as ambiguous"
+  );
+});
+
 runCase("cross-apply-derived-alias-does-not-trigger-unknown-table", () => {
   const uri = "file:///validation/cross-apply-derived-alias.sql";
   const sql = `
@@ -1304,6 +1404,46 @@ WHERE ISNULL(e.FirstName, '') <> '' AND trimmed.SkillName <> ''
   assert.ok(
     !diagnostics.some(d => String(d.message).includes("Unknown table 'ss.value'")),
     "Derived APPLY column ss.value should not be flagged as an unknown table"
+  );
+});
+
+runCase("derived-subquery-alias-does-not-leak-inner-sources-to-outer-scope", () => {
+  const uri = "file:///validation/derived-subquery-alias-boundary.sql";
+  const schemaSql = `
+CREATE TABLE dbo.Employee (
+  EmployeeId INT,
+  FirstName NVARCHAR(50),
+  LastName NVARCHAR(50)
+);
+`;
+  indexText("file:///schema/employee.sql", schemaSql);
+
+  const querySql = `
+SELECT s.EmployeeId
+FROM (
+  SELECT e.EmployeeId
+  FROM dbo.Employee e
+) s
+WHERE FirstName IS NOT NULL;
+`;
+
+  indexText(uri, querySql);
+  const parsed = parseSql(querySql);
+  const offset = querySql.indexOf("FirstName");
+  assert.ok(offset >= 0, "FirstName token must exist in test SQL");
+
+  const resolved = resolveBareColumnAtOffset({
+    parsed,
+    offset,
+    columnName: "FirstName",
+    tablesByName,
+    tableTypesByName
+  });
+
+  assert.strictEqual(
+    resolved.status,
+    "unresolved",
+    "Outer scope must not see non-projected inner source columns through derived alias"
   );
 });
 
