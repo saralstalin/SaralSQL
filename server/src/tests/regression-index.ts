@@ -279,6 +279,28 @@ LEFT JOIN [dbo].[BusinessUnits] [bu] ON [inr].BusinessUnitId = [bu].BusinessUnit
   );
 });
 
+runCase("create-view-select-alias-name-clash-does-not-flag-join-alias-as-unknown-table", () => {
+  const uri = "file:///regression/create-view-select-alias-clash.sql";
+  const sql = `
+CREATE VIEW dbo.InboundShippingOptionRulesView
+AS
+SELECT IIF(CAST([inr].[BusinessUnitId] AS VARCHAR(10)) = -1, 'ALL', CONCAT(bu.BusinessUnitId, '-', bu.BusinessUnitCode)) [BU]
+FROM [dbo].[InboundShippingOptionRules] [inr]
+LEFT JOIN [dbo].[BusinessUnits] [bu] ON [inr].BusinessUnitId = [bu].BusinessUnitId;
+`;
+
+  indexText(uri, sql);
+  const aliasMap = aliasesByUri.get(uri);
+  assert.ok(aliasMap?.get("bu") === "businessunits" || aliasMap?.get("bu") === "dbo.businessunits", "JOIN alias bu should resolve to BusinessUnits despite SELECT alias [BU]");
+  const refs = getReferencesForUri(uri);
+  const buAliasRefs = refs.filter(r => r.kind === "column" && normalizeName(r.name).startsWith("bu."));
+  assert.ok(buAliasRefs.length > 0, "JOIN alias bu qualified column usages should be indexed");
+  assert.ok(
+    buAliasRefs.every(r => r.validateSchema === false),
+    "JOIN alias bu qualified usages should remain non-schema-validated even when SELECT alias [BU] exists"
+  );
+});
+
 runCase("multi-statement-alias-resolution-isolation", () => {
   const uri = "file:///regression/alias-qualified-column-resolution.sql";
   const sql = `

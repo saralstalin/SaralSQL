@@ -1,5 +1,5 @@
 import { normalizeName } from "./text-utils";
-import { normalizeAstTableName } from "./ast-utils";
+import { normalizeAstTableName, resolveAliasTableName, resolveSymbolCaseInsensitive } from "./ast-utils";
 import { collectNearestScopeColumnOwners, type ScopeColumnOwner } from "./scope-column-resolver";
 
 type ResolveParams = {
@@ -29,10 +29,10 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
 
   const scopeAtPos = params.scopeAtPos ?? params.parsed?.scope?.root?.findInnermost?.(params.offset) ?? params.parsed?.scope?.root;
   const collectedOwners = collectNearestScopeColumnOwners(scopeAtPos, colNorm, params.tablesByName, params.tableTypesByName, params.localDefsByName);
-  const owners = narrowOwnersByReadScope(
+  const owners = dedupeOwners(narrowOwnersByReadScope(
     params,
     narrowOwnersForRecursiveCteSelfShadow(params, narrowOwnersForInsertReadContext(params, collectedOwners))
-  );
+  ));
   const matchedResolution = params.parsed?.columns?.resolutions?.find((r: any) => {
     const s = Number(r?.location?.start);
     const e = Number(r?.location?.end);
@@ -70,8 +70,9 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
     return { status: "resolved", owner: narrowedOwner, owners: [narrowedOwner], matchedResolution, ambiguityCandidates, decisionReason };
   }
 
-  const parserSaysAmbiguous = ambiguityCandidates.length > 1 || decisionReason.includes("ambig");
-  if (owners.length > 1 || parserSaysAmbiguous) {
+  // Ambiguity should be rooted in scope-visible ownership, not parser-only broad candidates.
+  // If scope walk does not find competing owners, treat as unresolved and let unknown-column flow handle it.
+  if (owners.length > 1) {
     return { status: "ambiguous", owners, matchedResolution, ambiguityCandidates, decisionReason };
   }
 
@@ -308,6 +309,11 @@ function resolveMutationTargetOwner(params: ResolveParams, colNorm: string): Sco
       return localOwner;
     }
 
+    const aliasOwner = resolveAliasMutationTargetOwner(scopeAtPos, targetName, params, colNorm);
+    if (aliasOwner) {
+      return aliasOwner;
+    }
+
     const owner = resolveCandidateOwner(params, targetName, colNorm);
     if (owner) {
       return owner;
@@ -315,6 +321,55 @@ function resolveMutationTargetOwner(params: ResolveParams, colNorm: string): Sco
   }
 
   return null;
+}
+
+function resolveAliasMutationTargetOwner(
+  scopeAtPos: any,
+  targetName: string,
+  params: ResolveParams,
+  colNorm: string
+): ScopeColumnOwner | null {
+  if (!scopeAtPos || !targetName) {
+    return null;
+  }
+
+  const aliasSym = resolveSymbolCaseInsensitive(scopeAtPos, targetName);
+  if (!aliasSym || aliasSym.kind !== "Alias") {
+    return null;
+  }
+
+  const explicitCols = Array.isArray(aliasSym.columns) ? aliasSym.columns : [];
+  const explicit = explicitCols.find((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === colNorm);
+  if (explicit) {
+    return {
+      kindLabel: "table",
+      ownerName: String(aliasSym?.rawName ?? aliasSym?.name ?? targetName),
+      column: explicit
+    };
+  }
+
+  const aliasTarget = normalizeName(resolveAliasTableName(aliasSym) ?? "");
+  if (!aliasTarget) {
+    return null;
+  }
+  return resolveCandidateOwner(params, aliasTarget, colNorm);
+}
+
+function dedupeOwners(owners: ScopeColumnOwner[]): ScopeColumnOwner[] {
+  if (!Array.isArray(owners) || owners.length <= 1) {
+    return owners;
+  }
+  const seen = new Set<string>();
+  const out: ScopeColumnOwner[] = [];
+  for (const o of owners) {
+    const key = `${normalizeName(String(o?.ownerName ?? ""))}:${normalizeName(String(o?.column?.rawName ?? o?.column?.name ?? ""))}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(o);
+  }
+  return out;
 }
 
 function resolveLocalScopeOwnerByName(scopeAtPos: any, targetName: string, colNorm: string): ScopeColumnOwner | null {

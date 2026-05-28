@@ -275,37 +275,9 @@ export function collectAmbiguousColumnDiagnostics(
       continue;
     }
 
-    const matchedResolution = resolutions.find((r: any) => r.location?.start === ref.location.start);
-    const resolvedSources = new Set<string>();
-    if (matchedResolution?.inputs) {
-      for (const input of matchedResolution.inputs) {
-        if (input.kind === "column" && input.source) {
-          resolvedSources.add(normalizeName(String(input.source)));
-        }
-      }
-    }
-    if (resolvedSources.size <= 1) {
-      continue;
-    }
-
-    const startPos = offsetToPosition(ref.location.start, lineStarts);
-    const endPos = offsetToPosition(ref.location.end ?? ref.location.start, lineStarts);
-    const key = `${startPos.line}:${startPos.character}:${colNorm}`;
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-
-    diagnostics.push({
-      code: SARAL_DIAGNOSTIC_CODES.AmbiguousColumn,
-      severity: resolveDiagnosticSeverity(SARAL_DIAGNOSTIC_CODES.AmbiguousColumn, DiagnosticSeverity.Warning, severityOverrides),
-      range: {
-        start: { line: startPos.line, character: startPos.character },
-        end: { line: endPos.line, character: endPos.character }
-      },
-      message: `Ambiguous column '${name}' could refer to multiple sources`,
-      source
-    });
+    // Do not emit ambiguity from parser input-count fallback.
+    // Ambiguity must be rooted in scope-visible competing owners only.
+    continue;
   }
 
   return diagnostics;

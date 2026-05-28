@@ -3086,6 +3086,14 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
           }
 
           const refOffset = (lineStarts[ref.line] ?? 0) + ref.start;
+          if (fileAliases?.has(normalizeName(ref.name))) {
+            continue;
+          }
+          const scopeAtPos = parsed?.scope?.root?.findInnermost?.(refOffset) ?? parsed?.scope?.root;
+          const aliasCandidates = getAliasCandidatesAtOffset(scopeAtPos, normalizeName(ref.name));
+          if (aliasCandidates.length > 0) {
+            continue;
+          }
           if (resolveCteSymbolAtOffset(ref.name, refOffset)) {
             continue;
           }

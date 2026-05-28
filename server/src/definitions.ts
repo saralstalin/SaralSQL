@@ -612,7 +612,7 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                             if (!parsed?.ast) {return false;}
                             let foundSelect = false;
                             walkAst(parsed.ast, (n: any) => {
-                                if (!n || n.type !== "SelectStatement" || typeof n.start !== "number" || typeof n.end !== "number") return;
+                                if (!n || n.type !== "SelectStatement" || typeof n.start !== "number" || typeof n.end !== "number") {return;}
                                 if (n.start <= ref.location.start && ref.location.start < n.end) {
                                     // ensure this select is within the update node range
                                     if (n.start >= updateNode.start && n.end <= updateNode.end) {
@@ -978,6 +978,16 @@ function indexQualifiedColumnReferencesFromAst(
         return;
     }
 
+    const resolveAliasSymbolAt = (scopeAtPos: any, aliasName: string): any | null => {
+        if (!scopeAtPos || !aliasName) {
+            return null;
+        }
+        const visible = typeof scopeAtPos.getVisibleSymbols === "function"
+            ? scopeAtPos.getVisibleSymbols()
+            : Object.values(scopeAtPos.symbols ?? {});
+        return (visible as any[]).find((s: any) => s?.kind === "Alias" && normalizeName(String(s?.name ?? "")) === aliasName) ?? null;
+    };
+
     walkAst(ast, (node: any) => {
         if (
             !node ||
@@ -996,16 +1006,13 @@ function indexQualifiedColumnReferencesFromAst(
         }
 
         const scopeAtPos = rootScope.findInnermost?.(node.start) ?? rootScope;
-        const sym = resolveSymbolCaseInsensitive(scopeAtPos, qualifier);
+        const sym = resolveAliasSymbolAt(scopeAtPos, qualifier);
         if (sym?.kind !== "Alias") {
             return;
         }
 
         const tableName = resolveAliasTableName(sym) ?? normalizeName(String(sym.name ?? ""));
         if (!tableName) { return; }
-
-        const normalizedTableName = tableName ? normalizeName(tableName) : "";
-        const isSchemaValidTableAlias = Boolean(normalizedTableName) && (tablesByName.has(normalizedTableName) || tableTypesByName.has(normalizedTableName));
 
         const pos = offsetToPosition(node.start, lineStarts);
         localRefs.push({
@@ -1015,7 +1022,7 @@ function indexQualifiedColumnReferencesFromAst(
             start: node.start - lineStarts[pos.line],
             end: (node.end ?? node.start + String(node.name).length) - lineStarts[pos.line],
             kind: "column",
-            validateSchema: isSchemaValidTableAlias
+            validateSchema: false
         });
     });
 }
