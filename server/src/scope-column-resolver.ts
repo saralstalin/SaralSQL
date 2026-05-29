@@ -230,8 +230,11 @@ export function collectNearestScopeColumnOwners(
   colNorm: string,
   tablesByName: Map<string, any>,
   tableTypesByName: Map<string, any>,
-  localDefsByName?: Map<string, any>
+  localDefsByName?: Map<string, any>,
+  options?: { stopAtSubqueryBoundary?: boolean; stopAtPotentialLocalSource?: boolean }
 ): ScopeColumnOwner[] {
+  const stopAtSubqueryBoundary = options?.stopAtSubqueryBoundary !== false;
+  const stopAtPotentialLocalSource = options?.stopAtPotentialLocalSource !== false;
   let scope = scopeAtPos;
   while (scope) {
     const symbols = typeof scope.getOwnSymbols === "function"
@@ -249,13 +252,13 @@ export function collectNearestScopeColumnOwners(
     if (owners.length > 0) {
       return owners;
     }
-    if (hasPotentialLocalSourceSymbol(symbols)) {
+    if (stopAtPotentialLocalSource && hasPotentialLocalSourceSymbol(symbols)) {
       return [];
     }
-    if (hasColumnBearingLocalSource(symbols, scope, tablesByName, tableTypesByName, localDefsByName)) {
+    if (stopAtPotentialLocalSource && hasColumnBearingLocalSource(symbols, scope, tablesByName, tableTypesByName, localDefsByName)) {
       return [];
     }
-    if (String(scope.name ?? "").toLowerCase() === "subquery") {
+    if (stopAtSubqueryBoundary && String(scope.name ?? "").toLowerCase() === "subquery") {
       return [];
     }
     scope = scope.parent ?? null;

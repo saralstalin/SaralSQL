@@ -3,6 +3,13 @@
 Use this checklist to migrate SaralSQL to the formal scope model described in:
 - [sql-scope-model.md](C:\Users\Nimmy\source\repos\SaralSQL\docs\sql-scope-model.md)
 - [sql-resolution-context.md](C:\Users\Nimmy\source\repos\SaralSQL\docs\sql-resolution-context.md)
+- [parser-gap-tracker.md](C:\Users\Nimmy\source\repos\SaralSQL\docs\parser-gap-tracker.md)
+- [lsp-phase-plan.md](C:\Users\Nimmy\source\repos\SaralSQL\docs\lsp-phase-plan.md)
+
+## 0) Delivery Mode (Current)
+
+- [ ] Execute LSP-first implementation now (non-blocking parser gaps tracked separately).
+- [ ] Keep parser gaps and ownership boundaries updated in `parser-gap-tracker.md`.
 
 ## 1) Baseline and Guardrails
 

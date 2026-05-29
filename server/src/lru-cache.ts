@@ -2,8 +2,13 @@
 
 export class LruCache {
     private map = new Map<string, { value: any; ts: number }>();
-    capacity = 2000;
-    ttlMs = 30 * 60 * 1000;
+    readonly capacity: number;
+    readonly ttlMs: number;
+
+    constructor(capacity = 2000, ttlMs = 30 * 60 * 1000) {
+        this.capacity = capacity;
+        this.ttlMs = Math.max(1, ttlMs);
+    }
 
     has(k: string): boolean {
         const e = this.map.get(k);

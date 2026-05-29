@@ -2,6 +2,8 @@ import { normalizeName } from "./text-utils";
 import { normalizeAstTableName, resolveAliasTableName, resolveSymbolCaseInsensitive } from "./ast-utils";
 import { collectNearestScopeColumnOwners, type ScopeColumnOwner } from "./scope-column-resolver";
 
+const selectRangesCache = new WeakMap<object, Array<{ start: number; end: number; node: any }>>();
+
 type ResolveParams = {
   parsed: any;
   offset: number;
@@ -12,6 +14,31 @@ type ResolveParams = {
   localDefsByName?: Map<string, any>;
 };
 
+export type ResolutionScopeType =
+  | "qualified"
+  | "mutation"
+  | "read"
+  | "projection"
+  | "orderBy"
+  | "lexical"
+  | "unknown";
+
+export type ResolutionDecisionTrace = {
+  scopeType: ResolutionScopeType;
+  reason: string;
+  ownerCount: number;
+};
+
+export type ResolutionContext = {
+  statementRange: { start: number; end: number } | null;
+  tokenRange: { start: number; end: number };
+  scopeAtPos: any;
+  readOwners: ScopeColumnOwner[];
+  mutationOwner: ScopeColumnOwner | null;
+  parserHintOwner: ScopeColumnOwner | null;
+  parserHintConfidence: "high" | "medium" | "low" | "none";
+};
+
 export type BareColumnResolution = {
   status: "resolved" | "ambiguous" | "unresolved";
   owner?: ScopeColumnOwner;
@@ -19,6 +46,8 @@ export type BareColumnResolution = {
   matchedResolution: any;
   ambiguityCandidates: string[];
   decisionReason: string;
+  trace?: ResolutionDecisionTrace;
+  context?: ResolutionContext;
 };
 
 export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnResolution {
@@ -28,14 +57,6 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
   }
 
   const scopeAtPos = params.scopeAtPos ?? params.parsed?.scope?.root?.findInnermost?.(params.offset) ?? params.parsed?.scope?.root;
-  const collectedOwners = collectNearestScopeColumnOwners(scopeAtPos, colNorm, params.tablesByName, params.tableTypesByName, params.localDefsByName);
-  const owners = dedupeOwners(narrowOwnersByReadScope(
-    params,
-    narrowOwnersForCurrentSelectSources(
-      params,
-      narrowOwnersForRecursiveCteSelfShadow(params, narrowOwnersForInsertReadContext(params, collectedOwners))
-    )
-  ));
   const matchedResolution = params.parsed?.columns?.resolutions?.find((r: any) => {
     const s = Number(r?.location?.start);
     const e = Number(r?.location?.end);
@@ -47,39 +68,202 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
       ? matchedResolution.decision.ambiguityCandidates
       : [];
   const decisionReason = normalizeName(String(matchedResolution?.decisionReason ?? matchedResolution?.decision?.decisionReason ?? ""));
+  const context = buildResolutionContext(params, colNorm, matchedResolution, scopeAtPos);
 
-  const parserOwner = resolveParserDecisionOwner(params, matchedResolution, colNorm);
-  if (parserOwner && ownerInList(parserOwner, owners)) {
-    return { status: "resolved", owner: parserOwner, owners: [parserOwner], matchedResolution, ambiguityCandidates, decisionReason };
+  // Phase: unified precedence path
+  // 1) Mutation target ownership has priority inside update/delete statement contexts.
+  if (context.mutationOwner) {
+    return {
+      status: "resolved",
+      owner: context.mutationOwner,
+      owners: [context.mutationOwner],
+      matchedResolution,
+      ambiguityCandidates,
+      decisionReason,
+      trace: { scopeType: "mutation", reason: "mutation-target-owner", ownerCount: 1 },
+      context
+    };
   }
 
-  const singleInputOwner = resolveSingleInputOwner(params, matchedResolution, colNorm);
-  if (singleInputOwner && ownerInList(singleInputOwner, owners)) {
-    return { status: "resolved", owner: singleInputOwner, owners: [singleInputOwner], matchedResolution, ambiguityCandidates, decisionReason };
+  // 2) Read scope ownership (statement-local only)
+  if (context.readOwners.length === 1) {
+    return {
+      status: "resolved",
+      owner: context.readOwners[0],
+      owners: context.readOwners,
+      matchedResolution,
+      ambiguityCandidates,
+      decisionReason,
+      trace: { scopeType: "read", reason: "single-read-owner", ownerCount: 1 },
+      context
+    };
   }
 
-  const mutationTargetOwner = resolveMutationTargetOwner(params, colNorm);
-  if (mutationTargetOwner) {
-    return { status: "resolved", owner: mutationTargetOwner, owners: [mutationTargetOwner], matchedResolution, ambiguityCandidates, decisionReason };
+  if (context.readOwners.length > 1) {
+    return {
+      status: "ambiguous",
+      owners: context.readOwners,
+      matchedResolution,
+      ambiguityCandidates,
+      decisionReason,
+      trace: { scopeType: "read", reason: "multiple-read-owners", ownerCount: context.readOwners.length },
+      context
+    };
   }
 
-  // Local scope single-owner truth wins over broad parser ambiguity candidates.
-  if (owners.length === 1) {
-    return { status: "resolved", owner: owners[0], owners, matchedResolution, ambiguityCandidates, decisionReason };
+  // 3) Correlated lexical outer-walk: only for subquery-select contexts with no local FROM sources.
+  const lexicalOwner = resolveCorrelatedLexicalOwner(params, colNorm, scopeAtPos);
+  if (lexicalOwner) {
+    return {
+      status: "resolved",
+      owner: lexicalOwner,
+      owners: [lexicalOwner],
+      matchedResolution,
+      ambiguityCandidates,
+      decisionReason,
+      trace: { scopeType: "lexical", reason: "correlated-outer-walk", ownerCount: 1 },
+      context
+    };
   }
 
-  const narrowedOwner = resolveNarrowedAmbiguityOwner(params, ambiguityCandidates, colNorm);
-  if (narrowedOwner && ownerInList(narrowedOwner, owners)) {
-    return { status: "resolved", owner: narrowedOwner, owners: [narrowedOwner], matchedResolution, ambiguityCandidates, decisionReason };
+  // 3) No owner in statement scope: unresolved.
+  // Parser hints remain non-authoritative for diagnostics.
+  return {
+    status: "unresolved",
+    owners: [],
+    matchedResolution,
+    ambiguityCandidates,
+    decisionReason,
+    trace: {
+      scopeType: "unknown",
+      reason: context.parserHintOwner ? `no-scope-owner-parser-hint-${context.parserHintConfidence}` : "no-scope-owner",
+      ownerCount: 0
+    },
+    context
+  };
+}
+
+function resolveCorrelatedLexicalOwner(
+  params: ResolveParams,
+  colNorm: string,
+  scopeAtPos: any
+): ScopeColumnOwner | null {
+  if (!isCorrelatedOuterWalkEligible(params.parsed?.ast, params.offset)) {
+    return null;
   }
 
-  // Ambiguity should be rooted in scope-visible ownership, not parser-only broad candidates.
-  // If scope walk does not find competing owners, treat as unresolved and let unknown-column flow handle it.
-  if (owners.length > 1) {
-    return { status: "ambiguous", owners, matchedResolution, ambiguityCandidates, decisionReason };
-  }
+  const owners = dedupeOwners(
+    collectNearestScopeColumnOwners(
+      scopeAtPos,
+      colNorm,
+      params.tablesByName,
+      params.tableTypesByName,
+      params.localDefsByName,
+      { stopAtSubqueryBoundary: false, stopAtPotentialLocalSource: false }
+    )
+  );
 
-  return { status: "unresolved", owners, matchedResolution, ambiguityCandidates, decisionReason };
+  return owners.length === 1 ? owners[0] : null;
+}
+
+function isCorrelatedOuterWalkEligible(ast: any, offset: number): boolean {
+  const select = findContainingSelectAtOffset(ast, offset);
+  if (!select) {
+    return false;
+  }
+  const hasLocalFromSources = Array.isArray(select?.from) && select.from.length > 0;
+  return !hasLocalFromSources;
+}
+
+function buildResolutionContext(
+  params: ResolveParams,
+  colNorm: string,
+  matchedResolution: any,
+  scopeAtPos: any
+): ResolutionContext {
+  const tokenRange = { start: params.offset, end: params.offset };
+  const mutationOwner = resolveMutationTargetOwner(params, colNorm);
+  const parserHintOwner = resolveParserDecisionOwner(params, matchedResolution, colNorm);
+  const parserHintConfidence: "high" | "medium" | "low" | "none" =
+    parserHintOwner
+      ? (normalizeName(String(matchedResolution?.decisionReason ?? matchedResolution?.decision?.decisionReason ?? "")).includes("ambiguous")
+          ? "medium"
+          : "high")
+      : "none";
+
+  const collectedOwners = collectNearestScopeColumnOwners(
+    scopeAtPos,
+    colNorm,
+    params.tablesByName,
+    params.tableTypesByName,
+    params.localDefsByName
+  );
+  const readOwners = dedupeOwners(
+    narrowOwnersByReadScope(
+      params,
+      narrowOwnersForCurrentSelectSources(
+        params,
+        narrowOwnersForRecursiveCteSelfShadow(params, narrowOwnersForInsertReadContext(params, collectedOwners))
+      )
+    )
+  );
+
+  const stmt = findContainingStatementAtOffset(params.parsed?.ast, params.offset);
+  const statementRange = stmt && Number.isFinite(Number(stmt?.start)) && Number.isFinite(Number(stmt?.end))
+    ? { start: Number(stmt.start), end: Number(stmt.end) }
+    : null;
+
+  return {
+    statementRange,
+    tokenRange,
+    scopeAtPos,
+    readOwners,
+    mutationOwner,
+    parserHintOwner,
+    parserHintConfidence
+  };
+}
+
+function findContainingStatementAtOffset(ast: any, offset: number): any | null {
+  if (!ast || typeof offset !== "number") {
+    return null;
+  }
+  let best: any = null;
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+    const start = Number(node?.start);
+    const end = Number(node?.end);
+    if (Number.isFinite(start) && Number.isFinite(end)) {
+      if (offset < start || offset > end) {
+        return;
+      }
+      if (
+        node?.type?.endsWith?.("Statement")
+        || node?.type === "CreateProcedureStatement"
+        || node?.type === "CreateFunctionStatement"
+        || node?.type === "CreateViewStatement"
+      ) {
+        if (!best || (end - start) < (Number(best.end) - Number(best.start))) {
+          best = node;
+        }
+      }
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+  visit(ast);
+  return best;
 }
 
 function narrowOwnersByReadScope(params: ResolveParams, owners: ScopeColumnOwner[]): ScopeColumnOwner[] {
@@ -202,8 +386,11 @@ function findContainingSelectAtOffset(ast: any, offset: number): any | null {
 }
 
 function getCachedSelectRanges(ast: any): Array<{ start: number; end: number; node: any }> {
-  const cacheKey = "__saralsqlSelectRanges";
-  const existing = ast?.[cacheKey];
+  if (!ast || typeof ast !== "object") {
+    return [];
+  }
+
+  const existing = selectRangesCache.get(ast as object);
   if (Array.isArray(existing)) {
     return existing;
   }
@@ -230,11 +417,7 @@ function getCachedSelectRanges(ast: any): Array<{ start: number; end: number; no
   };
 
   visit(ast);
-  Object.defineProperty(ast, cacheKey, {
-    value: out,
-    enumerable: false,
-    configurable: true
-  });
+  selectRangesCache.set(ast as object, out);
   return out;
 }
 
@@ -364,24 +547,6 @@ function narrowOwnersForInsertReadContext(params: ResolveParams, owners: ScopeCo
   return owners;
 }
 
-function resolveSingleInputOwner(params: ResolveParams, matchedResolution: any, colNorm: string): ScopeColumnOwner | null {
-  const sources = new Set<string>();
-  for (const input of matchedResolution?.inputs ?? []) {
-    if (input?.kind !== "column" || !input?.source) {
-      continue;
-    }
-    const source = normalizeName(String(input.source));
-    if (source) {
-      sources.add(source);
-    }
-  }
-  if (sources.size !== 1) {
-    return null;
-  }
-  const only = Array.from(sources)[0];
-  return resolveCandidateOwner(params, only, colNorm);
-}
-
 function resolveMutationTargetOwner(params: ResolveParams, colNorm: string): ScopeColumnOwner | null {
   const ast = params.parsed?.ast;
   if (!ast) {
@@ -496,19 +661,6 @@ function dedupeOwners(owners: ScopeColumnOwner[]): ScopeColumnOwner[] {
   return out;
 }
 
-function ownerInList(owner: ScopeColumnOwner, owners: ScopeColumnOwner[]): boolean {
-  if (!owner || !Array.isArray(owners) || owners.length === 0) {
-    return false;
-  }
-  const ownerName = normalizeName(String(owner.ownerName ?? ""));
-  const ownerCol = normalizeName(String(owner.column?.rawName ?? owner.column?.name ?? ""));
-  return owners.some((o) => {
-    const n = normalizeName(String(o.ownerName ?? ""));
-    const c = normalizeName(String(o.column?.rawName ?? o.column?.name ?? ""));
-    return n === ownerName && c === ownerCol;
-  });
-}
-
 
 function resolveLocalScopeOwnerByName(scopeAtPos: any, targetName: string, colNorm: string): ScopeColumnOwner | null {
   if (!scopeAtPos || !targetName) {
@@ -563,36 +715,6 @@ function resolveParserDecisionOwner(params: ResolveParams, matchedResolution: an
     return null;
   }
   return owner;
-}
-
-function resolveNarrowedAmbiguityOwner(params: ResolveParams, parserCandidates: any[], colNorm: string): ScopeColumnOwner | null {
-  if (!Array.isArray(parserCandidates) || parserCandidates.length === 0) {
-    return null;
-  }
-
-  const matches: ScopeColumnOwner[] = [];
-  const seen = new Set<string>();
-  for (const candidate of parserCandidates) {
-    const raw = String(candidate ?? "").trim();
-    if (!raw) {
-      continue;
-    }
-    const norm = normalizeName(raw);
-    if (!norm || seen.has(norm)) {
-      continue;
-    }
-    seen.add(norm);
-
-    const owner = resolveCandidateOwner(params, norm, colNorm);
-    if (owner) {
-      const dedupe = normalizeName(owner.ownerName);
-      if (!matches.some(m => normalizeName(m.ownerName) === dedupe)) {
-        matches.push(owner);
-      }
-    }
-  }
-
-  return matches.length === 1 ? matches[0] : null;
 }
 
 function resolveCandidateOwner(params: ResolveParams, normalizedCandidate: string, colNorm: string): ScopeColumnOwner | null {

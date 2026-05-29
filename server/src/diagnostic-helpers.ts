@@ -581,6 +581,11 @@ export function collectReadableBareColumnDiagnostics(
     if (resolved.status !== "resolved") {
       continue;
     }
+    if (resolved.trace?.scopeType === "lexical") {
+      // Correlated outer-walk ownership is legal for resolution, but we avoid
+      // readability hints that suggest qualifying with outer aliases from inner scopes.
+      continue;
+    }
     const matches: Array<{ alias: string; displayAlias: string }> = [];
     if (resolved.owner?.alias && resolved.owner?.displayAlias) {
       matches.push({ alias: resolved.owner.alias, displayAlias: resolved.owner.displayAlias });

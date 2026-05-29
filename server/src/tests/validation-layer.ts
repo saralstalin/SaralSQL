@@ -1,7 +1,7 @@
 import * as assert from "assert";
 import { DiagnosticSeverity } from "vscode-languageserver/node";
 import { parseSql } from "../sql-parser";
-import { getLineStarts } from "../text-utils";
+import { getLineStarts, normalizeName } from "../text-utils";
 import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, buildSelectStarExpansionCodeActions, buildUpdateNoLockCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "../diagnostic-helpers";
 import { indexText, definitions, referencesIndex, columnsByTable, tablesByName, tableTypesByName, aliasesByUri } from "../definitions";
 import { resolveBareColumnAtOffset } from "../column-resolution";
@@ -1202,6 +1202,83 @@ ORDER BY EmployeeId DESC;
   );
 });
 
+runCase("set-operator-order-by-uses-left-branch-canonical-output-name", () => {
+  const schemaUri = "file:///validation/setop-orderby-left-canonical-schema.sql";
+  const queryUri = "file:///validation/setop-orderby-left-canonical-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.T1 (
+  ColA INT
+);
+CREATE TABLE dbo.T2 (
+  ColB INT
+);
+`;
+
+  const querySql = `
+SELECT ColA AS OutName FROM dbo.T1
+UNION ALL
+SELECT ColB AS OtherName FROM dbo.T2
+ORDER BY OutName;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.strictEqual(
+    diagnostics.length,
+    0,
+    "ORDER BY should bind to the canonical set-operator output name from the left branch without ambiguity"
+  );
+});
+
+runCase("set-operator-order-by-duplicate-left-output-alias-does-not-false-ambiguity", () => {
+  const schemaUri = "file:///validation/setop-orderby-dup-left-schema.sql";
+  const queryUri = "file:///validation/setop-orderby-dup-left-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.T1 (
+  ColA INT,
+  ColC INT
+);
+CREATE TABLE dbo.T2 (
+  ColB INT,
+  ColD INT
+);
+`;
+
+  const querySql = `
+SELECT ColA AS OutName, ColC AS OutName FROM dbo.T1
+UNION ALL
+SELECT ColB AS OtherName, ColD AS OtherName FROM dbo.T2
+ORDER BY OutName;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'OutName'")),
+    "Set-operator ORDER BY duplicate output aliases should not trigger false ambiguity in current LSP contract"
+  );
+});
+
 runCase("parser-ambiguous-candidates-are-narrowed-by-schema-ownership", () => {
   const schemaUri = "file:///validation/ambig-schema-narrow.sql";
   const queryUri = "file:///validation/ambig-schema-narrow-query.sql";
@@ -1558,6 +1635,289 @@ WHERE FirstName IS NOT NULL;
     resolved.status,
     "unresolved",
     "Outer scope must not see non-projected inner source columns through derived alias"
+  );
+});
+
+runCase("nested-scope-local-source-wins-before-outer-visible-symbols", () => {
+  const uri = "file:///validation/nested-scope-local-first.sql";
+  const sql = `
+DECLARE @OuterRows TABLE (LocationCode INT);
+DECLARE @InnerRows TABLE (LocationCode INT);
+
+SELECT LocationCode
+FROM @InnerRows
+WHERE LocationCode > 0;
+`;
+
+  indexText(uri, sql);
+  const parsed = parseSql(sql);
+  const offset = sql.lastIndexOf("LocationCode > 0");
+  assert.ok(offset >= 0, "LocationCode token must exist in nested scope SQL");
+
+  const resolved = resolveBareColumnAtOffset({
+    parsed,
+    offset,
+    columnName: "LocationCode",
+    tablesByName,
+    tableTypesByName
+  });
+
+  assert.strictEqual(resolved.status, "resolved", "Local read source should resolve bare column");
+  assert.strictEqual(
+    normalizeName(String(resolved.owner?.ownerName ?? "")),
+    "@innerrows",
+    "Resolver must bind bare column to innermost statement source before outer visible symbols"
+  );
+});
+
+runCase("correlated-bare-column-can-walk-to-outer-when-inner-select-has-no-from", () => {
+  const schemaUri = "file:///validation/correlated-outer-walk-schema.sql";
+  const queryUri = "file:///validation/correlated-outer-walk-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.Employee (
+  EmployeeId INT
+);
+`;
+
+  const querySql = `
+SELECT e.EmployeeId
+FROM dbo.Employee e
+WHERE EXISTS (
+  SELECT 1
+  WHERE EmployeeId = e.EmployeeId
+);
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const offset = querySql.indexOf("EmployeeId = e.EmployeeId");
+  assert.ok(offset >= 0, "Correlated bare EmployeeId must exist in query");
+
+  const resolved = resolveBareColumnAtOffset({
+    parsed,
+    offset,
+    columnName: "EmployeeId",
+    tablesByName,
+    tableTypesByName
+  });
+
+  assert.strictEqual(
+    resolved.status,
+    "resolved",
+    "Resolver should legally walk to outer scope for correlated bare columns when inner select has no local FROM sources"
+  );
+  assert.strictEqual(
+    resolved.trace?.scopeType,
+    "lexical",
+    "Correlated outer-walk should be recorded as lexical resolution"
+  );
+});
+
+runCase("correlated-outer-walk-does-not-descend-into-outer-derived-internals", () => {
+  const schemaUri = "file:///validation/correlated-derived-internal-block-schema.sql";
+  const queryUri = "file:///validation/correlated-derived-internal-block-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.Employee (
+  EmployeeId INT,
+  FirstName NVARCHAR(100)
+);
+`;
+
+  const querySql = `
+SELECT d.EmployeeId
+FROM (
+  SELECT e.EmployeeId
+  FROM dbo.Employee e
+) d
+WHERE EXISTS (
+  SELECT 1
+  WHERE FirstName IS NOT NULL
+);
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const offset = querySql.indexOf("FirstName IS NOT NULL");
+  assert.ok(offset >= 0, "FirstName token must exist in correlated subquery");
+
+  const resolved = resolveBareColumnAtOffset({
+    parsed,
+    offset,
+    columnName: "FirstName",
+    tablesByName,
+    tableTypesByName
+  });
+
+  assert.strictEqual(
+    resolved.status,
+    "unresolved",
+    "Correlated outer-walk must not descend into nested internals of outer derived FROM sources"
+  );
+});
+
+runCase("cte-visibility-is-statement-local-not-batch-global", () => {
+  const uri = "file:///validation/cte-statement-local-boundary.sql";
+  const sql = `
+WITH c AS (
+  SELECT 1 AS EmployeeId
+)
+SELECT EmployeeId FROM c;
+
+SELECT EmployeeId FROM c;
+`;
+
+  indexText(uri, sql);
+  const parsed = parseSql(sql);
+  const secondSelectIdx = sql.lastIndexOf("EmployeeId FROM c");
+  assert.ok(secondSelectIdx >= 0, "Second statement token should exist");
+
+  const resolved = resolveBareColumnAtOffset({
+    parsed,
+    offset: secondSelectIdx,
+    columnName: "EmployeeId",
+    tablesByName,
+    tableTypesByName
+  });
+
+  assert.strictEqual(
+    resolved.status,
+    "unresolved",
+    "CTE columns must not remain visible after the statement that defines the CTE"
+  );
+});
+
+runCase("derived-alias-star-expansion-stays-on-projected-surface", () => {
+  const schemaUri = "file:///validation/derived-alias-star-boundary-schema.sql";
+  const queryUri = "file:///validation/derived-alias-star-boundary-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.Department (
+  DepartmentId INT,
+  DepartmentName NVARCHAR(100)
+);
+CREATE TABLE dbo.Employee (
+  EmployeeId INT,
+  DepartmentId INT,
+  FirstName NVARCHAR(100)
+);
+`;
+
+  const querySql = `
+SELECT s.*
+FROM (
+  SELECT d.*, e.FirstName
+  FROM dbo.Department d
+  JOIN dbo.Employee e ON e.DepartmentId = d.DepartmentId
+) s
+WHERE s.DepartmentId = 1;
+`;
+
+  indexText(schemaUri, schemaSql);
+  const parsed = parseSql(querySql);
+  const actions = buildSelectStarExpansionCodeActions(
+    queryUri,
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    0,
+    querySql.length
+  );
+  const starAction = actions.find(a => String(a.title ?? "").toLowerCase().includes("expand"));
+  const expandedSql = String(starAction?.edit?.changes?.[queryUri]?.[0]?.newText ?? "");
+
+  assert.ok(expandedSql.includes("DepartmentId"), "Expansion should include projected DepartmentId from derived alias surface");
+  assert.ok(!expandedSql.includes("EmployeeId"), "Expansion should not descend into non-projected inner source columns");
+});
+
+runCase("missing-readscopes-falls-back-to-statement-local-scope-without-false-ambiguity", () => {
+  const schemaUri = "file:///validation/missing-readscopes-schema.sql";
+  const queryUri = "file:///validation/missing-readscopes-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.Employee (
+  EmployeeId INT
+);
+CREATE TABLE dbo.Department (
+  DepartmentId INT
+);
+`;
+
+  const querySql = `
+SELECT e.EmployeeId
+FROM dbo.Employee e
+JOIN dbo.Department d ON d.DepartmentId = 1
+WHERE EmployeeId > 0;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  if (parsed?.lineage) {
+    parsed.lineage.readScopes = [];
+  }
+
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    diagnostics.every(d => !String(d.message).includes("Ambiguous column 'EmployeeId'")),
+    "When parser readScopes metadata is missing, LSP should use statement-local scope synthesis and avoid false ambiguity"
+  );
+});
+
+runCase("missing-parser-column-resolutions-prefers-unknown-over-unproven-ambiguity", () => {
+  const schemaUri = "file:///validation/missing-resolutions-schema.sql";
+  const queryUri = "file:///validation/missing-resolutions-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.Employee (
+  EmployeeId INT
+);
+`;
+
+  const querySql = `
+SELECT EmployeeId
+FROM dbo.Employee;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  if (parsed?.columns) {
+    parsed.columns.resolutions = [];
+  }
+  if (parsed?.lineage) {
+    parsed.lineage.readScopes = [];
+  }
+  const offset = querySql.indexOf("EmployeeId");
+  assert.ok(offset >= 0, "EmployeeId token must exist");
+
+  const resolved = resolveBareColumnAtOffset({
+    parsed,
+    offset,
+    columnName: "EmployeeId",
+    tablesByName,
+    tableTypesByName
+  });
+
+  assert.ok(
+    resolved.status === "resolved" || resolved.status === "unresolved",
+    "Missing parser metadata should still allow scope-local synthesis attempts without forcing parser-derived ambiguity"
+  );
+  assert.notStrictEqual(
+    resolved.status,
+    "ambiguous",
+    "When parser column-resolutions are missing, resolver must prefer unknown over unproven ambiguity"
   );
 });
 

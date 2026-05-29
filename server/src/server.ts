@@ -9,7 +9,6 @@ import {
   Location,
   ReferenceParams,
   CompletionItem,
-  CompletionItemKind,
   CompletionParams,
   CodeAction,
   CodeActionKind,
@@ -23,7 +22,6 @@ import {
   Range,
   RenameParams,
   WorkspaceEdit,
-  TextEdit,
   Position
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
@@ -31,10 +29,20 @@ import * as fs from "fs";
 import * as fg from "fast-glob";
 import * as url from "url";
 import * as path from "path";
+import { isSqlProjectUri, normalizeFileLikeUri } from "./uri-utils";
+import { indexStore } from "./index-store";
+import { rebuildSqlProjMembershipFromWorkspaceFolders, shouldContributeToWorkspaceSchemaFor, toSqlProjMembershipKey, type SqlProjItemKind } from "./workspace-sqlproj";
+import { addUnknownTableAtProvider, addWrongColumnProvider, buildSchemaValidationContextProvider, buildTableRefsByNameProvider, clearWorkspaceDiagnosticsProvider, collectParserDiagnosticsProvider, columnExistsInContextProvider, createDiagnosticTextReaderProvider, createOffsetRangeProvider, getDisplayTableNameProvider, tableExistsInContextProvider, validateWorkspaceDocumentsProvider } from "./validation-provider";
+import { findReferencesForWordProvider, isAmbiguousBareColumnAtPositionProvider } from "./references-provider";
+import { buildCodeActionsForDocument } from "./code-actions-provider";
+import { doHoverProvider } from "./hover-provider";
+import { onDefinitionProvider } from "./definition-provider";
+import { onCompletionProvider } from "./completion-provider";
+import { onRenameProvider } from "./rename-provider";
+import { onDocumentSymbolProvider } from "./document-symbol-provider";
 import {
   normalizeName
   , getWordRangeAtPosition
-  , isSqlKeyword
   , offsetAt
   , getLineStarts
   , offsetToPosition
@@ -86,9 +94,10 @@ const schemaDiagnosticCodes = new Set<string>([
 ]);
 const DEBUG = process.env.SARALSQL_DEBUG === "1";
 const dbg = (...args: any[]) => { if (DEBUG) { console.debug("[SaralSQL]", ...args); } };
-type SqlProjItemKind = "build" | "none" | "preDeploy" | "postDeploy" | "other";
 const sqlProjItemKindBySqlUri = new Map<string, SqlProjItemKind>();
 let hasSqlProjInWorkspace = false;
+let indexWorkspaceInFlight: Promise<void> | null = null;
+let indexWorkspaceQueued = false;
 
 // Call this after building the definitions index
 async function markIndexReady() {
@@ -106,109 +115,37 @@ async function markIndexReady() {
 }
 
 async function validateWorkspaceDocuments(): Promise<void> {
-  const openDocs = new Map(documents.all().map(doc => [doc.uri, doc]));
-  const validatedUris = new Set<string>();
-
-  for (const doc of openDocs.values()) {
-    try {
-      await validateTextDocument(doc);
-      validatedUris.add(doc.uri);
-    } catch (e) {
-      connection.console.error(
-        `[validateWorkspace] open document validate threw: ${String(e)}`
-      );
-    }
-  }
-
-  let validatedCount = validatedUris.size;
-
-  for (const doc of workspaceDocuments.values()) {
-    if (validatedUris.has(doc.uri)) {
-      continue;
-    }
-
-    try {
-      await validateTextDocument(doc);
-      validatedUris.add(doc.uri);
-      validatedCount++;
-
-      if (validatedCount % 25 === 0) {
-        await new Promise(resolve => setTimeout(resolve, 0));
-      }
-    } catch (e) {
-      connection.console.error(
-        `[validateWorkspace] workspace document validate threw for ${doc.uri}: ${String(e)}`
-      );
-    }
-  }
-
-  connection.console.log(
-    `[validateWorkspace] validated ${validatedUris.size} workspace SQL documents`
+  await validateWorkspaceDocumentsProvider(
+    documents,
+    workspaceDocuments,
+    validateTextDocument,
+    (message) => connection.console.log(message)
   );
 }
 
 function clearWorkspaceDiagnostics(): void {
-  const uris = new Set<string>();
-
-  for (const doc of workspaceDocuments.values()) {
-    uris.add(doc.uri);
-  }
-
-  for (const doc of documents.all()) {
-    uris.add(doc.uri);
-  }
-
-  for (const uri of uris) {
-    connection.sendDiagnostics({
-      uri,
-      diagnostics: []
-    });
-  }
+  clearWorkspaceDiagnosticsProvider(
+    documents,
+    workspaceDocuments,
+    (uri, diagnostics) => connection.sendDiagnostics({ uri, diagnostics })
+  );
 }
 
 function toNormUri(rawUri: string) {
-  try {
-    let uri = rawUri;
-    if (!uri.startsWith('file://')) {
-      uri = url.pathToFileURL(uri).toString();
-    }
-    const prefix = 'file:///';
-    if (uri.toLowerCase().startsWith(prefix)) {
-      const pathPart = decodeURIComponent(uri.substring(prefix.length));
-      const normalizedPath = pathPart.replace(/\\/g, '/').replace(/^([A-Za-z]):\//, (m, d) => d.toLowerCase() + ':/');
-      return prefix + encodeURI(normalizedPath);
-    }
-    return uri;
-  } catch (e) {
-    return rawUri;
-  }
+  return normalizeFileLikeUri(rawUri);
 }
 
 function isSqlProjectFileUri(rawUri: string): boolean {
-  return toNormUri(rawUri).toLowerCase().endsWith(".sqlproj");
-}
-
-function toSqlProjMembershipKey(rawUri: string): string {
-  return toNormUri(rawUri).toLowerCase();
+  return isSqlProjectUri(rawUri);
 }
 
 function shouldContributeToWorkspaceSchema(rawUri: string): boolean {
-  return shouldContributeToWorkspaceSchemaFor(sqlProjItemKindBySqlUri, hasSqlProjInWorkspace, rawUri);
-}
-
-function shouldContributeToWorkspaceSchemaFor(
-  membership: Map<string, SqlProjItemKind>,
-  hasSqlProj: boolean,
-  rawUri: string
-): boolean {
-  if (!sqlProjStrictBuildMembership) {
-    return true;
-  }
-  if (!hasSqlProj) {
-    return true;
-  }
-  const kind = membership.get(toSqlProjMembershipKey(rawUri));
-  return kind === "build";
+  return shouldContributeToWorkspaceSchemaFor(
+    sqlProjItemKindBySqlUri,
+    hasSqlProjInWorkspace,
+    sqlProjStrictBuildMembership,
+    rawUri
+  );
 }
 
 function maybePushSqlProjMissingFileDiagnostic(uri: string, text: string, diagnostics: Diagnostic[]): void {
@@ -218,80 +155,32 @@ function maybePushSqlProjMissingFileDiagnostic(uri: string, text: string, diagno
   if (sqlProjItemKindBySqlUri.has(toSqlProjMembershipKey(uri))) {
     return;
   }
+  const firstLineEnd = (() => {
+    const newlineIdx = text.indexOf("\n");
+    if (newlineIdx >= 0) {
+      return newlineIdx;
+    }
+    return Math.max(1, text.length);
+  })();
   diagnostics.push({
     code: "SSDT001",
     severity: sqlProjMissingFileSeverity,
     range: {
       start: { line: 0, character: 0 },
-      end: { line: 0, character: Math.min(1, text.length) }
+      end: { line: 0, character: firstLineEnd }
     },
     message: "File is not included in any .sqlproj item. It is validated locally but excluded from workspace schema contribution.",
     source: "SaralSQL"
   });
 }
 
-function decodeXmlAttribute(value: string): string {
-  return value
-    .replace(/&quot;/g, "\"")
-    .replace(/&apos;/g, "'")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
-}
-
-function registerSqlProjItem(projectDir: string, includeValue: string, kind: SqlProjItemKind): void {
-  const trimmed = decodeXmlAttribute(String(includeValue ?? "").trim());
-  if (!trimmed || !trimmed.toLowerCase().endsWith(".sql")) {
-    return;
-  }
-
-  const absPath = path.isAbsolute(trimmed)
-    ? trimmed
-    : path.resolve(projectDir, trimmed);
-  const sqlUri = url.pathToFileURL(absPath).toString();
-  sqlProjItemKindBySqlUri.set(toSqlProjMembershipKey(sqlUri), kind);
-}
-
-function ingestSqlProj(absSqlProjPath: string): void {
-  const projectXml = fs.readFileSync(absSqlProjPath, "utf8");
-  const projectDir = path.dirname(absSqlProjPath);
-
-  const collect = (tagName: string, kind: SqlProjItemKind): void => {
-    const rx = new RegExp(`<${tagName}\\b[^>]*\\bInclude\\s*=\\s*\"([^\"]+)\"[^>]*>`, "gi");
-    for (const m of projectXml.matchAll(rx)) {
-      registerSqlProjItem(projectDir, String(m[1] ?? ""), kind);
-    }
-  };
-
-  collect("Build", "build");
-  collect("None", "none");
-  collect("PreDeploy", "preDeploy");
-  collect("PostDeploy", "postDeploy");
-  collect("Content", "other");
-}
-
 async function rebuildSqlProjMembershipFromWorkspace(): Promise<void> {
   const folders = await connection.workspace.getWorkspaceFolders?.();
-  sqlProjItemKindBySqlUri.clear();
-  hasSqlProjInWorkspace = false;
-  if (!folders) {
-    return;
-  }
-
-  for (const folder of folders) {
-    const folderPath = url.fileURLToPath(folder.uri);
-    const sqlProjFiles = await fg.glob("**/*.sqlproj", { cwd: folderPath, absolute: true });
-    if (sqlProjFiles.length > 0) {
-      hasSqlProjInWorkspace = true;
-    }
-    for (const sqlProjFile of sqlProjFiles) {
-      try {
-        ingestSqlProj(sqlProjFile);
-      } catch (err) {
-        safeError(`Failed to parse ${sqlProjFile}`, err);
-      }
-    }
-  }
+  hasSqlProjInWorkspace = await rebuildSqlProjMembershipFromWorkspaceFolders(
+    folders,
+    sqlProjItemKindBySqlUri,
+    safeError
+  );
 }
 
 function safeLog(msg: string): void {
@@ -355,20 +244,21 @@ function parseSeveritySetting(value: unknown, fallback: DiagnosticSeverity): Dia
 }
 
 async function indexWorkspace(): Promise<void> {
-  try {
+  if (indexWorkspaceInFlight) {
+    indexWorkspaceQueued = true;
+    await indexWorkspaceInFlight;
+    return;
+  }
+
+  indexWorkspaceInFlight = (async () => {
+    try {
     const folders = await connection.workspace.getWorkspaceFolders?.();
     if (!folders) {
       return;
     }
 
     workspaceDocuments.clear();
-    definitions.clear();
-    referencesIndex.clear();
-    columnsByTable.clear();
-    tablesByName.clear();
-    tableTypesByName.clear();
-    aliasesByUri.clear();
-    tempTablesByUri.clear();
+    indexStore.clearAll();
     await rebuildSqlProjMembershipFromWorkspace();
 
     for (const folder of folders) {
@@ -399,6 +289,17 @@ async function indexWorkspace(): Promise<void> {
     safeLog("Workspace indexing complete.");
   } catch (err) {
     safeError("Workspace indexing failed", err);
+  }
+  })();
+
+  try {
+    await indexWorkspaceInFlight;
+  } finally {
+    indexWorkspaceInFlight = null;
+    if (indexWorkspaceQueued) {
+      indexWorkspaceQueued = false;
+      await indexWorkspace();
+    }
   }
 }
 
@@ -455,7 +356,7 @@ connection.onDidChangeWatchedFiles(async (change) => {
 
     const impactedUris = new Set<string>();
     for (const uri of workspaceDocuments.keys()) {
-      const before = shouldContributeToWorkspaceSchemaFor(previousMembership, previousHasSqlProj, uri);
+      const before = shouldContributeToWorkspaceSchemaFor(previousMembership, previousHasSqlProj, sqlProjStrictBuildMembership, uri);
       const after = shouldContributeToWorkspaceSchema(uri);
       if (before !== after) {
         impactedUris.add(uri);
@@ -558,182 +459,24 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
   try {
     const doc = documents.get(params.textDocument.uri);
     if (!doc) { return null; }
-
-    const normUri = toNormUri(doc.uri);
-    const parsed = getParsedDocument(doc);
-    const offset = doc.offsetAt(params.position);
-    const localDefsByName = new Map<string, any>();
-    for (const def of definitions.get(normUri) ?? []) {
-      localDefsByName.set(normalizeName(def.name), def);
-    }
-
-    const match = findReferenceAtPosition(normUri, params.position.line, params.position.character);
-    if (isAmbiguousBareColumnAtPosition(doc, params.position, parsed)) {
-      return null;
-    }
-
-    if (!match) {
-      const wordRange = getWordRangeAtPosition(doc, params.position);
-      if (!wordRange) { return null; }
-      const rawWord = doc.getText(wordRange);
-      const word = normalizeName(rawWord);
-      const isBareColumnToken = !rawWord.includes(".") && !rawWord.startsWith("@") && !isSqlKeyword(word);
-      const matchedResolution = parsed?.columns?.resolutions?.find((r: any) => {
-        const s = Number(r?.location?.start);
-        const e = Number(r?.location?.end);
-        return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
-      });
-      if (matchedResolution) {
-        const sources = getResolutionSourceColumns(matchedResolution);
-        if (sources.length > 0) {
-          for (const src of sources) {
-            const locs = findColumnInTable(src.table, src.column);
-            if (locs.length > 0) {
-              return locs;
-            }
-          }
-        }
-      }
-      const localDefs = (definitions.get(normUri) || []).filter(d => normalizeName(d.name) === word || normalizeName(d.rawName) === word);
-      if (localDefs.length > 0) {
-        return localDefs.map(d => ({
-          uri: d.uri,
-          range: {
-            start: { line: d.line, character: 0 },
-            end: { line: d.line, character: 200 }
-          }
-        }));
-      }
-      if (isBareColumnToken) {
-        const scopeAtPos = parsed?.scope?.root?.findInnermost(offset) ?? parsed?.scope?.root;
-        const stmtOwner = findStatementLocalColumnOwner(getCurrentStatement(doc, params.position), rawWord, scopeAtPos, parsed, offset, localDefsByName);
-        if (stmtOwner?.ownerName) {
-          const locs = findColumnInTable(normalizeName(stmtOwner.ownerName), word);
-          if (locs.length > 0) {
-            return locs;
-          }
-        }
-        return null;
-      }
-      return null;
-    }
-
-    if (match.kind === "parameter") {
-      const byUri = referencesIndex.get(match.name);
-      const fileRefs = byUri?.get(normUri) || [];
-      const first = fileRefs[0];
-      if (first) {
-        return [{
-          uri: first.uri,
-          range: {
-            start: { line: first.line, character: first.start },
-            end: { line: first.line, character: first.end }
-          }
-        }];
-      }
-      return null;
-    }
-
-    if (match.kind === "table") {
-      const norm = normalizeName(match.name);
-      if (norm.startsWith("@")) {
-        const byUri = referencesIndex.get(norm);
-        const fileRefs = byUri?.get(normUri) || [];
-        const declarationRef = fileRefs.find(r => r.kind === "parameter") ?? fileRefs[0];
-        if (declarationRef) {
-          return [{
-            uri: declarationRef.uri,
-            range: {
-              start: { line: declarationRef.line, character: declarationRef.start },
-              end: { line: declarationRef.line, character: declarationRef.end }
-            }
-          }];
-        }
-      }
-      const defs = definitions.get(norm);
-      if (defs && defs.length > 0) {
-        return defs.map(d => ({
-          uri: d.uri,
-          range: {
-            start: { line: d.line, character: 0 },
-            end: { line: d.line, character: 200 }
-          }
-        }));
-      }
-      const tblDef = tablesByName.get(norm) || tableTypesByName.get(norm);
-      if (tblDef) {
-        return [{
-          uri: tblDef.uri,
-          range: {
-            start: { line: tblDef.line, character: 0 },
-            end: { line: tblDef.line, character: 200 }
-          }
-        }];
-      }
-
-      if (parsed?.scope?.root) {
-        const scopeAtPos = parsed.scope.root.findInnermost(offset);
-        const cteSym = resolveSymbolCaseInsensitive(scopeAtPos, norm);
-        if (cteSym?.kind === "CTE" && typeof cteSym.location?.start === "number" && typeof cteSym.location?.end === "number") {
-          return [{
-            uri: doc.uri,
-            range: {
-              start: doc.positionAt(cteSym.location.start),
-              end: doc.positionAt(cteSym.location.end)
-            }
-          }];
-        }
-      }
-
-    }
-
-    if (match.kind === "column") {
-      const parts = match.name.split('.');
-      if (parts.length === 2) {
-        const tableName = parts[0];
-        const colName = parts[1];
-        const derivedProjectionLoc = findDerivedAliasProjectedColumnRange(doc, parsed, offset, tableName, colName);
-        if (derivedProjectionLoc && derivedProjectionLoc.length > 0) {
-          return derivedProjectionLoc;
-        }
-        const matchedResolution = parsed?.columns?.resolutions?.find((r: any) => {
-          const s = Number(r?.location?.start);
-          const e = Number(r?.location?.end);
-          return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
-        });
-        if (matchedResolution) {
-          const sources = getResolutionSourceColumns(matchedResolution);
-          if (sources.length > 0) {
-            for (const src of sources) {
-              const locs = findColumnInTable(src.table, src.column);
-              if (locs.length > 0) {
-                return locs;
-              }
-            }
-          }
-        }
-        if (parsed?.scope?.root) {
-          const scopeAtPos = parsed.scope.root.findInnermost(offset);
-          const cteSym = resolveSymbolCaseInsensitive(scopeAtPos, tableName);
-          if (cteSym?.kind === "CTE") {
-            const cteCol = getCteColumns(cteSym).find(c => c.name === normalizeName(colName));
-            if (cteCol?.start !== undefined && cteCol?.end !== undefined) {
-              return [{
-                uri: doc.uri,
-                range: {
-                  start: doc.positionAt(cteCol.start),
-                  end: doc.positionAt(cteCol.end)
-                }
-              }];
-            }
-          }
-
-        }
-        return findColumnInTable(tableName, colName);
-      }
-    }
-
-    return null;
+    return onDefinitionProvider(doc, params.position, {
+      toNormUri,
+      definitions,
+      tablesByName,
+      tableTypesByName,
+      referencesIndex,
+      getParsedDocument,
+      findReferenceAtPosition,
+      isAmbiguousBareColumnAtPosition,
+      getWordRangeAtPosition,
+      findStatementLocalColumnOwner,
+      getCurrentStatement,
+      findColumnInTable,
+      findDerivedAliasProjectedColumnRange,
+      getResolutionSourceColumns,
+      resolveSymbolCaseInsensitive,
+      getCteColumns
+    });
   } catch (err) {
     safeError("[onDefinition] handler error", err);
     return null;
@@ -743,405 +486,32 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
 // --- Completion ---
 connection.onCompletion((params: CompletionParams): CompletionItem[] => {
   try {
-    const rawUri = params.textDocument.uri;
-    const normUri = toNormUri(rawUri);
-
-    const doc = documents.get(rawUri) || documents.get(normUri);
-    if (!doc) {
-      safeLog(`[completion] no document found for ${rawUri}`);
-      return [];
-    }
-
-    const position = params.position;
-    const offset = doc.offsetAt(position);
-    const linePrefix = doc.getText({
-      start: { line: position.line, character: 0 },
-      end: { line: position.line, character: position.character }
+    return onCompletionProvider(params, {
+      toNormUri,
+      getDocument: (rawUri, normUri) => documents.get(rawUri) || documents.get(normUri),
+      safeLog,
+      getParsedDocument,
+      getUpdateSetTargetTable,
+      getInsertColumnTargetTable,
+      endsWithDotToken,
+      getAliasBeforeDot,
+      resolveSymbolCaseInsensitive,
+      getParserAliasColumnNames,
+      resolveAliasTableName,
+      getCteColumns,
+      getCompletionParsedDocument,
+      resolveAliasTableFromStatementAst,
+      isFromJoinTableContext,
+      isInSelectProjectionContext,
+      getStatementTableCandidatesFromAst,
+      tablesByName,
+      tableTypesByName
     });
-
-    const items: CompletionItem[] = [];
-    const parsed = getParsedDocument(doc);
-    const scopeAtPos = parsed?.scope?.root?.findInnermost(offset);
-    const variableItems = getVariableCompletionItems(scopeAtPos);
-    const updateSetTarget = getUpdateSetTargetTable(parsed, offset);
-    const insertColumnTarget = getInsertColumnTargetTable(parsed, offset);
-
-    if (updateSetTarget && !endsWithDotToken(linePrefix)) {
-      const targetNorm = normalizeName(updateSetTarget);
-      const def = tablesByName.get(targetNorm) || tableTypesByName.get(targetNorm);
-      if (def?.columns?.length) {
-        for (const col of def.columns) {
-          items.push({
-            label: col.rawName,
-            kind: CompletionItemKind.Field,
-            detail: col.type ? `Column in ${def.rawName} (${col.type})` : `Column in ${def.rawName}`,
-            insertText: col.rawName
-          });
-        }
-        items.push(...variableItems);
-        return items;
-      }
-    }
-
-    if (insertColumnTarget) {
-      const targetNorm = normalizeName(insertColumnTarget);
-      const def = tablesByName.get(targetNorm) || tableTypesByName.get(targetNorm);
-      if (def?.columns?.length) {
-        for (const col of def.columns) {
-          items.push({
-            label: col.rawName,
-            kind: CompletionItemKind.Field,
-            detail: col.type ? `Column in ${def.rawName} (${col.type})` : `Column in ${def.rawName}`,
-            insertText: col.rawName
-          });
-        }
-        return items;
-      }
-    }
-
-    // 1. Alias-dot completions, e.g. "t." or "[t]."
-    const aliasRaw = getAliasBeforeDot(linePrefix);
-    if (aliasRaw) {
-      const aliasNorm = normalizeName(aliasRaw);
-
-      if (scopeAtPos) {
-        const sym = resolveSymbolCaseInsensitive(scopeAtPos, aliasNorm);
-        if (sym) {
-          let targetTable = aliasNorm;
-          if (sym.kind === "Alias") {
-            targetTable = normalizeName(sym.metadata?.tableName as string || (sym.location as any).table?.name || (sym.location as any).table || aliasNorm);
-          }
-
-          let resolved = tablesByName.get(targetTable) || tableTypesByName.get(targetTable);
-          if (!resolved && sym.dataType) {
-            const typeKey = normalizeName(sym.dataType);
-            resolved = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
-          }
-
-          if (resolved && resolved.columns) {
-            for (const col of resolved.columns) {
-              items.push({
-                label: col.rawName,
-                kind: CompletionItemKind.Field,
-                detail: col.type ? `Column in ${resolved.rawName} (${col.type})` : `Column in ${resolved.rawName}`,
-                insertText: col.rawName
-              });
-            }
-          } else if (sym.kind === "Alias") {
-            const derivedColumns = getParserAliasColumnNames(parsed, sym);
-            if (derivedColumns.length > 0) {
-              for (const colName of derivedColumns) {
-                items.push({
-                  label: colName,
-                  kind: CompletionItemKind.Field,
-                  detail: `Column in derived table ${sym.name}`,
-                  insertText: colName
-                });
-              }
-            }
-          } else if (sym.kind === "Alias") {
-            const aliasTarget = normalizeName(resolveAliasTableName(sym) ?? "");
-            const cteSym = aliasTarget ? resolveSymbolCaseInsensitive(scopeAtPos, aliasTarget) : null;
-            if (cteSym?.kind === "CTE") {
-              for (const cteCol of getCteColumns(cteSym)) {
-                items.push({
-                  label: cteCol.rawName,
-                  kind: CompletionItemKind.Field,
-                  detail: `Column in CTE ${cteSym.name}`,
-                  insertText: cteCol.rawName
-                });
-              }
-            }
-          } else if (sym.columns && Array.isArray(sym.columns)) {
-            for (const col of sym.columns) {
-              const name = typeof col === "string" ? col : (col.name || col.rawName);
-              items.push({
-                label: name,
-                kind: CompletionItemKind.Field,
-                detail: `Column in ${sym.name}`,
-                insertText: name
-              });
-            }
-          }
-        }
-      }
-      if (items.length === 0) {
-        const completionParsedCtx = getCompletionParsedDocument(doc, offset);
-        const completionParsed = completionParsedCtx?.parsed ?? parsed;
-        const completionOffset = completionParsedCtx?.offset ?? offset;
-        const completionScopeAtPos = completionParsed?.scope?.root?.findInnermost?.(completionOffset) ?? completionParsed?.scope?.root;
-        const completionSym = completionScopeAtPos ? resolveSymbolCaseInsensitive(completionScopeAtPos, aliasNorm) : null;
-        if (completionSym?.kind === "Alias") {
-          let targetTable = normalizeName(completionSym.metadata?.tableName as string || (completionSym.location as any).table?.name || (completionSym.location as any).table || aliasNorm);
-          if (!targetTable) {
-            targetTable = normalizeName(resolveAliasTableName(completionSym) ?? "");
-          }
-          let resolved = tablesByName.get(targetTable) || tableTypesByName.get(targetTable);
-          if (!resolved && completionSym.dataType) {
-            const typeKey = normalizeName(completionSym.dataType);
-            resolved = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
-          }
-          if (resolved?.columns) {
-            for (const col of resolved.columns) {
-              items.push({
-                label: col.rawName,
-                kind: CompletionItemKind.Field,
-                detail: col.type ? `Column in ${resolved.rawName} (${col.type})` : `Column in ${resolved.rawName}`,
-                insertText: col.rawName
-              });
-            }
-          } else {
-            const derivedColumns = getParserAliasColumnNames(completionParsed, completionSym);
-            if (derivedColumns.length > 0) {
-              for (const colName of derivedColumns) {
-                items.push({
-                  label: colName,
-                  kind: CompletionItemKind.Field,
-                  detail: `Column in derived table ${completionSym.name}`,
-                  insertText: colName
-                });
-              }
-            }
-          }
-        }
-
-        if (items.length === 0) {
-          const tableFromAst = resolveAliasTableFromStatementAst(completionParsed, completionOffset, aliasNorm);
-          if (tableFromAst) {
-            const def = tablesByName.get(tableFromAst) || tableTypesByName.get(tableFromAst);
-            if (def?.columns) {
-              for (const col of def.columns) {
-                items.push({
-                  label: col.rawName,
-                  kind: CompletionItemKind.Field,
-                  detail: col.type ? `Column in ${def.rawName} (${col.type})` : `Column in ${def.rawName}`,
-                  insertText: col.rawName
-                });
-              }
-            }
-          }
-        }
-      }
-      return items;
-    }
-
-    // 2. Suggest table names after FROM / JOIN
-    if (isFromJoinTableContext(linePrefix)) {
-      for (const def of tablesByName.values()) {
-        items.push({
-          label: def.rawName,
-          kind: CompletionItemKind.Class,
-          detail: `Table defined in ${def.uri.split("/").pop()}:${def.line + 1}`
-        });
-      }
-      return items;
-    }
-
-    // 3. Inside SELECT projection -> suggest columns from local statement scope
-    if (isInSelectProjectionContext(parsed, offset, linePrefix)) {
-      const visibleTables = new Set<string>();
-      const visibleCtes = new Map<string, Array<{ rawName: string }>>();
-      if (scopeAtPos) {
-        const visibleSymbols = scopeAtPos.getVisibleSymbols();
-        for (const sym of visibleSymbols) {
-          if (sym.kind === "Table" || sym.kind === "TempTable" || sym.kind === "CTE") {
-            visibleTables.add(normalizeName(sym.name));
-            if (sym.kind === "CTE") {
-              visibleCtes.set(normalizeName(sym.name), getCteColumns(sym).map(c => ({ rawName: c.rawName })));
-            }
-          } else if (sym.kind === "Alias") {
-            const tblName = resolveAliasTableName(sym);
-            if (tblName) {
-              const tblNorm = normalizeName(tblName);
-              visibleTables.add(tblNorm);
-              const cteSym = resolveSymbolCaseInsensitive(scopeAtPos, tblNorm);
-              if (cteSym?.kind === "CTE") {
-                visibleCtes.set(tblNorm, getCteColumns(cteSym).map(c => ({ rawName: c.rawName })));
-              }
-            }
-          }
-        }
-      }
-
-      if (visibleTables.size === 0) {
-        for (const t of getStatementTableCandidatesFromAst(parsed, offset)) {
-          visibleTables.add(t);
-        }
-      }
-
-      let colCount = 0;
-      const COL_LIMIT = 500;
-
-      if (visibleTables.size > 0) {
-        for (const tbl of visibleTables) {
-          const def = tablesByName.get(tbl) || tableTypesByName.get(tbl);
-          if (def && def.columns) {
-            for (const col of def.columns) {
-              if (colCount++ > COL_LIMIT) { break; }
-              items.push({
-                label: col.rawName,
-                kind: CompletionItemKind.Field,
-                detail: col.type ? `Column in ${def.rawName} (${col.type})` : `Column in ${def.rawName}`,
-                insertText: col.rawName
-              });
-            }
-          } else {
-            const cteCols = visibleCtes.get(tbl);
-            if (cteCols) {
-              for (const col of cteCols) {
-                if (colCount++ > COL_LIMIT) { break; }
-                items.push({
-                  label: col.rawName,
-                  kind: CompletionItemKind.Field,
-                  detail: `Column in CTE ${tbl}`,
-                  insertText: col.rawName
-                });
-              }
-            }
-          }
-        }
-      } else {
-        for (const def of tablesByName.values()) {
-          if (def.columns) {
-            for (const col of def.columns) {
-              if (colCount++ > COL_LIMIT) { break; }
-              items.push({
-                label: col.rawName,
-                kind: CompletionItemKind.Field,
-                detail: col.type ? `Column in ${def.rawName} (${col.type})` : `Column in ${def.rawName}`,
-                insertText: col.rawName
-              });
-            }
-          }
-          if (colCount > COL_LIMIT) { break; }
-        }
-      }
-
-      for (const def of tablesByName.values()) {
-        items.push({
-          label: def.rawName,
-          kind: CompletionItemKind.Class,
-          detail: `Table defined in ${def.uri.split("/").pop()}:${def.line + 1}`
-        });
-      }
-      items.push(...variableItems);
-      return items;
-    }
-
-    // Fallback: suggest visible columns from current scope before generic table/keyword list.
-    if (scopeAtPos) {
-      const visibleTables = new Set<string>();
-      const visibleCtes = new Map<string, Array<{ rawName: string }>>();
-      const visibleSymbols = scopeAtPos.getVisibleSymbols?.() ?? [];
-      for (const sym of visibleSymbols) {
-        if (sym.kind === "Table" || sym.kind === "TempTable" || sym.kind === "CTE") {
-          const name = normalizeName(String(sym.name ?? ""));
-          if (name) { visibleTables.add(name); }
-          if (sym.kind === "CTE") {
-            visibleCtes.set(name, getCteColumns(sym).map(c => ({ rawName: c.rawName })));
-          }
-        } else if (sym.kind === "Alias") {
-          const tblName = resolveAliasTableName(sym);
-          if (tblName) {
-            const tblNorm = normalizeName(tblName);
-            visibleTables.add(tblNorm);
-            const cteSym = resolveSymbolCaseInsensitive(scopeAtPos, tblNorm);
-            if (cteSym?.kind === "CTE") {
-              visibleCtes.set(tblNorm, getCteColumns(cteSym).map(c => ({ rawName: c.rawName })));
-            }
-          }
-        }
-      }
-
-      for (const t of getStatementTableCandidatesFromAst(parsed, offset)) {
-        visibleTables.add(t);
-      }
-
-      for (const tbl of visibleTables) {
-        const def = tablesByName.get(tbl) || tableTypesByName.get(tbl);
-        if (def?.columns) {
-          for (const col of def.columns) {
-            items.push({
-              label: col.rawName,
-              kind: CompletionItemKind.Field,
-              detail: col.type ? `Column in ${def.rawName} (${col.type})` : `Column in ${def.rawName}`,
-              insertText: col.rawName
-            });
-          }
-        } else {
-          const cteCols = visibleCtes.get(tbl);
-          if (cteCols) {
-            for (const col of cteCols) {
-              items.push({
-                label: col.rawName,
-                kind: CompletionItemKind.Field,
-                detail: `Column in CTE ${tbl}`,
-                insertText: col.rawName
-              });
-            }
-          }
-        }
-      }
-
-      if (items.length > 0) {
-        items.push(...variableItems);
-        return items;
-      }
-    }
-
-    // Fallback: tables + keywords
-    items.push(...variableItems);
-
-    for (const def of tablesByName.values()) {
-      items.push({
-        label: def.rawName,
-        kind: CompletionItemKind.Class,
-        detail: `Table defined in ${def.uri.split("/").pop()}:${def.line + 1}`
-      });
-    }
-
-    const keywords = [
-      "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER",
-      "JOIN", "WHERE", "GROUP BY", "ORDER BY", "FROM", "AS"
-    ];
-    for (const kw of keywords) { items.push({ label: kw, kind: CompletionItemKind.Keyword }); }
-
-    return items;
   } catch (err) {
     safeError("[completion] handler error", err);
     return [];
   }
 });
-
-function getVariableCompletionItems(scopeAtPos: any): CompletionItem[] {
-  if (!scopeAtPos || typeof scopeAtPos.getVisibleSymbols !== "function") {
-    return [];
-  }
-
-  const items: CompletionItem[] = [];
-  const seen = new Set<string>();
-
-  for (const sym of scopeAtPos.getVisibleSymbols()) {
-    if (sym.kind !== "Parameter" && sym.kind !== "Variable") {
-      continue;
-    }
-
-    const name = String(sym.name ?? "");
-    if (!name || seen.has(name.toLowerCase())) {
-      continue;
-    }
-
-    seen.add(name.toLowerCase());
-    items.push({
-      label: name,
-      kind: CompletionItemKind.Variable,
-      detail: sym.dataType ? `${sym.kind} (${sym.dataType})` : sym.kind,
-      insertText: name
-    });
-  }
-
-  return items;
-}
 
 function getParserAliasColumnNames(parsed: ParseResult | null | undefined, sym: any, localDefsByName?: Map<string, any>): string[] {
   const names = new Map<string, string>();
@@ -1848,34 +1218,17 @@ function findStatementLocalColumnOwner(
 }
 
 function isAmbiguousBareColumnAtPosition(doc: TextDocument, position: Position, parsed: ParseResult | null): boolean {
-  const range = getWordRangeAtPosition(doc, position);
-  if (!range) { return false; }
-
-  const rawWord = doc.getText(range).trim();
-  if (!rawWord || rawWord.includes(".") || rawWord.startsWith("@")) {
-    return false;
-  }
-
-  const colNorm = normalizeName(rawWord);
-  if (!colNorm || isSqlKeyword(colNorm)) {
-    return false;
-  }
-
-  const offset = doc.offsetAt(position);
-  const normUri = toNormUri(doc.uri);
-  const localDefsByName = new Map<string, any>();
-  for (const def of definitions.get(normUri) ?? []) {
-    localDefsByName.set(normalizeName(def.name), def);
-  }
-  const resolved = resolveBareColumnAtOffset({
-    parsed,
-    offset,
-    columnName: rawWord,
+  return isAmbiguousBareColumnAtPositionProvider(doc, position, parsed, {
+    toNormUri,
     tablesByName,
     tableTypesByName,
-    localDefsByName
+    definitions,
+    referencesIndex,
+    findReferenceAtPosition,
+    getParsedDocument,
+    findStatementLocalColumnOwner,
+    getCurrentStatement
   });
-  return resolved.status === "ambiguous";
 }
 
 // --- References ---
@@ -1902,44 +1255,16 @@ connection.onReferences((params: ReferenceParams): Location[] => {
 // --- Code Actions ---
 connection.onCodeAction((params: CodeActionParams): CodeAction[] => {
   try {
-    const actions: CodeAction[] = [];
     const doc = documents.get(params.textDocument.uri);
-    const docText = doc?.getText() ?? "";
-    const lineStarts = doc ? getLineStarts(docText) : [];
-    for (const diagnostic of params.context.diagnostics ?? []) {
-      const action = buildReadableBareColumnCodeAction(params.textDocument.uri, diagnostic);
-      if (action) {
-        actions.push(action);
-      }
-      if (doc) {
-        const noLockAction = buildUpdateNoLockCodeAction(
-          params.textDocument.uri,
-          diagnostic,
-          docText,
-          lineStarts
-        );
-        if (noLockAction) {
-          actions.push(noLockAction);
-        }
-      }
-    }
-    if (doc) {
-      const parsed = getParsedDocument(doc);
-      const startOffset = (lineStarts[params.range.start.line] ?? 0) + params.range.start.character;
-      const endOffset = (lineStarts[params.range.end.line] ?? 0) + params.range.end.character;
-      actions.push(
-        ...buildSelectStarExpansionCodeActions(
-          params.textDocument.uri,
-          parsed,
-          lineStarts,
-          tablesByName,
-          tableTypesByName,
-          startOffset,
-          endOffset
-        )
-      );
-    }
-    return actions;
+    return buildCodeActionsForDocument(params, doc, {
+      buildReadableBareColumnCodeAction,
+      buildUpdateNoLockCodeAction,
+      buildSelectStarExpansionCodeActions,
+      getLineStarts,
+      getParsedDocument,
+      tablesByName,
+      tableTypesByName
+    });
   } catch (err) {
     safeError("[codeAction] handler error", err);
     return [];
@@ -1950,32 +1275,10 @@ connection.onCodeAction((params: CodeActionParams): CodeAction[] => {
 connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
   try {
     const doc = documents.get(params.textDocument.uri);
-    if (!doc) { return null; }
-
-    const range = getWordRangeAtPosition(doc, params.position);
-    if (!range) { return null; }
-
-    const rawWord = doc.getText(range);
-    const newName = params.newName;
-
-    const locations = findReferencesForWord(rawWord, doc, params.position);
-    if (!locations || locations.length === 0) { return null; }
-
-    const editsByUri: { [uri: string]: TextEdit[] } = {};
-    const seen = new Set<string>();
-
-    for (const loc of locations) {
-      const key = `${loc.uri}:${loc.range.start.line}:${loc.range.start.character}:${loc.range.end.line}:${loc.range.end.character}`;
-      if (seen.has(key)) { continue; }
-      seen.add(key);
-
-      const uri = loc.uri.startsWith("file://") ? loc.uri : url.pathToFileURL(loc.uri).toString();
-
-      if (!editsByUri[uri]) { editsByUri[uri] = []; }
-      editsByUri[uri].push({ range: loc.range, newText: newName });
-    }
-
-    return { changes: editsByUri };
+    return onRenameProvider(params, doc, {
+      getWordRangeAtPosition,
+      findReferencesForWord
+    });
   } catch (err) {
     safeError("[rename] handler error", err);
     return null;
@@ -1994,37 +1297,13 @@ connection.onHover(async (params): Promise<Hover | null> => {
 // --- Document Symbols ---
 connection.onDocumentSymbol((params): DocumentSymbol[] => {
   try {
-    const uri = toNormUri(params.textDocument.uri);
-    const defs = definitions.get(uri) || [];
-    const symbols: DocumentSymbol[] = [];
-
-    for (const def of defs) {
-      const tableSymbol: DocumentSymbol = {
-        name: def.rawName,
-        kind: SymbolKind.Class,
-        range: Range.create(def.line, 0, def.line, 200),
-        selectionRange: Range.create(def.line, 0, def.line, 200),
-        children: []
-      };
-
-      if (def.columns) {
-        tableSymbol.children = def.columns.map((col) => {
-          const startChar = typeof (col as any).start === "number" ? (col as any).start : 0;
-          const endChar = typeof (col as any).end === "number" ? (col as any).end : 200;
-          return {
-            name: col.rawName,
-            kind: SymbolKind.Field,
-            range: Range.create(col.line, startChar, col.line, endChar),
-            selectionRange: Range.create(col.line, startChar, col.line, endChar),
-            detail: col.type || undefined
-          };
-        });
-      }
-
-      symbols.push(tableSymbol);
-    }
-
-    return symbols;
+    return onDocumentSymbolProvider(params.textDocument.uri, {
+      toNormUri,
+      definitions,
+      Range,
+      symbolKindClass: SymbolKind.Class,
+      symbolKindField: SymbolKind.Field
+    });
   } catch (err) {
     safeError("[documentSymbol] handler error", err);
     return [];
@@ -2056,470 +1335,45 @@ export function getCurrentStatement(doc: TextDocument, position: Position): stri
 }
 
 function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Position): Location[] {
-  if (!rawWord || rawWord.trim().length === 0) { return []; }
-  const rawNorm = normalizeName(rawWord);
-  if (isSqlKeyword(rawNorm)) { return []; }
-
-  const normUri = toNormUri(doc.uri);
-  const results: Location[] = [];
-  const seen = new Set<string>();
-
-  const pushLocFromRef = (r: ReferenceDef) => {
-    const key = `${r.uri}:${r.line}:${r.start}:${r.end}`;
-    if (seen.has(key)) { return; }
-    seen.add(key);
-    results.push({
-      uri: r.uri,
-      range: {
-        start: { line: r.line, character: r.start },
-        end: { line: r.line, character: r.end }
-      }
-    });
-  };
-
-  const match = position
-    ? findReferenceAtPosition(normUri, position.line, position.character)
-    : undefined;
-  const parsed = position ? getParsedDocument(doc) : null;
-  const offset = position ? doc.offsetAt(position) : -1;
-
-  if (match) {
-    const byUri = referencesIndex.get(match.name);
-    const localArr = byUri?.get(normUri) ?? [];
-    if (localArr.length > 0) {
-      for (const r of localArr) {
-        pushLocFromRef(r);
-      }
-    } else if (byUri) {
-      for (const arr of byUri.values()) {
-        for (const r of arr) {
-          pushLocFromRef(r);
-        }
-      }
-    }
-    if (match.kind === "table") {
-      const defs = definitions.get(normalizeName(match.name));
-      if (defs) {
-        for (const d of defs) {
-          pushLocFromRef({
-            name: d.name,
-            uri: d.uri,
-            line: d.line,
-            start: 0,
-            end: d.rawName.length,
-            kind: "table"
-          });
-        }
-      }
-    }
-  } else {
-    const isBareColumnToken = !rawWord.includes(".") && !rawWord.startsWith("@") && !isSqlKeyword(rawNorm);
-    if (parsed && typeof offset === "number" && offset >= 0) {
-      const matchedResolution = parsed?.columns?.resolutions?.find((r: any) => {
-        const s = Number(r?.location?.start);
-        const e = Number(r?.location?.end);
-        return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
-      });
-      if (matchedResolution) {
-        const sources = getResolutionSourceColumns(matchedResolution);
-        if (sources.length > 0) {
-          for (const src of sources) {
-            const key = `${src.table}.${src.column}`;
-            const byUri = referencesIndex.get(key);
-            const localArr = byUri?.get(normUri) ?? [];
-            if (localArr.length > 0) {
-              for (const r of localArr) {
-                pushLocFromRef(r);
-              }
-              return results;
-            }
-            if (byUri) {
-              for (const arr of byUri.values()) {
-                for (const r of arr) {
-                  pushLocFromRef(r);
-                }
-              }
-              return results;
-            }
-          }
-        }
-      }
-    }
-    if (isBareColumnToken && position) {
-      const scopeAtPos = parsed?.scope?.root?.findInnermost(offset) ?? parsed?.scope?.root;
-      const localDefsByName = new Map<string, any>();
-      for (const def of definitions.get(normUri) ?? []) {
-        localDefsByName.set(normalizeName(def.name), def);
-      }
-      const stmtOwner = findStatementLocalColumnOwner(getCurrentStatement(doc, position), rawWord, scopeAtPos, parsed, offset, localDefsByName);
-      if (stmtOwner?.ownerName) {
-        const ownerNorm = normalizeName(stmtOwner.ownerName);
-        const colNorm = normalizeName(rawWord);
-        const key = `${ownerNorm}.${colNorm}`;
-        const byUri = referencesIndex.get(key);
-        const localArr = byUri?.get(normUri) ?? [];
-        if (localArr.length > 0) {
-          for (const r of localArr) {
-            pushLocFromRef(r);
-          }
-          return results;
-        }
-        if (byUri) {
-          for (const arr of byUri.values()) {
-            for (const r of arr) {
-              pushLocFromRef(r);
-            }
-          }
-          return results;
-        }
-      }
-      return results;
-    }
-
-    return results;
-  }
-
-  return results;
+  return findReferencesForWordProvider(rawWord, doc, {
+    toNormUri,
+    tablesByName,
+    tableTypesByName,
+    definitions,
+    referencesIndex,
+    findReferenceAtPosition,
+    getParsedDocument,
+    findStatementLocalColumnOwner,
+    getCurrentStatement
+  }, position);
 }
 
 async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> {
-  try {
-    const text = doc.getText();
-    const offset = doc.offsetAt(pos);
-    const normUri = toNormUri(doc.uri);
-
-    const range = getWordRangeAtPosition(doc, pos);
-    if (!range) { return null; }
-
-    const wordRangeText = doc.getText(range);
-
-    const match = findReferenceAtPosition(normUri, pos.line, pos.character);
-    const parsed = getParsedDocument(doc);
-    const propertyAccess = getPropertyAccessAtOffset(parsed, offset);
-    if (propertyAccess) {
-      const member = String(propertyAccess.member ?? "");
-      const baseExpr = String(propertyAccess.baseExpr ?? "");
-      const owner = String(propertyAccess.owner ?? "");
-      const dataType = String(propertyAccess.dataType ?? "");
-      const memberType = String(propertyAccess.memberType ?? "");
-      const typePart = memberType ? ` - ${memberType}` : "";
-      const ownerPart = owner ? `\n\nDefined on **${dataType || "typed"}** column \`${baseExpr}\` in \`${owner}\`` : "";
-      const value = `**Member** \`${member}\`${typePart}${ownerPart}`;
-      return { contents: { kind: MarkupKind.Markdown, value }, range };
-    }
-    const localDefs = definitions.get(normUri) ?? [];
-    const localDefsByName = new Map<string, any>();
-    for (const def of localDefs) {
-      localDefsByName.set(normalizeName(def.name), def);
-    }
-
-    if (!match) {
-      const word = normalizeName(wordRangeText);
-      const matchedResolution = parsed?.columns?.resolutions?.find((r: any) => {
-        const s = Number(r?.location?.start);
-        const e = Number(r?.location?.end);
-        return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
-      });
-    if (matchedResolution) {
-      const sources = getResolutionSourceColumns(matchedResolution);
-      if (sources.length > 0) {
-        for (const src of sources) {
-          const srcStripped = src.table.replace(/^dbo\./, "");
-          const def = localDefsByName.get(src.table) || localDefsByName.get(srcStripped) || tablesByName.get(src.table) || tableTypesByName.get(src.table);
-          const colDef = def?.columns?.find((c: any) => normalizeName(c.name) === src.column);
-
-          if (colDef) {
-            const kindLabel = getResolvedObjectKindLabel(src.table, def);
-            const typePart = colDef.type ? ` - ${colDef.type}` : "";
-            const displayCol = colDef.rawName ?? (normalizeName(wordRangeText) === src.column ? wordRangeText : src.column);
-            const displayTable = def?.rawName ?? def?.name ?? src.table;
-            const value = `**Column** \`${displayCol}\`${typePart}\n\nDefined in **${kindLabel}** \`${displayTable}\``;
-            return { contents: { kind: MarkupKind.Markdown, value }, range };
-          }
-        }
-      }
-    }
-      const updateSetTarget = getUpdateSetTargetTable(parsed, offset);
-      if (updateSetTarget) {
-        const targetNorm = normalizeName(updateSetTarget);
-        const targetStripped = targetNorm.replace(/^dbo\./, "");
-        const colDef = (localDefsByName.get(targetNorm) || localDefsByName.get(targetStripped) || tablesByName.get(targetNorm) || tableTypesByName.get(targetNorm))
-          ?.columns
-          ?.find((c: any) => normalizeName(c.name) === word);
-
-        if (colDef) {
-          const owner = localDefsByName.get(targetNorm) || localDefsByName.get(targetNorm.replace(/^dbo\./, "")) || tablesByName.get(targetNorm) || tableTypesByName.get(targetNorm);
-          const kindLabel = getResolvedObjectKindLabel(targetNorm, owner);
-          const typePart = colDef.type ? ` - ${colDef.type}` : "";
-          const value = `**Column** \`${colDef.rawName}\`${typePart}\n\nDefined in **${kindLabel}** \`${owner?.rawName ?? targetNorm}\``;
-          return { contents: { kind: MarkupKind.Markdown, value }, range };
-        }
-      }
-
-      const hoverScope = parsed?.scope?.root?.findInnermost(offset);
-      const stmtOwner = findStatementLocalColumnOwner(getCurrentStatement(doc, pos), word, hoverScope, parsed, offset, localDefsByName);
-      if (stmtOwner) {
-        const typePart = stmtOwner.column.type ? ` - ${stmtOwner.column.type}` : "";
-        const displayCol = getHoverColumnLabel(stmtOwner.column, wordRangeText);
-        const value = `**Column** \`${displayCol}\`${typePart}\n\nDefined in **${stmtOwner.kindLabel}** \`${stmtOwner.ownerName}\``;
-        return { contents: { kind: MarkupKind.Markdown, value }, range };
-      }
-      return null;
-    }
-
-    if (match.kind === "parameter") {
-      let dataType = "unknown";
-      let columns: any[] | undefined = undefined;
-      let isTableVariable = false;
-      let paramDisplay = match.name;
-
-      if (parsed?.scope?.root) {
-        const scopeAtPos = parsed.scope.root.findInnermost(offset);
-          const sym = resolveSymbolCaseInsensitive(scopeAtPos, match.name) ?? resolveSymbolCaseInsensitive(scopeAtPos, wordRangeText);
-        if (sym) {
-          paramDisplay = sym.name ?? paramDisplay;
-          if (sym.dataType) {
-            dataType = sym.dataType;
-            const typeKey = normalizeName(dataType);
-            const typeDef = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
-            if (typeDef && typeDef.columns) {
-              columns = typeDef.columns;
-              isTableVariable = true;
-            }
-          }
-          const localCols = getSymbolLocalColumns(sym);
-          if (localCols && localCols.length > 0) {
-            columns = localCols;
-            isTableVariable = true;
-          }
-        }
-      }
-
-      if (isTableVariable && columns) {
-        const rows = columns.map(c => `- \`${c.rawName ?? c.name}\`${c.type ? ` ${c.type}` : ""}`);
-        const body = `**Table Variable** \`${paramDisplay}\` — \`${dataType}\`\n\n${rows.join("\n")}`;
-        return { contents: { kind: MarkupKind.Markdown, value: body }, range };
-      }
-
-      const value = `**Parameter** \`${paramDisplay}\` — \`${dataType}\``;
-      return { contents: { kind: MarkupKind.Markdown, value }, range };
-    }
-
-    if (match.kind === "table") {
-      const norm = normalizeName(match.name);
-      if (norm.startsWith("@")) {
-        let dataType = "unknown";
-        let columns: any[] | undefined = undefined;
-        let isTableVariable = false;
-        let paramDisplay = match.name;
-
-        if (parsed?.scope?.root) {
-          const scopeAtPos = parsed.scope.root.findInnermost(offset);
-          const sym = resolveSymbolCaseInsensitive(scopeAtPos, match.name) ?? resolveSymbolCaseInsensitive(scopeAtPos, wordRangeText);
-          if (sym) {
-            paramDisplay = sym.name ?? paramDisplay;
-            if (sym.dataType) {
-              dataType = sym.dataType;
-              const typeKey = normalizeName(dataType);
-              const typeDef = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
-              if (typeDef && typeDef.columns) {
-                columns = typeDef.columns;
-                isTableVariable = true;
-              }
-            }
-            const localCols = getSymbolLocalColumns(sym);
-            if (localCols && localCols.length > 0) {
-              columns = localCols;
-              isTableVariable = true;
-            }
-          }
-        }
-
-        if (isTableVariable && columns) {
-          const rows = columns.map(c => `- \`${c.rawName ?? c.name}\`${c.type ? ` ${c.type}` : ""}`);
-          const body = `**Table Variable** \`${paramDisplay}\` — \`${dataType}\`\n\n${rows.join("\n")}`;
-          return { contents: { kind: MarkupKind.Markdown, value: body }, range };
-        }
-
-        const value = `**Parameter** \`${paramDisplay}\` — \`${dataType}\``;
-        return { contents: { kind: MarkupKind.Markdown, value }, range };
-      }
-      const strippedNorm = norm.replace(/^dbo\./, "");
-      const def = localDefsByName.get(norm) || localDefsByName.get(strippedNorm) || tablesByName.get(norm) || tableTypesByName.get(norm);
-      if (def && def.columns) {
-        const rows = def.columns.map((c: any) => `- \`${c.rawName}\`${c.type ? ` ${c.type}` : ""}`);
-        const kindLabel = getResolvedObjectKindLabel(norm, def, { titleCase: true });
-        const body = `**${kindLabel}** \`${def.rawName}\`\n\n${rows.join("\n")}`;
-        return { contents: { kind: MarkupKind.Markdown, value: body }, range };
-      }
-
-      if (parsed?.scope?.root) {
-        const scopeAtPos = parsed.scope.root.findInnermost(offset);
-        const cteSym = resolveSymbolCaseInsensitive(scopeAtPos, norm);
-        if (cteSym?.kind === "CTE") {
-          const cteCols = getCteColumns(cteSym);
-          if (cteCols.length > 0) {
-            const rows = cteCols.map(c => `- \`${c.rawName}\``);
-            const body = `**CTE** \`${getDisplaySymbolName(cteSym)}\`\n\n${rows.join("\n")}`;
-            return { contents: { kind: MarkupKind.Markdown, value: body }, range };
-          }
-        }
-      }
-
-      if (parsed?.scope?.root) {
-        const scopeAtPos = parsed.scope.root.findInnermost(offset);
-        const aliasSym = resolveSymbolCaseInsensitive(scopeAtPos, norm);
-        if (aliasSym?.kind === "Alias") {
-          const aliasTableNorm = normalizeName(resolveAliasTableName(aliasSym) ?? "");
-          const aliasTableDef = localDefsByName.get(aliasTableNorm) || localDefsByName.get(aliasTableNorm.replace(/^dbo\./, "")) || tablesByName.get(aliasTableNorm) || tableTypesByName.get(aliasTableNorm);
-          if (aliasTableDef?.columns) {
-            const rows = aliasTableDef.columns.map((c: any) => `- \`${c.rawName}\`${c.type ? ` ${c.type}` : ""}`);
-            const kindLabel = getResolvedObjectKindLabel(aliasTableNorm, aliasTableDef, { titleCase: true });
-            const body = `**Alias** \`${getDisplaySymbolName(aliasSym)}\`\n\nResolves to **${kindLabel}** \`${aliasTableDef.rawName}\`\n\n${rows.join("\n")}`;
-            return { contents: { kind: MarkupKind.Markdown, value: body }, range };
-          } else if (parsed?.ast) {
-            const { isFunc, rawName } = isFunctionCallInAst(parsed.ast, aliasTableNorm);
-            if (isFunc) {
-              const body = `**Alias** \`${getDisplaySymbolName(aliasSym)}\`\n\nResolves to **table-valued function** \`${rawName}\``;
-              return { contents: { kind: MarkupKind.Markdown, value: body }, range };
-            }
-          }
-        }
-      }
-
-      if (!localDefsByName.has(norm) && !localDefsByName.has(norm.replace(/^dbo\./, "")) && !tablesByName.has(norm) && !tableTypesByName.has(norm) && parsed?.ast) {
-        const { isFunc, rawName } = isFunctionCallInAst(parsed.ast, norm);
-        if (isFunc) {
-          const body = `**Table-valued function** \`${rawName}\``;
-          return { contents: { kind: MarkupKind.Markdown, value: body }, range };
-        }
-      }
-    }
-
-    if (match.kind === "column") {
-      const parts = match.name.split('.');
-      if (parts.length === 1) {
-        const hoverScope = parsed?.scope?.root?.findInnermost(offset);
-        const stmtOwner = findStatementLocalColumnOwner(getCurrentStatement(doc, pos), parts[0], hoverScope, parsed, offset, localDefsByName);
-        if (stmtOwner) {
-          const typePart = stmtOwner.column.type ? ` - ${stmtOwner.column.type}` : "";
-          const displayCol = getHoverColumnLabel(stmtOwner.column, wordRangeText);
-          const value = `**Column** \`${displayCol}\`${typePart}\n\nDefined in **${stmtOwner.kindLabel}** \`${stmtOwner.ownerName}\``;
-          return { contents: { kind: MarkupKind.Markdown, value }, range };
-        }
-      }
-
-      if (parts.length === 2) {
-        const tableName = parts[0];
-        const colName = parts[1];
-
-        let colDef: any = null;
-        let containerName = tableName;
-        let isType = false;
-        let isCte = false;
-        let aliasToken: string | undefined = undefined;
-
-        if (tableName.startsWith("@")) {
-          const parsed = getParsedDocument(doc);
-          if (parsed?.scope?.root) {
-            const scopeAtPos = parsed.scope.root.findInnermost(offset);
-            const sym = resolveSymbolCaseInsensitive(scopeAtPos, tableName);
-            if (sym) {
-              const localCols = getSymbolLocalColumns(sym);
-              if (localCols && Array.isArray(localCols)) {
-                colDef = localCols.find((c: any) => normalizeName(c.rawName ?? c.name ?? c) === colName);
-                containerName = sym.rawName ?? sym.name;
-              } else if (sym.dataType) {
-                const typeKey = normalizeName(sym.dataType);
-                const typeDef = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
-                if (typeDef && typeDef.columns) {
-                  colDef = typeDef.columns.find((c: any) => normalizeName(c.rawName ?? c.name ?? c) === colName);
-                  containerName = typeDef.rawName ?? typeDef.name;
-                  isType = typeDef === tableTypesByName.get(typeKey);
-                  aliasToken = sym.rawName ?? sym.name;
-                }
-              }
-            }
-          }
-        } else {
-          const def = localDefsByName.get(tableName) || localDefsByName.get(tableName.replace(/^dbo\./, "")) || tablesByName.get(tableName) || tableTypesByName.get(tableName);
-          if (def && def.columns) {
-            colDef = def.columns.find((c: any) => normalizeName(c.name) === colName);
-            containerName = def.rawName ?? def.name;
-            isType = tableTypesByName.has(tableName);
-          } else if (parsed?.scope?.root) {
-            const scopeAtPos = parsed.scope.root.findInnermost(offset);
-            const cteSym = resolveSymbolCaseInsensitive(scopeAtPos, tableName);
-            if (cteSym?.kind === "CTE") {
-              const cteCol = getCteColumns(cteSym).find(c => c.name === colName);
-              if (cteCol) {
-                colDef = { name: cteCol.name, rawName: cteCol.rawName };
-                containerName = cteSym.name ?? tableName;
-                isCte = true;
-              }
-            }
-              const aliasSym = resolveSymbolCaseInsensitive(scopeAtPos, tableName);
-              if (aliasSym?.kind === "Alias") {
-                const aliasTarget = normalizeName(resolveAliasTableName(aliasSym) ?? "");
-                if (aliasTarget) {
-                  const targetSym = resolveSymbolCaseInsensitive(scopeAtPos, aliasTarget);
-                  if (targetSym) {
-                    if (Array.isArray(targetSym.columns)) {
-                      const localCol = targetSym.columns.find((c: any) => normalizeName(c.rawName ?? c.name ?? c) === colName || normalizeName(c.name ?? c) === colName);
-                      if (localCol) {
-                        colDef = localCol;
-                        containerName = targetSym.rawName ?? targetSym.name ?? aliasTarget;
-                      }
-                    } else if (targetSym.dataType) {
-                      const typeKey = normalizeName(String(targetSym.dataType));
-                      const typeDef = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
-                      const typeCol = typeDef?.columns?.find((c: any) => normalizeName(c.rawName ?? c.name ?? c) === colName || normalizeName(c.name ?? c) === colName);
-                      if (typeCol) {
-                        colDef = typeCol;
-                        containerName = typeDef?.rawName ?? typeDef?.name ?? typeKey;
-                        isType = true;
-                      }
-                    }
-                  }
-                }
-                const derivedColumns = getParserAliasColumnNames(parsed, aliasSym, localDefsByName);
-                if (!colDef && derivedColumns.some(c => normalizeName(c) === colName)) {
-                  colDef = { name: colName, rawName: colName };
-                  containerName = getDisplaySymbolName(aliasSym) ?? tableName;
-                }
-              }
-            }
-        }
-
-        if (colDef) {
-          const kindLabel = isCte ? "CTE" : (isType ? "table type" : "table");
-          const typePart = colDef.type ? ` — ${colDef.type}` : "";
-          const aliasPart = aliasToken ? ` (parameter \`${aliasToken}\`)` : "";
-          const displayCol = getHoverColumnLabel(colDef, wordRangeText);
-          const value = `**Column** \`${displayCol}\`${typePart}\n\nDefined in **${kindLabel}** \`${containerName}\`${aliasPart}`;
-          return { contents: { kind: MarkupKind.Markdown, value }, range };
-        } else {
-          let kindLabel = "table";
-          if (parsed?.ast) {
-            const { isFunc, rawName } = isFunctionCallInAst(parsed.ast, tableName);
-            if (isFunc) {
-              kindLabel = "table-valued function";
-              containerName = rawName;
-            }
-          }
-          const displayCol = normalizeName(wordRangeText) === colName ? wordRangeText : colName;
-          const value = `**Column** \`${displayCol}\`\n\nDefined in **${kindLabel}** \`${containerName}\``;
-          return { contents: { kind: MarkupKind.Markdown, value }, range };
-        }
-      }
-    }
-
-    return null;
-  } catch (e) {
-    safeLog(`[doHover] error: ${String(e)}`);
-    return null;
-  }
+  return await doHoverProvider(doc, pos, {
+    toNormUri,
+    definitions,
+    tablesByName,
+    tableTypesByName,
+    findReferenceAtPosition,
+    getParsedDocument,
+    getPropertyAccessAtOffset,
+    getWordRangeAtPosition,
+    getUpdateSetTargetTable: (parsed, offset) => getUpdateSetTargetTable(parsed, offset) ?? null,
+    findStatementLocalColumnOwner,
+    getCurrentStatement,
+    getHoverColumnLabel,
+    getResolvedObjectKindLabel,
+    resolveSymbolCaseInsensitive,
+    getSymbolLocalColumns,
+    getCteColumns,
+    getDisplaySymbolName,
+    resolveAliasTableName: (sym) => resolveAliasTableName(sym) ?? "",
+    isFunctionCallInAst,
+    getParserAliasColumnNames,
+    safeLog
+  });
 }
+
 
 export async function validateTextDocument(doc: TextDocument): Promise<void> {
   if (typeof enableValidation !== "undefined" && !enableValidation) {
@@ -2531,6 +1385,14 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
   connection.console.log(`[validate] indexReady=${getIndexReady()}`);
   const indexReady = typeof getIndexReady === "function" ? getIndexReady() : true;
   const schemaValidationReady = enableSchemaValidation && indexReady;
+  const validationVersion = doc.version;
+  const sendDiagnosticsIfCurrent = (nextDiagnostics: Diagnostic[]) => {
+    const latestOpen = documents.get(doc.uri);
+    if (latestOpen && latestOpen.version !== validationVersion) {
+      return;
+    }
+    connection.sendDiagnostics({ uri: doc.uri, diagnostics: nextDiagnostics });
+  };
 
   const diagnostics: Diagnostic[] = [];
   const text = doc.getText();
@@ -2539,110 +1401,32 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
   let parsed: any = null;
   let hasParseIssues = false;
 
-  function toDiagnostic(diag: any, source: string): Diagnostic | null {
-    let range: Range;
-
-    if (typeof diag.start === "number") {
-      const startPos = offsetToPosition(diag.start, lineStarts);
-      const endPos = offsetToPosition(diag.end ?? diag.start, lineStarts);
-
-      range = {
-        start: {
-          line: startPos.line,
-          character: startPos.character
-        },
-        end: {
-          line: endPos.line,
-          character: endPos.character
-        }
-      };
-    } else if (diag.range && typeof diag.range.start === "number") {
-      const startPos = offsetToPosition(diag.range.start, lineStarts);
-      const endPos = offsetToPosition(diag.range.end, lineStarts);
-
-      range = {
-        start: {
-          line: startPos.line,
-          character: startPos.character
-        },
-        end: {
-          line: endPos.line,
-          character: endPos.character
-        }
-      };
-    } else {
-      return null;
-    }
-
-    return {
-      code: String(diag.code ?? ""),
-      severity: mapSeverity(diag.severity, String(diag.code ?? "")),
-      range,
-      message: String(diag.message ?? "SQL diagnostic"),
-      source
-    };
-  }
-
   try {
-    parsed = parseSql(text);
-
-    const combinedDiagnostics = parsed?.diagnostics ?? [];
-    const parserIssues = (parsed?.issues?.length
-      ? parsed.issues
-      : combinedDiagnostics.filter((diag: any) => {
-          const source = String(diag.source ?? "").toLowerCase();
-          const code = String(diag.code ?? "").toUpperCase();
-          return source === "parser" || code.startsWith("PARSE_");
-        })) ?? [];
-
-    hasParseIssues = hasBlockingParseIssues(parsed, parserIssues);
+    const result = collectParserDiagnosticsProvider(
+      doc,
+      text,
+      lineStarts,
+      diagnostics,
+      mapSeverity,
+      offsetToPosition,
+      {
+        parseSql,
+        hasBlockingParseIssues,
+        showParseIssues,
+        schemaValidationReady,
+        schemaDiagnosticCodes,
+        resolveExistingSqlCmdInclude: (docUri, message) => Boolean(resolveExistingSqlCmdInclude(docUri, message)),
+        shouldSuppressDiagnosticCode,
+        disabledDiagnosticCodes,
+        SARAL_DIAGNOSTIC_CODES
+      }
+    );
+    parsed = result.parsed;
+    hasParseIssues = result.hasParseIssues;
 
     if (hasParseIssues) {
-      if (showParseIssues) {
-        for (const issue of parserIssues) {
-          const diagnostic = toDiagnostic(issue, "SaralSQL Parser");
-          if (diagnostic && !shouldSuppressDiagnosticCode(String((issue as any).code ?? diagnostic.code ?? ""), disabledDiagnosticCodes)) {
-            diagnostics.push(diagnostic);
-          }
-        }
-      }
-
-      connection.sendDiagnostics({
-        uri: doc.uri,
-        diagnostics
-      });
+      sendDiagnosticsIfCurrent(diagnostics);
       return;
-    }
-
-    const semanticDiags = parsed?.semanticDiagnostics?.length
-      ? parsed.semanticDiagnostics
-      : combinedDiagnostics.filter((diag: any) => {
-          const source = String(diag.source ?? "").toLowerCase();
-          const code = String(diag.code ?? "").toUpperCase();
-          return source !== "parser" && !code.startsWith("PARSE_");
-        });
-
-    for (const diag of semanticDiags) {
-      const diagCode = String((diag as any)?.code ?? "").toUpperCase();
-      if (!schemaValidationReady && schemaDiagnosticCodes.has(diagCode)) {
-        continue;
-      }
-      if (String((diag as any)?.code ?? "").toUpperCase() === "SQLCMD_UNRESOLVED_INCLUDE") {
-        if (resolveExistingSqlCmdInclude(doc.uri, String((diag as any)?.message ?? ""))) {
-          continue;
-        }
-      }
-      const diagnostic = toDiagnostic(diag, "SaralSQL Parser");
-      if (diagnostic && !shouldSuppressDiagnosticCode(String((diag as any).code ?? diagnostic.code ?? ""), disabledDiagnosticCodes)) {
-          if ((diagnostic.code === SARAL_DIAGNOSTIC_CODES.UnknownColumn || diagnostic.code === SARAL_DIAGNOSTIC_CODES.AmbiguousColumn) && typeof diag.start === "number") {
-            const resolution = parsed.columns?.resolutions?.find((r: any) => r.location?.start === diag.start);
-            if (resolution?.isUnverifiable) {
-              continue;
-            }
-        }
-        
-        diagnostics.push(diagnostic);
-      }
     }
   } catch (e) {
     safeLog(`[validate] Parser diagnostics failed: ${String(e)}`);
@@ -2650,10 +1434,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
 
   if (!parsed?.scope?.root) {
     maybePushSqlProjMissingFileDiagnostic(doc.uri, text, diagnostics);
-    connection.sendDiagnostics({
-      uri: doc.uri,
-      diagnostics
-    });
+    sendDiagnosticsIfCurrent(diagnostics);
     return;
   }
 
@@ -2666,10 +1447,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
       indexText(doc.uri, text, { includeInWorkspaceSchema: shouldContributeToWorkspaceSchema(doc.uri) });
     }
 
-    connection.sendDiagnostics({
-      uri: doc.uri,
-      diagnostics: [...diagnostics]
-    });
+    sendDiagnosticsIfCurrent([...diagnostics]);
   }
 
   if (schemaValidationReady) {
@@ -2677,41 +1455,29 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
 
     try {
       const normDocUri = toNormUri(doc.uri);
-      const fileAliases = aliasesByUri.get(normDocUri);
-      const refsForDoc = getReferencesForUri(normDocUri);
-      const localDefs = definitions.get(normDocUri) ?? [];
-      const localDefsByName = new Map<string, any>();
-      for (const def of localDefs) {
-        localDefsByName.set(normalizeName(def.name), def);
-      }
-      const cteNames = new Set<string>();
-      const seenTables = new Set<string>();
-      const reportedMissingTables = new Set<string>();
-      const seenColumns = new Set<string>();
-      const diagnosticTextCache = new Map<string, string>();
-      const tableRefsByName = new Map<string, ReferenceDef[]>();
-      const propertyAccessStarts = new Set<number>(
-        Array.isArray(parsed?.columns?.propertyAccesses)
-          ? parsed.columns.propertyAccesses
-            .map((p: any) => Number(p?.location?.start))
-            .filter((n: number) => Number.isFinite(n))
-          : []
-      );
+      const {
+        fileAliases,
+        refsForDoc,
+        localDefs,
+        localDefsByName,
+        cteNames,
+        seenTables,
+        reportedMissingTables,
+        seenColumns,
+        diagnosticTextCache,
+        tableRefsByName,
+        propertyAccessStarts
+      } = buildSchemaValidationContextProvider({
+        normDocUri,
+        definitions,
+        aliasesByUri,
+        getReferencesForUri,
+        parsed,
+        normalizeName
+      });
 
       function makeOffsetRange(start: number, end: number): Range {
-        const startPos = offsetToPosition(start, lineStarts);
-        const endPos = offsetToPosition(end, lineStarts);
-
-        return {
-          start: {
-            line: startPos.line,
-            character: startPos.character
-          },
-          end: {
-            line: endPos.line,
-            character: endPos.character
-          }
-        };
+        return createOffsetRangeProvider(lineStarts, offsetToPosition)(start, end);
       }
 
       function addUnknownTable(name: string, line: number, start: number, end: number, isFallback = false) {
@@ -2719,46 +1485,22 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
       }
 
       function addUnknownTableAt(name: string, startLine: number, startChar: number, endLine: number, endChar: number, isFallback = false) {
-        if (!name) {return;}
-        if (shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.UnknownTable, disabledDiagnosticCodes)) {return;}
-
-        const clean = normalizeName(name);
-        
-        if (isFallback && reportedMissingTables.has(clean)) {
-            return;
-        }
-
-        const key = isFallback ? `fallback:${clean}` : `${clean}:${startLine}:${startChar}`;
-        if (seenTables.has(key)) {return;}
-        seenTables.add(key);
-        reportedMissingTables.add(clean);
-
-        const refOffset = (lineStarts[startLine] ?? 0) + startChar;
-        if (resolveCteSymbolAtOffset(clean, refOffset)) {return;}
-        if (cteNames.has(clean)) {return;}
-
-        if (clean.startsWith("#") || clean.startsWith("@")) {return;}
-        if (isSystemTableReference(clean)) {return;}
-        if (tableExistsInContext(clean)) {return;}
-
-        let displayTableName = name;
-        const rangeText = getTextAtRange(startLine, startChar, endLine, endChar);
-        if (rangeText) {
-          const rangeClean = normalizeName(rangeText);
-          if (rangeClean === clean || rangeClean.endsWith("." + clean)) {
-            displayTableName = rangeText;
-          }
-        }
-
-        diagnostics.push({
-          code: SARAL_DIAGNOSTIC_CODES.UnknownTable,
-          severity: resolveDiagnosticSeverity(SARAL_DIAGNOSTIC_CODES.UnknownTable, DiagnosticSeverity.Error, diagnosticSeverityOverrides),
-          range: {
-            start: { line: startLine, character: startChar },
-            end: { line: endLine, character: endChar }
-          },
-          message: `Unknown table '${displayTableName}'`,
-          source: "SaralSQL"
+        addUnknownTableAtProvider(name, startLine, startChar, endLine, endChar, isFallback, {
+          shouldSuppressDiagnosticCode,
+          SARAL_DIAGNOSTIC_CODES,
+          disabledDiagnosticCodes,
+          normalizeName,
+          reportedMissingTables,
+          seenTables,
+          lineStarts,
+          resolveCteSymbolAtOffset,
+          cteNames,
+          isSystemTableReference,
+          tableExistsInContext,
+          getTextAtRange,
+          resolveDiagnosticSeverity,
+          diagnosticSeverityOverrides,
+          diagnostics
         });
       }
 
@@ -2770,86 +1512,64 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         end: number,
         tableDisplay?: string
       ) {
-        if (shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.UnknownColumn, disabledDiagnosticCodes)) {return;}
-
-        const key = `${column}:${line}:${start}:${end}`;
-        if (seenColumns.has(key)) {return;}
-        seenColumns.add(key);
-
-        diagnostics.push({
-          code: SARAL_DIAGNOSTIC_CODES.UnknownColumn,
-          severity: resolveDiagnosticSeverity(SARAL_DIAGNOSTIC_CODES.UnknownColumn, DiagnosticSeverity.Error, diagnosticSeverityOverrides),
-          range: {
-            start: { line, character: start },
-            end: { line, character: end }
-          },
-          message: `Column '${getTextAtRange(line, start, line, end) || column}' not found in table '${tableDisplay ?? table}'`,
-          source: "SaralSQL"
+        addWrongColumnProvider(table, column, line, start, end, tableDisplay, {
+          shouldSuppressDiagnosticCode,
+          SARAL_DIAGNOSTIC_CODES,
+          disabledDiagnosticCodes,
+          seenColumns,
+          resolveDiagnosticSeverity,
+          diagnosticSeverityOverrides,
+          getTextAtRange,
+          diagnostics
         });
       }
 
       function getDisplayTableName(table: string): string {
-        const norm = normalizeName(table);
-        const stripped = norm.replace(/^dbo\./, "");
-        const def = localDefsByName.get(norm) || localDefsByName.get(stripped) || tablesByName.get(norm) || tableTypesByName.get(norm) || tablesByName.get(stripped) || tableTypesByName.get(stripped);
-        return def?.rawName ?? table;
+        return getDisplayTableNameProvider(table, {
+          normalizeName,
+          localDefsByName,
+          tablesByName,
+          tableTypesByName
+        });
       }
 
       function tableExistsInContext(tableName: string): boolean {
-        const norm = normalizeName(tableName);
-        if (isOutputPseudoTableReference(norm)) { return true; }
-        if (isSystemTableReference(norm)) { return true; }
-        if (localDefsByName.has(norm)) { return true; }
-        const stripped = norm.replace(/^dbo\./, "");
-        if (localDefsByName.has(stripped)) { return true; }
-        return tableExists(tableName);
+        return tableExistsInContextProvider(tableName, {
+          normalizeName,
+          isOutputPseudoTableReference,
+          isSystemTableReference,
+          localDefsByName,
+          tableExists
+        });
       }
 
       function columnExistsInContext(tableName: string, columnName: string): boolean {
-        const norm = normalizeName(tableName);
-        if (isOutputPseudoTableReference(norm)) { return true; }
-        if (isSystemTableReference(norm)) { return true; }
-        const stripped = norm.replace(/^dbo\./, "");
-        const localDef = localDefsByName.get(norm) || localDefsByName.get(stripped);
-        const targetCol = normalizeName(columnName);
-        if (localDef?.columns?.some((c: any) => normalizeName(c.name ?? c.rawName) === targetCol)) {
-          return true;
-        }
-        return columnExists(tableName, columnName);
+        return columnExistsInContextProvider(tableName, columnName, {
+          normalizeName,
+          isOutputPseudoTableReference,
+          isSystemTableReference,
+          localDefsByName,
+          columnExists
+        });
       }
 
       function getSchemaEquivalentTableRefCandidates(tableName: string): ReferenceDef[] {
         const norm = normalizeName(tableName);
         const stripped = norm.replace(/^dbo\./, "");
         const dboPrefixed = stripped ? `dbo.${stripped}` : norm;
-        const candidates = [
+        return [
           ...(tableRefsByName.get(norm) ?? []),
           ...(tableRefsByName.get(stripped) ?? []),
           ...(tableRefsByName.get(dboPrefixed) ?? [])
         ];
-        return candidates;
       }
 
-      function getTextAtRange(startLine: number, startChar: number, endLine: number, endChar: number): string {
-        const key = `${startLine}:${startChar}:${endLine}:${endChar}`;
-        const cached = diagnosticTextCache.get(key);
-        if (cached !== undefined) {
-          return cached;
-        }
-
-        const value = doc.getText({
-          start: { line: startLine, character: startChar },
-          end: { line: endLine, character: endChar }
-        }).trim();
-        diagnosticTextCache.set(key, value);
-        return value;
-      }
+      const getTextAtRange = createDiagnosticTextReaderProvider(doc, diagnosticTextCache);
 
       function isAliasMutationTarget(ref: ReferenceDef): boolean {
         if (ref.context !== "update-target" && ref.context !== "delete-target") {
           return false;
         }
-
         return Boolean(fileAliases?.has(normalizeName(ref.name)));
       }
 
@@ -3076,13 +1796,9 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
       }
 
       collectCteNames(parsed.scope.root);
-      for (const ref of refsForDoc) {
-        if (ref.kind === "table") {
-          const key = normalizeName(ref.name);
-          const bucket = tableRefsByName.get(key) ?? [];
-          bucket.push(ref);
-          tableRefsByName.set(key, bucket);
-        }
+      const tableRefsIndexed = buildTableRefsByNameProvider(refsForDoc, normalizeName);
+      for (const [k, bucket] of tableRefsIndexed.entries()) {
+        tableRefsByName.set(k, bucket as ReferenceDef[]);
       }
 
       for (const ref of refsForDoc) {
@@ -3370,10 +2086,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
 
   maybePushSqlProjMissingFileDiagnostic(doc.uri, text, diagnostics);
 
-  connection.sendDiagnostics({
-    uri: doc.uri,
-    diagnostics
-  });
+  sendDiagnosticsIfCurrent(diagnostics);
 }
 
 function tableExists(tableName: string): boolean {
@@ -3417,6 +2130,16 @@ function isSystemTableReference(tableName: string): boolean {
     return true;
   }
 
+  const parts = norm.split(".").filter(Boolean);
+  if (parts.length >= 2) {
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (parts[i] === "sys" || parts[i] === "information_schema") {
+        return true;
+      }
+    }
+  }
+
+  // Compatibility for non-canonical shapes that still appear in legacy SQL scripts.
   if (norm.includes(".sys.") || norm.includes(".information_schema.")) {
     return true;
   }

@@ -37,7 +37,7 @@ const SQL_KEYWORDS = new Set([
     "exec", "execute", "return", "returns",
 
     // Transactions
-    "begin", "commit", "rollback", "savepoint", "transaction",
+    "commit", "rollback", "savepoint", "transaction",
 
     // Security / perms
     "grant", "revoke", "deny",

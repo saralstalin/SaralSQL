@@ -9,6 +9,8 @@ import * as url from "url";
 import { walkAst, resolveAliasTableName, resolveSymbolCaseInsensitive } from "./ast-utils";
 import { parseSql, type ParseResult } from "./sql-parser";
 import { extractReferences, type ASTNode, type BinaryExpression, type Expression, type ExtractedReferenceContext, type InsertNode, type Statement, type TableReference, type UpdateNode, type VariableNode } from "@saralsql/tsql-parser";
+import { normalizeFileLikeUri } from "./uri-utils";
+import { indexStore } from "./index-store";
 
 export interface ColumnDef {
     name: string;
@@ -39,14 +41,14 @@ export interface ReferenceDef {
     validateSchema?: boolean;
 }
 
-export const columnsByTable = new Map<string, Set<string>>();
-export const aliasesByUri = new Map<string, Map<string, string>>();
-export const definitions = new Map<string, SymbolDef[]>();
-export const referencesIndex = new Map<string, Map<string, ReferenceDef[]>>();
+export const columnsByTable = indexStore.columnsByTable as Map<string, Set<string>>;
+export const aliasesByUri = indexStore.aliasesByUri as Map<string, Map<string, string>>;
+export const definitions = indexStore.definitions as Map<string, SymbolDef[]>;
+export const referencesIndex = indexStore.referencesIndex as Map<string, Map<string, ReferenceDef[]>>;
 const referencesByUri = new Map<string, Map<number, ReferenceDef[]>>();
-export const tablesByName = new Map<string, SymbolDef>();
-export const tableTypesByName = new Map<string, SymbolDef>();
-export const tempTablesByUri = new Map<string, Map<string, { columns: Set<string>; declaredAt: number }>>();
+export const tablesByName = indexStore.tablesByName as Map<string, SymbolDef>;
+export const tableTypesByName = indexStore.tableTypesByName as Map<string, SymbolDef>;
+export const tempTablesByUri = indexStore.tempTablesByUri as Map<string, Map<string, { columns: Set<string>; declaredAt: number }>>;
 
 const MAX_FILE_SIZE_BYTES = 250 * 1024;  // 250 KB (skip larger files)
 const DEPLOY_BLOCK_SUBSTRING = "deploy"; // block any path that contains this substring
@@ -226,26 +228,7 @@ export function findTableOrColumn(word: string): Location[] {
 }
 
 function normalizeIndexUri(rawUri: string): string {
-    try {
-        let uri = rawUri;
-        if (!uri.startsWith("file://")) {
-            uri = url.pathToFileURL(uri).toString();
-        }
-
-        const prefix = "file:///";
-        if (!uri.toLowerCase().startsWith(prefix)) {
-            return uri;
-        }
-
-        const pathPart = decodeURIComponent(uri.substring(prefix.length));
-        const normalizedPath = pathPart
-            .replace(/\\/g, "/")
-            .replace(/^([A-Za-z]):\//, (_m, drive) => `${String(drive).toLowerCase()}:/`);
-
-        return prefix + encodeURI(normalizedPath);
-    } catch {
-        return rawUri;
-    }
+    return normalizeFileLikeUri(rawUri);
 }
 
 function getParserColumns(node: any, text: string, lineStarts: number[]): ColumnDef[] {
