@@ -1370,6 +1370,47 @@ END;
   );
 });
 
+runCase("tvp-parameter-outside-from-does-not-compete-with-local-table-variable-source", () => {
+  const schemaUri = "file:///validation/tvp-scope-competition-schema.sql";
+  const queryUri = "file:///validation/tvp-scope-competition-query.sql";
+
+  const schemaSql = `
+CREATE TYPE dbo.SomeTableType AS TABLE (
+  FactoryCode VARCHAR(20)
+);
+`;
+
+  const querySql = `
+CREATE PROCEDURE dbo.Repro
+  @Facilities dbo.SomeTableType READONLY
+AS
+BEGIN
+  DECLARE @OutputTable TABLE (
+    FactoryCode VARCHAR(20),
+    AvailableQty INT
+  );
+, DispositionCode, DispositionName
+  FROM @OutputTable;
+END;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'FactoryCode'")),
+    "TVP parameter columns must not compete when the active SELECT reads from a different local table variable source"
+  );
+});
+
 runCase("cross-apply-derived-alias-does-not-trigger-unknown-table", () => {
   const uri = "file:///validation/cross-apply-derived-alias.sql";
   const sql = `

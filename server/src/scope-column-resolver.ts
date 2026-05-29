@@ -149,7 +149,14 @@ function resolveSymbolColumns(
     const typeDef = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
     const c = findColumn(typeDef?.columns, colNorm);
     if (c) {
-      return { kindLabel: "table type", ownerName: String(typeDef?.rawName ?? typeDef?.name ?? typeKey), column: c };
+      // Use symbol identity as owner so statement read-scope filtering can tell
+      // whether this variable/parameter is actually present in FROM/JOIN.
+      return {
+        kindLabel: "table type",
+        ownerName: String(sym.rawName ?? sym.name ?? typeKey),
+        column: c,
+        alias: normalizeName(String(sym.name ?? ""))
+      };
     }
   }
 

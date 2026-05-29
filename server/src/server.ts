@@ -1716,6 +1716,22 @@ function getPropertyAccessAtOffset(parsed: ParseResult | null, offset: number): 
   }) ?? null;
 }
 
+function getResolvedObjectKindLabel(
+  key: string,
+  def?: any,
+  opts?: { titleCase?: boolean }
+): string {
+  const norm = normalizeName(key);
+  const stripped = norm.replace(/^dbo\./, "");
+  const isType = tableTypesByName.has(norm)
+    || tableTypesByName.has(stripped)
+    || (def && normalizeName(String(def.kind ?? "")).includes("type"));
+  if (opts?.titleCase) {
+    return isType ? "Table Type" : "Table";
+  }
+  return isType ? "table type" : "table";
+}
+
 function findDerivedAliasProjectedColumnRange(
   doc: TextDocument,
   parsed: ParseResult | null,
@@ -2213,7 +2229,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
           const colDef = def?.columns?.find((c: any) => normalizeName(c.name) === src.column);
 
           if (colDef) {
-            const kindLabel = tableTypesByName.has(src.table) ? "table type" : "table";
+            const kindLabel = getResolvedObjectKindLabel(src.table, def);
             const typePart = colDef.type ? ` - ${colDef.type}` : "";
             const displayCol = colDef.rawName ?? (normalizeName(wordRangeText) === src.column ? wordRangeText : src.column);
             const displayTable = def?.rawName ?? def?.name ?? src.table;
@@ -2233,7 +2249,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
 
         if (colDef) {
           const owner = localDefsByName.get(targetNorm) || localDefsByName.get(targetNorm.replace(/^dbo\./, "")) || tablesByName.get(targetNorm) || tableTypesByName.get(targetNorm);
-          const kindLabel = tableTypesByName.has(targetNorm) ? "table type" : "table";
+          const kindLabel = getResolvedObjectKindLabel(targetNorm, owner);
           const typePart = colDef.type ? ` - ${colDef.type}` : "";
           const value = `**Column** \`${colDef.rawName}\`${typePart}\n\nDefined in **${kindLabel}** \`${owner?.rawName ?? targetNorm}\``;
           return { contents: { kind: MarkupKind.Markdown, value }, range };
@@ -2332,7 +2348,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
       const def = localDefsByName.get(norm) || localDefsByName.get(strippedNorm) || tablesByName.get(norm) || tableTypesByName.get(norm);
       if (def && def.columns) {
         const rows = def.columns.map((c: any) => `- \`${c.rawName}\`${c.type ? ` ${c.type}` : ""}`);
-        const kindLabel = tablesByName.has(norm) ? "Table" : "Table Type";
+        const kindLabel = getResolvedObjectKindLabel(norm, def, { titleCase: true });
         const body = `**${kindLabel}** \`${def.rawName}\`\n\n${rows.join("\n")}`;
         return { contents: { kind: MarkupKind.Markdown, value: body }, range };
       }
@@ -2358,7 +2374,7 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
           const aliasTableDef = localDefsByName.get(aliasTableNorm) || localDefsByName.get(aliasTableNorm.replace(/^dbo\./, "")) || tablesByName.get(aliasTableNorm) || tableTypesByName.get(aliasTableNorm);
           if (aliasTableDef?.columns) {
             const rows = aliasTableDef.columns.map((c: any) => `- \`${c.rawName}\`${c.type ? ` ${c.type}` : ""}`);
-            const kindLabel = tablesByName.has(aliasTableNorm) ? "Table" : "Table Type";
+            const kindLabel = getResolvedObjectKindLabel(aliasTableNorm, aliasTableDef, { titleCase: true });
             const body = `**Alias** \`${getDisplaySymbolName(aliasSym)}\`\n\nResolves to **${kindLabel}** \`${aliasTableDef.rawName}\`\n\n${rows.join("\n")}`;
             return { contents: { kind: MarkupKind.Markdown, value: body }, range };
           } else if (parsed?.ast) {
