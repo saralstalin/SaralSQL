@@ -31,7 +31,10 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
   const collectedOwners = collectNearestScopeColumnOwners(scopeAtPos, colNorm, params.tablesByName, params.tableTypesByName, params.localDefsByName);
   const owners = dedupeOwners(narrowOwnersByReadScope(
     params,
-    narrowOwnersForRecursiveCteSelfShadow(params, narrowOwnersForInsertReadContext(params, collectedOwners))
+    narrowOwnersForCurrentSelectSources(
+      params,
+      narrowOwnersForRecursiveCteSelfShadow(params, narrowOwnersForInsertReadContext(params, collectedOwners))
+    )
   ));
   const matchedResolution = params.parsed?.columns?.resolutions?.find((r: any) => {
     const s = Number(r?.location?.start);
@@ -46,12 +49,12 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
   const decisionReason = normalizeName(String(matchedResolution?.decisionReason ?? matchedResolution?.decision?.decisionReason ?? ""));
 
   const parserOwner = resolveParserDecisionOwner(params, matchedResolution, colNorm);
-  if (parserOwner) {
+  if (parserOwner && ownerInList(parserOwner, owners)) {
     return { status: "resolved", owner: parserOwner, owners: [parserOwner], matchedResolution, ambiguityCandidates, decisionReason };
   }
 
   const singleInputOwner = resolveSingleInputOwner(params, matchedResolution, colNorm);
-  if (singleInputOwner) {
+  if (singleInputOwner && ownerInList(singleInputOwner, owners)) {
     return { status: "resolved", owner: singleInputOwner, owners: [singleInputOwner], matchedResolution, ambiguityCandidates, decisionReason };
   }
 
@@ -66,7 +69,7 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
   }
 
   const narrowedOwner = resolveNarrowedAmbiguityOwner(params, ambiguityCandidates, colNorm);
-  if (narrowedOwner) {
+  if (narrowedOwner && ownerInList(narrowedOwner, owners)) {
     return { status: "resolved", owner: narrowedOwner, owners: [narrowedOwner], matchedResolution, ambiguityCandidates, decisionReason };
   }
 
@@ -134,6 +137,105 @@ function narrowOwnersByReadScope(params: ResolveParams, owners: ScopeColumnOwner
   });
 
   return filtered.length > 0 ? filtered : owners;
+}
+
+function narrowOwnersForCurrentSelectSources(params: ResolveParams, owners: ScopeColumnOwner[]): ScopeColumnOwner[] {
+  if (!Array.isArray(owners) || owners.length <= 1) {
+    return owners;
+  }
+
+  const select = findContainingSelectAtOffset(params.parsed?.ast, params.offset);
+  const from = Array.isArray(select?.from) ? select.from : null;
+  if (!from || from.length === 0) {
+    return owners;
+  }
+
+  const sourceNames = new Set<string>();
+  const addName = (value: any): void => {
+    const norm = normalizeName(String(value ?? ""));
+    if (!norm) {
+      return;
+    }
+    sourceNames.add(norm);
+    sourceNames.add(normalizeName(norm.split(".").pop() ?? norm));
+  };
+
+  for (const t of from) {
+    addName(t?.alias);
+    addName(t?.table?.name ?? t?.table);
+    const joins = Array.isArray(t?.joins) ? t.joins : [];
+    for (const j of joins) {
+      addName(j?.alias);
+      addName(j?.table?.name ?? j?.table);
+    }
+  }
+
+  if (sourceNames.size === 0) {
+    return owners;
+  }
+
+  const filtered = owners.filter((o) => {
+    const ownerNorm = normalizeName(String(o?.ownerName ?? ""));
+    const ownerTail = normalizeName(ownerNorm.split(".").pop() ?? ownerNorm);
+    const aliasNorm = normalizeName(String(o?.alias ?? ""));
+    return sourceNames.has(ownerNorm) || sourceNames.has(ownerTail) || sourceNames.has(aliasNorm);
+  });
+
+  return filtered.length > 0 ? filtered : owners;
+}
+
+function findContainingSelectAtOffset(ast: any, offset: number): any | null {
+  if (!ast || typeof offset !== "number") {
+    return null;
+  }
+  const ranges = getCachedSelectRanges(ast);
+  let best: any = null;
+  for (const entry of ranges) {
+    if (offset < entry.start || offset > entry.end) {
+      continue;
+    }
+    if (!best || (entry.end - entry.start) < (best.end - best.start)) {
+      best = entry.node;
+    }
+  }
+  return best;
+}
+
+function getCachedSelectRanges(ast: any): Array<{ start: number; end: number; node: any }> {
+  const cacheKey = "__saralsqlSelectRanges";
+  const existing = ast?.[cacheKey];
+  if (Array.isArray(existing)) {
+    return existing;
+  }
+
+  const out: Array<{ start: number; end: number; node: any }> = [];
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+    if (node.type === "SelectStatement" && typeof node.start === "number" && typeof node.end === "number") {
+      out.push({ start: node.start, end: node.end, node });
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+
+  visit(ast);
+  Object.defineProperty(ast, cacheKey, {
+    value: out,
+    enumerable: false,
+    configurable: true
+  });
+  return out;
 }
 
 function narrowOwnersForRecursiveCteSelfShadow(params: ResolveParams, owners: ScopeColumnOwner[]): ScopeColumnOwner[] {
@@ -282,22 +384,13 @@ function resolveSingleInputOwner(params: ResolveParams, matchedResolution: any, 
 
 function resolveMutationTargetOwner(params: ResolveParams, colNorm: string): ScopeColumnOwner | null {
   const ast = params.parsed?.ast;
-  if (!ast || !Array.isArray(ast.body)) {
+  if (!ast) {
     return null;
   }
 
   const scopeAtPos = params.scopeAtPos ?? params.parsed?.scope?.root?.findInnermost?.(params.offset) ?? params.parsed?.scope?.root;
-
-  for (const stmt of ast.body) {
-    const start = Number(stmt?.start);
-    const end = Number(stmt?.end);
-    if (!Number.isFinite(start) || !Number.isFinite(end) || params.offset < start || params.offset > end) {
-      continue;
-    }
-
-    if (stmt?.type !== "UpdateStatement" && stmt?.type !== "DeleteStatement") {
-      continue;
-    }
+  const candidates = collectMutationStatementsAtOffset(ast, params.offset);
+  for (const stmt of candidates) {
 
     const targetName = normalizeName(normalizeAstTableName(stmt?.target) ?? "");
     if (!targetName) {
@@ -321,6 +414,37 @@ function resolveMutationTargetOwner(params: ResolveParams, colNorm: string): Sco
   }
 
   return null;
+}
+
+function collectMutationStatementsAtOffset(ast: any, offset: number): any[] {
+  const matches: any[] = [];
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+    const start = Number(node?.start);
+    const end = Number(node?.end);
+    if (Number.isFinite(start) && Number.isFinite(end) && (offset < start || offset > end)) {
+      return;
+    }
+    if (node?.type === "UpdateStatement" || node?.type === "DeleteStatement") {
+      matches.push(node);
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+  visit(ast);
+  matches.sort((a, b) => (Number(a?.end) - Number(a?.start)) - (Number(b?.end) - Number(b?.start)));
+  return matches;
 }
 
 function resolveAliasMutationTargetOwner(
@@ -371,6 +495,20 @@ function dedupeOwners(owners: ScopeColumnOwner[]): ScopeColumnOwner[] {
   }
   return out;
 }
+
+function ownerInList(owner: ScopeColumnOwner, owners: ScopeColumnOwner[]): boolean {
+  if (!owner || !Array.isArray(owners) || owners.length === 0) {
+    return false;
+  }
+  const ownerName = normalizeName(String(owner.ownerName ?? ""));
+  const ownerCol = normalizeName(String(owner.column?.rawName ?? owner.column?.name ?? ""));
+  return owners.some((o) => {
+    const n = normalizeName(String(o.ownerName ?? ""));
+    const c = normalizeName(String(o.column?.rawName ?? o.column?.name ?? ""));
+    return n === ownerName && c === ownerCol;
+  });
+}
+
 
 function resolveLocalScopeOwnerByName(scopeAtPos: any, targetName: string, colNorm: string): ScopeColumnOwner | null {
   if (!scopeAtPos || !targetName) {

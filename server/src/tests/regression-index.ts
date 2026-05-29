@@ -261,16 +261,16 @@ FROM UnknownTable ut;
 runCase("create-view-join-alias-reference-is-not-schema-validated", () => {
   const uri = "file:///regression/create-view-join-alias-reference.sql";
   const sql = `
-CREATE VIEW dbo.InboundShippingOptionRulesView
+CREATE VIEW dbo.GenericJoinAliasView
 AS
-SELECT bu.BusinessUnitId
-FROM [dbo].[InboundShippingOptionRules] [inr]
-LEFT JOIN [dbo].[BusinessUnits] [bu] ON [inr].BusinessUnitId = [bu].BusinessUnitId;
+SELECT bu.UnitId
+FROM [dbo].[RuleSource] [inr]
+LEFT JOIN [dbo].[UnitLookup] [bu] ON [inr].UnitId = [bu].UnitId;
 `;
 
   indexText(uri, sql);
   const aliasMap = aliasesByUri.get(uri);
-  assert.ok(aliasMap?.get("bu") === "businessunits" || aliasMap?.get("bu") === "dbo.businessunits", "JOIN alias bu should resolve to BusinessUnits in CREATE VIEW");
+  assert.ok(aliasMap?.get("bu") === "unitlookup" || aliasMap?.get("bu") === "dbo.unitlookup", "JOIN alias bu should resolve to UnitLookup in CREATE VIEW");
   const refs = getReferencesForUri(uri);
   const buAliasRefs = refs.filter(r => r.kind === "table" && normalizeName(r.name) === "bu");
   assert.ok(
@@ -282,16 +282,16 @@ LEFT JOIN [dbo].[BusinessUnits] [bu] ON [inr].BusinessUnitId = [bu].BusinessUnit
 runCase("create-view-select-alias-name-clash-does-not-flag-join-alias-as-unknown-table", () => {
   const uri = "file:///regression/create-view-select-alias-clash.sql";
   const sql = `
-CREATE VIEW dbo.InboundShippingOptionRulesView
+CREATE VIEW dbo.GenericSelectAliasClashView
 AS
-SELECT IIF(CAST([inr].[BusinessUnitId] AS VARCHAR(10)) = -1, 'ALL', CONCAT(bu.BusinessUnitId, '-', bu.BusinessUnitCode)) [BU]
-FROM [dbo].[InboundShippingOptionRules] [inr]
-LEFT JOIN [dbo].[BusinessUnits] [bu] ON [inr].BusinessUnitId = [bu].BusinessUnitId;
+SELECT IIF(CAST([inr].[UnitId] AS VARCHAR(10)) = -1, 'ALL', CONCAT(bu.UnitId, '-', bu.UnitCode)) [BU]
+FROM [dbo].[RuleSource] [inr]
+LEFT JOIN [dbo].[UnitLookup] [bu] ON [inr].UnitId = [bu].UnitId;
 `;
 
   indexText(uri, sql);
   const aliasMap = aliasesByUri.get(uri);
-  assert.ok(aliasMap?.get("bu") === "businessunits" || aliasMap?.get("bu") === "dbo.businessunits", "JOIN alias bu should resolve to BusinessUnits despite SELECT alias [BU]");
+  assert.ok(aliasMap?.get("bu") === "unitlookup" || aliasMap?.get("bu") === "dbo.unitlookup", "JOIN alias bu should resolve to UnitLookup despite SELECT alias [BU]");
   const refs = getReferencesForUri(uri);
   const buAliasRefs = refs.filter(r => r.kind === "column" && normalizeName(r.name).startsWith("bu."));
   assert.ok(buAliasRefs.length > 0, "JOIN alias bu qualified column usages should be indexed");

@@ -1,7 +1,6 @@
 import { CodeAction, CodeActionKind, Diagnostic, DiagnosticSeverity, TextEdit } from "vscode-languageserver/node";
 import { isSqlKeyword, normalizeName, offsetToPosition } from "./text-utils";
 import { getCteColumns, getDisplaySymbolName, normalizeAstTableName, resolveAliasTableName, resolveSymbolCaseInsensitive } from "./ast-utils";
-import { collectNearestScopeColumnOwners } from "./scope-column-resolver";
 import { extractReferences } from "@saralsql/tsql-parser";
 import { resolveBareColumnAtOffset } from "./column-resolution";
 
@@ -502,22 +501,6 @@ function collectOrderByDuplicateAliasStarts(ast: any): Set<number> {
   return starts;
 }
 
-function collectReadableAliasMatchesIncremental(
-  scopeAtPos: any,
-  colNorm: string,
-  tablesByName: Map<string, any>,
-  tableTypesByName: Map<string, any>
-): Array<{ alias: string; displayAlias: string }> {
-  const owners = collectNearestScopeColumnOwners(scopeAtPos, colNorm, tablesByName, tableTypesByName);
-  const matches: Array<{ alias: string; displayAlias: string }> = [];
-  for (const o of owners) {
-    if (o.alias && o.displayAlias) {
-      matches.push({ alias: o.alias, displayAlias: o.displayAlias });
-    }
-  }
-  return matches;
-}
-
 function collectQualifiedIdentifierStarts(ast: any): Set<number> {
   const starts = new Set<number>();
 
@@ -598,7 +581,10 @@ export function collectReadableBareColumnDiagnostics(
     if (resolved.status !== "resolved") {
       continue;
     }
-    const matches = collectReadableAliasMatchesIncremental(scopeAtPos, colNorm, tablesByName, tableTypesByName);
+    const matches: Array<{ alias: string; displayAlias: string }> = [];
+    if (resolved.owner?.alias && resolved.owner?.displayAlias) {
+      matches.push({ alias: resolved.owner.alias, displayAlias: resolved.owner.displayAlias });
+    }
 
     if (matches.length !== 1) {
       continue;

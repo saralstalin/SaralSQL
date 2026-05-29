@@ -1342,15 +1342,15 @@ runCase("single-table-variable-select-bare-columns-are-not-ambiguous", () => {
 CREATE PROCEDURE dbo.p
 AS
 BEGIN
-  DECLARE @OutputTable TABLE (
-    FacilityCode VARCHAR(20),
-    AvailableQty INT,
-    DispositionCode VARCHAR(50),
-    DispositionName VARCHAR(100)
+  DECLARE @ResultTable TABLE (
+    LocationCode VARCHAR(20),
+    Quantity INT,
+    StatusCode VARCHAR(50),
+    StatusName VARCHAR(100)
   );
 
-  SELECT FacilityCode, AvailableQty, DispositionCode, DispositionName
-  FROM @OutputTable;
+  SELECT LocationCode, Quantity, StatusCode, StatusName
+  FROM @ResultTable;
 END;
 `;
 
@@ -1365,7 +1365,7 @@ END;
   );
 
   assert.ok(
-    diagnostics.every(d => !String(d.message).includes("FacilityCode")),
+    diagnostics.every(d => !String(d.message).includes("LocationCode")),
     "Bare columns from a single table-variable source should not be reported as ambiguous"
   );
 });
@@ -1376,21 +1376,22 @@ runCase("tvp-parameter-outside-from-does-not-compete-with-local-table-variable-s
 
   const schemaSql = `
 CREATE TYPE dbo.SomeTableType AS TABLE (
-  FactoryCode VARCHAR(20)
+  LocationCode VARCHAR(20)
 );
 `;
 
   const querySql = `
 CREATE PROCEDURE dbo.Repro
-  @Facilities dbo.SomeTableType READONLY
+  @InputRows dbo.SomeTableType READONLY
 AS
 BEGIN
-  DECLARE @OutputTable TABLE (
-    FactoryCode VARCHAR(20),
-    AvailableQty INT
+  DECLARE @ResultTable TABLE (
+    LocationCode VARCHAR(20),
+    Quantity INT
   );
-, DispositionCode, DispositionName
-  FROM @OutputTable;
+
+  SELECT LocationCode, Quantity
+  FROM @ResultTable;
 END;
 `;
 
@@ -1406,8 +1407,80 @@ END;
   );
 
   assert.ok(
-    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'FactoryCode'")),
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'LocationCode'")),
     "TVP parameter columns must not compete when the active SELECT reads from a different local table variable source"
+  );
+});
+
+runCase("nested-procedure-update-bare-where-binds-to-mutation-target-not-visible-tvp", () => {
+  const schemaUri = "file:///validation/nested-proc-update-tvp-schema.sql";
+  const queryUri = "file:///validation/nested-proc-update-tvp-query.sql";
+
+  const schemaSql = `
+CREATE TYPE dbo.FacilityCodeListType AS TABLE (
+  LocationCode VARCHAR(20)
+);
+CREATE TABLE dbo.InventoryByLocation (
+  ItemKey VARCHAR(60),
+  LocationCode VARCHAR(20),
+  CategoryId INT,
+  ReservedQty INT,
+  IsActive BIT
+);
+CREATE TABLE dbo.InventoryEvents (
+  ItemKey VARCHAR(60),
+  LocationCode VARCHAR(20),
+  CategoryId INT,
+  Qty INT,
+  IsFinalized BIT,
+  IsActive BIT
+);
+`;
+
+  const querySql = `
+CREATE PROCEDURE dbo.Repro
+  @Facilities dbo.FacilityCodeListType READONLY,
+  @ItemKey VARCHAR(60),
+  @CategoryId INT,
+  @TargetLocationCode VARCHAR(20)
+AS
+BEGIN
+  DECLARE @ResultTable TABLE (
+    LocationCode VARCHAR(20),
+    Quantity INT
+  );
+
+  UPDATE dbo.InventoryByLocation
+  SET ReservedQty = (
+        SELECT ISNULL(SUM(Qty), 0)
+        FROM dbo.InventoryEvents
+        WHERE ItemKey = @ItemKey
+          AND LocationCode = @TargetLocationCode
+          AND CategoryId = @CategoryId
+          AND IsFinalized = 0
+          AND IsActive = 1
+      )
+  WHERE ItemKey = @ItemKey
+    AND LocationCode = @TargetLocationCode
+    AND CategoryId = @CategoryId
+    AND IsActive = 1;
+END;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'LocationCode'")),
+    "Nested UPDATE WHERE bare LocationCode should bind to mutation target and not visible TVP/table-variable symbols"
   );
 });
 
