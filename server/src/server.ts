@@ -42,6 +42,7 @@ import { onRenameProvider } from "./rename-provider";
 import { onDocumentSymbolProvider } from "./document-symbol-provider";
 import {
   normalizeName
+  , isSqlKeyword
   , getWordRangeAtPosition
   , offsetAt
   , getLineStarts
@@ -69,7 +70,7 @@ import { parseSql, type ParseResult } from "./sql-parser";
 import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, buildSelectStarExpansionCodeActions, buildUpdateNoLockCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, normalizeSaralSqlSettings, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "./diagnostic-helpers";
 import { getCteColumns, resolveAliasTableName, resolveSymbolCaseInsensitive, resolveAliasFromAst, getDisplaySymbolName } from "./ast-utils";
 import { collectNearestScopeColumnOwners } from "./scope-column-resolver";
-import { resolveBareColumnAtOffset } from "./column-resolution";
+import { resolveColumnAtOffset } from "./column-resolution";
 import { LruCache } from "./lru-cache";
 
 // ---------- Connection + Documents ----------
@@ -475,6 +476,7 @@ connection.onDefinition(async (params: DefinitionParams): Promise<Location[] | n
       findDerivedAliasProjectedColumnRange,
       getResolutionSourceColumns,
       resolveSymbolCaseInsensitive,
+      resolveAliasTableName,
       getCteColumns
     });
   } catch (err) {
@@ -1198,14 +1200,16 @@ function findStatementLocalColumnOwner(
     }
     return null;
   }
-  const resolved = resolveBareColumnAtOffset({
+  const resolved = resolveColumnAtOffset({
     parsed,
     offset,
     columnName,
+    tokenText: columnName,
     tablesByName,
     tableTypesByName,
     scopeAtPos,
-    localDefsByName
+    localDefsByName,
+    resolverOptions: { allowQualifiedSchemaLookup: false }
   });
   if (resolved.status === "resolved" && resolved.owner?.column) {
     return {
@@ -1275,6 +1279,11 @@ connection.onCodeAction((params: CodeActionParams): CodeAction[] => {
 connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
   try {
     const doc = documents.get(params.textDocument.uri);
+    if (!doc) { return null; }
+    const parsed = getParsedDocument(doc);
+    if (isAmbiguousBareColumnAtPosition(doc, params.position, parsed)) {
+      return null;
+    }
     return onRenameProvider(params, doc, {
       getWordRangeAtPosition,
       findReferencesForWord
@@ -1701,6 +1710,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
 
             const directCandidates = [
               String(col?.alias ?? "").trim(),
+              String(col?.name ?? "").trim(),
               String(col?.outputName ?? "").trim(),
               String(col?.sourceName ?? "").trim()
             ].filter(Boolean);
@@ -1775,6 +1785,22 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
           });
       }
 
+      function getAliasProjectedColumnSet(aliasNorm: string, aliasSym: any): Set<string> {
+        const projected = new Set<string>();
+        for (const name of getParserAliasColumnNames(parsed, aliasSym, localDefsByName)) {
+          const n = normalizeName(name);
+          if (n) {
+            projected.add(n);
+          }
+        }
+        for (const n of getDerivedAliasProjectedColumns(aliasNorm, aliasSym)) {
+          if (n) {
+            projected.add(n);
+          }
+        }
+        return projected;
+      }
+
       function collectCteNames(scope: any): void {
         const symbols = typeof scope?.getOwnSymbols === "function"
           ? scope.getOwnSymbols()
@@ -1837,183 +1863,88 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
           continue;
         }
 
-        if (ref.kind !== "column") {
+        if (ref.kind !== "column" && ref.kind !== "unknown") {
           continue;
         }
 
-        const lastDot = ref.name.lastIndexOf(".");
+        const refOffset = (lineStarts[ref.line] ?? 0) + ref.start;
+        const refRangeText = getTextAtRange(ref.line, ref.start, ref.line, ref.end);
+        const refNameFromRange = normalizeName(refRangeText.replace(/\s+/g, ""));
+        const recoveredQualifiedUnknown = ref.kind === "unknown"
+          ? recoverQualifiedUnknownNameFromText(text, refOffset, String(ref.name ?? ""))
+          : null;
+        const refName = (ref.kind === "unknown" && refNameFromRange.includes("."))
+          ? refNameFromRange
+          : (recoveredQualifiedUnknown ?? String(ref.name ?? ""));
+        const lastDot = refName.lastIndexOf(".");
         if (lastDot <= 0) {
           if (ref.validateSchema === false) {
             continue;
           }
+          // Bare unknown-column validation:
+          // use shared resolver context; only emit when parser provides a statement-local owner hint
+          // and the referenced column is truly missing on that owner.
+          const bareToken = normalizeName(refName);
+          if (!bareToken || bareToken.startsWith("@") || isSqlKeyword(bareToken)) {
+            continue;
+          }
+          const scopeAtPos = parsed?.scope?.root?.findInnermost?.(refOffset) ?? parsed?.scope?.root;
+          const resolvedBare = resolveColumnAtOffset({
+            parsed,
+            offset: refOffset,
+            columnName: refName,
+            tokenText: refName,
+            tablesByName,
+            tableTypesByName,
+            scopeAtPos,
+            localDefsByName,
+            resolverOptions: { allowQualifiedSchemaLookup: false }
+          });
+          if (resolvedBare.status !== "resolved") {
+            const hintedOwner = normalizeName(String(resolvedBare.context?.parserHintOwner?.ownerName ?? ""));
+            if (hintedOwner && tableExistsInContext(hintedOwner) && !columnExistsInContext(hintedOwner, bareToken)) {
+              addWrongColumn(hintedOwner, bareToken, ref.line, ref.start, ref.end, getDisplayTableName(hintedOwner));
+            }
+          }
           continue;
         }
 
-        const table = normalizeName(ref.name.slice(0, lastDot));
-        const column = normalizeName(ref.name.slice(lastDot + 1));
-        const refOffset = (lineStarts[ref.line] ?? 0) + ref.start;
-
-        // Validate local derived/alias sources (e.g., subquery alias "s") even when ref.validateSchema is false.
+        const table = normalizeName(refName.slice(0, lastDot));
+        const column = normalizeName(refName.slice(lastDot + 1));
         const scopeAtPos = parsed?.scope?.root?.findInnermost?.(refOffset) ?? parsed?.scope?.root;
-        const scopedSym = resolveSymbolCaseInsensitive(scopeAtPos, table);
-        const aliasCandidates = getAliasCandidatesAtOffset(scopeAtPos, table);
-        if (aliasCandidates.length > 0) {
-          const withColumns = aliasCandidates
-            .map((sym: any) => {
-              const explicitCols = Array.isArray(sym.columns) ? sym.columns : [];
-              const explicitHas = explicitCols.some((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === column);
-              const aliasTarget = normalizeName(resolveAliasTableName(sym) ?? "");
-              const aliasTargetStripped = aliasTarget.replace(/^dbo\./, "");
-              const aliasTargetDef = aliasTarget
-                ? (localDefsByName.get(aliasTarget)
-                  || localDefsByName.get(aliasTargetStripped)
-                  || tablesByName.get(aliasTarget)
-                  || tablesByName.get(aliasTargetStripped)
-                  || tableTypesByName.get(aliasTarget)
-                  || tableTypesByName.get(aliasTargetStripped))
-                : null;
-              const targetHas = Array.isArray(aliasTargetDef?.columns)
-                ? aliasTargetDef.columns.some((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === column)
-                : false;
-              const projected = getDerivedAliasProjectedColumns(table, sym);
-              const projectedHas = projected.has(column);
-              const hasKnowledge = explicitCols.length > 0 || projected.size > 0 || Array.isArray(aliasTargetDef?.columns);
-              return { sym, explicitHas, targetHas, projectedHas, hasKnowledge };
-            });
-
-          if (withColumns.some(x => x.explicitHas || x.projectedHas || x.targetHas)) {
-            continue;
-          }
-
-          // Emit missing column only when at least one alias candidate has known projection shape.
-          const known = withColumns.find(x => x.hasKnowledge);
-          if (known) {
-            addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplaySymbolName(known.sym) || table);
-            continue;
-          }
-        }
-
-        if (scopedSym?.kind === "Alias" && Array.isArray(scopedSym.columns) && scopedSym.columns.length > 0) {
-          const hasLocalCol = scopedSym.columns.some((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === column);
-          if (!hasLocalCol) {
-            addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplaySymbolName(scopedSym) || table);
-          }
+        const resolvedQualified = resolveColumnAtOffset({
+          parsed,
+          offset: refOffset,
+          columnName: column,
+          tokenText: `${table}.${column}`,
+          tablesByName,
+          tableTypesByName,
+          scopeAtPos,
+          localDefsByName,
+          resolverOptions: { allowQualifiedSchemaLookup: false }
+        });
+        if (resolvedQualified.verdict === "resolved") {
           continue;
         }
-        if (scopedSym?.kind === "Alias") {
-          const projected = getDerivedAliasProjectedColumns(table, scopedSym);
-          if (projected.size > 0) {
-            if (!projected.has(column)) {
-              addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplaySymbolName(scopedSym) || table);
-            }
-            continue;
-          }
-        }
-        if (scopedSym?.kind === "CTE") {
-          const cteCols = getCteColumns(scopedSym);
-          const hasLocalCol = cteCols.some((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === column);
-          if (!hasLocalCol) {
-            addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplaySymbolName(scopedSym) || table);
-          }
-          continue;
-        }
-
-        if (ref.validateSchema === false) {
-          continue;
-        }
-
-        if (propertyAccessStarts.has(refOffset)) {
-          continue;
-        }
-        const tempTableSym = resolveTempTableSymbolAtOffset(table, refOffset);
-        if (tempTableSym) {
-          if (!tempTableSymbolHasColumn(tempTableSym, column)) {
-            addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplayTableName(table));
-          }
-          continue;
-        }
-
-        const matchedResolution = parsed?.columns?.resolutions?.find((r: any) => r.location?.start === refOffset);
-        if (matchedResolution?.inputs) {
-          let hasResolvedColumnInput = false;
-          let hasValidatedResolvedInput = false;
-          for (const input of matchedResolution.inputs) {
-            if (input?.kind !== "column" || !input?.source || !input?.name) {
-              continue;
-            }
-            hasResolvedColumnInput = true;
-            const srcTable = normalizeName(String(input.source));
-            const srcCol = normalizeName(String(input.name).split(".").pop() ?? "");
-            if (!srcTable || !srcCol) {
-              continue;
-            }
-            if (String(input.sourceKind ?? "table") !== "table") {
-              hasValidatedResolvedInput = true;
-              break;
-            }
-            if (tableExistsInContext(srcTable) && columnExistsInContext(srcTable, srcCol)) {
-              hasValidatedResolvedInput = true;
-              break;
-            }
-          }
-          if (hasResolvedColumnInput) {
-            if (hasValidatedResolvedInput) {
-              continue;
-            }
-            
-            // The parser resolved the column, but it failed schema validation.
-            // Emit the exact error so the user sees the typo!
-            for (const input of matchedResolution.inputs) {
-              if (input?.kind !== "column" || !input?.source || !input?.name) {continue;};
-              const srcTable = normalizeName(String(input.source));
-              const srcCol = normalizeName(String(input.name).split(".").pop() ?? "");
-              if (!srcTable || !srcCol) {continue;};
-              if (String(input.sourceKind ?? "table") !== "table") {continue;};
-              
-              if (!tableExistsInContext(srcTable)) {
-                const tableRef = getSchemaEquivalentTableRefCandidates(srcTable)
-                  .find((r) => r.context === "insert-target" && r.validateSchema !== false)
-                  ?? getSchemaEquivalentTableRefCandidates(srcTable).find((r) => r.validateSchema !== false);
-                if (tableRef) {
-                  addUnknownTable(tableRef.name, tableRef.line, tableRef.start, tableRef.end);
-                } else {
-                  addUnknownTable(srcTable, ref.line, ref.start, ref.end, true);
-                }
-              } else if (!columnExistsInContext(srcTable, srcCol)) {
-                addWrongColumn(srcTable, srcCol, ref.line, ref.start, ref.end, getDisplayTableName(srcTable));
-              }
-            }
-            continue;
-          }
-        }
-
-        if (!table || table.startsWith("@")) {
-          continue;
-        }
-
-        if (cteNames.has(table)) {
-          continue;
-        }
-
-        if (isSystemTableReference(table)) {
-          continue;
-        }
-
-        if (!tableExistsInContext(table)) {
-          const tableRef = getSchemaEquivalentTableRefCandidates(table)
-            .find((r) => r.context === "insert-target" && r.validateSchema !== false)
-            ?? getSchemaEquivalentTableRefCandidates(table).find((r) => r.validateSchema !== false);
-          if (tableRef) {
-            addUnknownTable(tableRef.name, tableRef.line, tableRef.start, tableRef.end);
-          } else {
-            addUnknownTable(table, ref.line, ref.start, ref.end, true);
-          }
-          continue;
-        }
-
-        if (!columnExistsInContext(table, column)) {
+        if (resolvedQualified.verdict === "missing-column") {
           addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplayTableName(table));
+          continue;
         }
+        if (ref.validateSchema === false || resolvedQualified.verdict === "ambiguous") {
+          continue;
+        }
+        if (!table || table.startsWith("@") || cteNames.has(table) || isSystemTableReference(table)) {
+          continue;
+        }
+        const tableRef = getSchemaEquivalentTableRefCandidates(table)
+          .find((r) => r.context === "insert-target" && r.validateSchema !== false)
+          ?? getSchemaEquivalentTableRefCandidates(table).find((r) => r.validateSchema !== false);
+        if (tableRef) {
+          addUnknownTable(tableRef.name, tableRef.line, tableRef.start, tableRef.end);
+        } else {
+          addUnknownTable(table, ref.line, ref.start, ref.end, true);
+        }
+        continue;
       }
 
       function visitScope(scope: any) {
@@ -2093,15 +2024,86 @@ function tableExists(tableName: string): boolean {
   const norm = normalizeName(tableName);
   if (isOutputPseudoTableReference(norm)) { return true; }
   if (isSystemTableReference(norm)) { return true; }
-
-  if (tablesByName.has(norm) || tableTypesByName.has(norm)) { return true; }
-  if (columnsByTable.has(norm)) { return true; }
-
+  const parts = norm.split(".").filter(Boolean);
+  const candidates = new Set<string>([norm]);
   const stripped = norm.replace(/^dbo\./, "");
-  if (tablesByName.has(stripped) || tableTypesByName.has(stripped)) { return true; }
-  if (columnsByTable.has(stripped)) { return true; }
+  const dboPrefixed = stripped ? `dbo.${stripped}` : norm;
+  if (stripped) {
+    candidates.add(stripped);
+  }
+  if (dboPrefixed) {
+    candidates.add(dboPrefixed);
+  }
+  if (parts.length >= 2) {
+    candidates.add(parts.slice(-2).join(".")); // schema.table
+  }
+  if (parts.length >= 1) {
+    candidates.add(parts[parts.length - 1]); // table
+  }
+
+  for (const key of candidates) {
+    if (!key) {
+      continue;
+    }
+    if (tablesByName.has(key) || tableTypesByName.has(key) || columnsByTable.has(key)) {
+      return true;
+    }
+  }
 
   return false;
+}
+
+function recoverQualifiedUnknownNameFromText(
+  text: string,
+  absoluteStart: number,
+  tokenName: string
+): string | null {
+  if (!Number.isFinite(absoluteStart) || absoluteStart <= 0) {
+    return null;
+  }
+  const col = normalizeName(tokenName);
+  if (!col) {
+    return null;
+  }
+
+  let i = absoluteStart - 1;
+  while (i >= 0 && /\s/.test(text[i])) {
+    i -= 1;
+  }
+  if (i < 0 || text[i] !== ".") {
+    return null;
+  }
+
+  i -= 1;
+  while (i >= 0 && /\s/.test(text[i])) {
+    i -= 1;
+  }
+  if (i < 0) {
+    return null;
+  }
+
+  let qualifier = "";
+  if (text[i] === "]") {
+    let j = i - 1;
+    while (j >= 0 && text[j] !== "[") {
+      j -= 1;
+    }
+    if (j >= 0) {
+      qualifier = text.slice(j, i + 1);
+    }
+  } else {
+    let j = i;
+    while (j >= 0 && /[A-Za-z0-9_#@]/.test(text[j])) {
+      j -= 1;
+    }
+    qualifier = text.slice(j + 1, i + 1);
+  }
+
+  const qNorm = normalizeName(qualifier);
+  if (!qNorm) {
+    return null;
+  }
+  return `${qNorm}.${col}`;
 }
 
 function columnExists(tableName: string, columnName: string): boolean {
@@ -2109,12 +2111,29 @@ function columnExists(tableName: string, columnName: string): boolean {
   if (isOutputPseudoTableReference(norm)) { return true; }
   if (isSystemTableReference(norm)) { return true; }
   const column = normalizeName(columnName);
-  const direct = columnsByTable.get(norm);
-  if (direct?.has(column)) { return true; }
-
+  const parts = norm.split(".").filter(Boolean);
+  const candidates = new Set<string>([norm]);
   const stripped = norm.replace(/^dbo\./, "");
-  const strippedCols = columnsByTable.get(stripped);
-  if (strippedCols?.has(column)) { return true; }
+  const dboPrefixed = stripped ? `dbo.${stripped}` : norm;
+  if (stripped) {
+    candidates.add(stripped);
+  }
+  if (dboPrefixed) {
+    candidates.add(dboPrefixed);
+  }
+  if (parts.length >= 2) {
+    candidates.add(parts.slice(-2).join(".")); // schema.table
+  }
+  if (parts.length >= 1) {
+    candidates.add(parts[parts.length - 1]); // table
+  }
+
+  for (const key of candidates) {
+    const cols = columnsByTable.get(key);
+    if (cols?.has(column)) {
+      return true;
+    }
+  }
 
   return false;
 }

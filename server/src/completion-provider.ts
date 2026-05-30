@@ -3,6 +3,39 @@ import { CompletionItemKind } from "vscode-languageserver/node";
 import { normalizeName } from "./text-utils";
 import type { CompletionProviderDeps } from "./provider-types";
 
+function addVisibleTableSources(
+  scopeAtPos: any,
+  deps: CompletionProviderDeps,
+  visibleTables: Set<string>,
+  visibleCtes: Map<string, Array<{ rawName: string }>>
+): void {
+  if (!scopeAtPos) {
+    return;
+  }
+  const visibleSymbols = scopeAtPos.getVisibleSymbols?.() ?? [];
+  for (const sym of visibleSymbols) {
+    if (sym.kind === "Table" || sym.kind === "TempTable" || sym.kind === "CTE") {
+      const name = normalizeName(String(sym.name ?? ""));
+      if (name) {
+        visibleTables.add(name);
+      }
+      if (sym.kind === "CTE") {
+        visibleCtes.set(name, deps.getCteColumns(sym).map(c => ({ rawName: c.rawName })));
+      }
+    } else if (sym.kind === "Alias") {
+      const tblName = deps.resolveAliasTableName(sym);
+      if (tblName) {
+        const tblNorm = normalizeName(tblName);
+        visibleTables.add(tblNorm);
+        const cteSym = deps.resolveSymbolCaseInsensitive(scopeAtPos, tblNorm);
+        if (cteSym?.kind === "CTE") {
+          visibleCtes.set(tblNorm, deps.getCteColumns(cteSym).map(c => ({ rawName: c.rawName })));
+        }
+      }
+    }
+  }
+}
+
 function getVariableCompletionItems(scopeAtPos: any): CompletionItem[] {
   if (!scopeAtPos || typeof scopeAtPos.getVisibleSymbols !== "function") {
     return [];
@@ -229,27 +262,7 @@ export function onCompletionProvider(params: CompletionParams, deps: CompletionP
   if (deps.isInSelectProjectionContext(parsed, offset, linePrefix)) {
     const visibleTables = new Set<string>();
     const visibleCtes = new Map<string, Array<{ rawName: string }>>();
-    if (scopeAtPos) {
-      const visibleSymbols = scopeAtPos.getVisibleSymbols();
-      for (const sym of visibleSymbols) {
-        if (sym.kind === "Table" || sym.kind === "TempTable" || sym.kind === "CTE") {
-          visibleTables.add(normalizeName(sym.name));
-          if (sym.kind === "CTE") {
-            visibleCtes.set(normalizeName(sym.name), deps.getCteColumns(sym).map(c => ({ rawName: c.rawName })));
-          }
-        } else if (sym.kind === "Alias") {
-          const tblName = deps.resolveAliasTableName(sym);
-          if (tblName) {
-            const tblNorm = normalizeName(tblName);
-            visibleTables.add(tblNorm);
-            const cteSym = deps.resolveSymbolCaseInsensitive(scopeAtPos, tblNorm);
-            if (cteSym?.kind === "CTE") {
-              visibleCtes.set(tblNorm, deps.getCteColumns(cteSym).map(c => ({ rawName: c.rawName })));
-            }
-          }
-        }
-      }
-    }
+    addVisibleTableSources(scopeAtPos, deps, visibleTables, visibleCtes);
 
     if (visibleTables.size === 0) {
       for (const t of deps.getStatementTableCandidatesFromAst(parsed, offset)) {
@@ -288,23 +301,9 @@ export function onCompletionProvider(params: CompletionParams, deps: CompletionP
           }
         }
       }
-    } else {
-      for (const def of deps.tablesByName.values()) {
-        if (def.columns) {
-          for (const col of def.columns) {
-            if (colCount++ > COL_LIMIT) { break; }
-            items.push({
-              label: col.rawName,
-              kind: CompletionItemKind.Field,
-              detail: col.type ? `Column in ${def.rawName} (${col.type})` : `Column in ${def.rawName}`,
-              insertText: col.rawName
-            });
-          }
-        }
-        if (colCount > COL_LIMIT) { break; }
-      }
     }
 
+    // Keep table-name suggestions in projection, but avoid global column ownership fallback.
     for (const def of deps.tablesByName.values()) {
       items.push({
         label: def.rawName,
@@ -319,26 +318,7 @@ export function onCompletionProvider(params: CompletionParams, deps: CompletionP
   if (scopeAtPos) {
     const visibleTables = new Set<string>();
     const visibleCtes = new Map<string, Array<{ rawName: string }>>();
-    const visibleSymbols = scopeAtPos.getVisibleSymbols?.() ?? [];
-    for (const sym of visibleSymbols) {
-      if (sym.kind === "Table" || sym.kind === "TempTable" || sym.kind === "CTE") {
-        const name = normalizeName(String(sym.name ?? ""));
-        if (name) { visibleTables.add(name); }
-        if (sym.kind === "CTE") {
-          visibleCtes.set(name, deps.getCteColumns(sym).map(c => ({ rawName: c.rawName })));
-        }
-      } else if (sym.kind === "Alias") {
-        const tblName = deps.resolveAliasTableName(sym);
-        if (tblName) {
-          const tblNorm = normalizeName(tblName);
-          visibleTables.add(tblNorm);
-          const cteSym = deps.resolveSymbolCaseInsensitive(scopeAtPos, tblNorm);
-          if (cteSym?.kind === "CTE") {
-            visibleCtes.set(tblNorm, deps.getCteColumns(cteSym).map(c => ({ rawName: c.rawName })));
-          }
-        }
-      }
-    }
+    addVisibleTableSources(scopeAtPos, deps, visibleTables, visibleCtes);
 
     for (const t of deps.getStatementTableCandidatesFromAst(parsed, offset)) {
       visibleTables.add(t);
@@ -377,14 +357,6 @@ export function onCompletionProvider(params: CompletionParams, deps: CompletionP
   }
 
   items.push(...variableItems);
-
-  for (const def of deps.tablesByName.values()) {
-    items.push({
-      label: def.rawName,
-      kind: CompletionItemKind.Class,
-      detail: `Table defined in ${def.uri.split("/").pop()}:${def.line + 1}`
-    });
-  }
 
   const keywords = [
     "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER",

@@ -12,6 +12,13 @@ type ResolveParams = {
   tableTypesByName: Map<string, any>;
   scopeAtPos?: any;
   localDefsByName?: Map<string, any>;
+  resolverOptions?: ResolverOptions;
+};
+
+export type ResolverOptions = {
+  // Allow schema map lookup for qualified owners when qualifier is not bound in statement scope.
+  // Keep false for strict scope semantics.
+  allowQualifiedSchemaLookup?: boolean;
 };
 
 export type ResolutionScopeType =
@@ -40,6 +47,7 @@ export type ResolutionContext = {
 };
 
 export type BareColumnResolution = {
+  verdict: "resolved" | "unknown-owner" | "missing-column" | "ambiguous";
   status: "resolved" | "ambiguous" | "unresolved";
   owner?: ScopeColumnOwner;
   owners: ScopeColumnOwner[];
@@ -53,7 +61,7 @@ export type BareColumnResolution = {
 export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnResolution {
   const colNorm = normalizeName(params.columnName);
   if (!colNorm) {
-    return { status: "unresolved", owners: [], matchedResolution: null, ambiguityCandidates: [], decisionReason: "" };
+    return { verdict: "unknown-owner", status: "unresolved", owners: [], matchedResolution: null, ambiguityCandidates: [], decisionReason: "" };
   }
 
   const scopeAtPos = params.scopeAtPos ?? params.parsed?.scope?.root?.findInnermost?.(params.offset) ?? params.parsed?.scope?.root;
@@ -74,6 +82,7 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
   // 1) Mutation target ownership has priority inside update/delete statement contexts.
   if (context.mutationOwner) {
     return {
+      verdict: "resolved",
       status: "resolved",
       owner: context.mutationOwner,
       owners: [context.mutationOwner],
@@ -88,6 +97,7 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
   // 2) Read scope ownership (statement-local only)
   if (context.readOwners.length === 1) {
     return {
+      verdict: "resolved",
       status: "resolved",
       owner: context.readOwners[0],
       owners: context.readOwners,
@@ -101,6 +111,7 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
 
   if (context.readOwners.length > 1) {
     return {
+      verdict: "ambiguous",
       status: "ambiguous",
       owners: context.readOwners,
       matchedResolution,
@@ -115,6 +126,7 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
   const lexicalOwner = resolveCorrelatedLexicalOwner(params, colNorm, scopeAtPos);
   if (lexicalOwner) {
     return {
+      verdict: "resolved",
       status: "resolved",
       owner: lexicalOwner,
       owners: [lexicalOwner],
@@ -126,9 +138,26 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
     };
   }
 
+  // 4) Parser-owned fallback only when hint owner is provably one of current statement read sources.
+  // This keeps fallback statement-local and avoids global scope leakage.
+  if (context.parserHintOwner && parserHintOwnerIsCurrentReadSource(params, context.parserHintOwner)) {
+    return {
+      verdict: "resolved",
+      status: "resolved",
+      owner: context.parserHintOwner,
+      owners: [context.parserHintOwner],
+      matchedResolution,
+      ambiguityCandidates,
+      decisionReason,
+      trace: { scopeType: "read", reason: "parser-hint-current-read-source", ownerCount: 1 },
+      context
+    };
+  }
+
   // 3) No owner in statement scope: unresolved.
   // Parser hints remain non-authoritative for diagnostics.
   return {
+    verdict: "unknown-owner",
     status: "unresolved",
     owners: [],
     matchedResolution,
@@ -141,6 +170,367 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
     },
     context
   };
+}
+
+function parserHintOwnerIsCurrentReadSource(params: ResolveParams, owner: ScopeColumnOwner): boolean {
+  const ownerNorm = normalizeName(String(owner?.ownerName ?? ""));
+  if (!ownerNorm) {
+    return false;
+  }
+  const select = findContainingSelectAtOffset(params.parsed?.ast, params.offset);
+  const from = Array.isArray(select?.from) ? select.from : [];
+  if (from.length === 0) {
+    return false;
+  }
+
+  const names = new Set<string>();
+  const addName = (value: any): void => {
+    const norm = normalizeName(String(value ?? ""));
+    if (!norm) {
+      return;
+    }
+    names.add(norm);
+    names.add(normalizeName(norm.split(".").pop() ?? norm));
+  };
+
+  for (const t of from) {
+    addName(t?.alias);
+    addName(t?.table?.name ?? t?.table);
+    const joins = Array.isArray(t?.joins) ? t.joins : [];
+    for (const j of joins) {
+      addName(j?.alias);
+      addName(j?.table?.name ?? j?.table);
+    }
+  }
+
+  if (names.size === 0) {
+    return false;
+  }
+  const ownerTail = normalizeName(ownerNorm.split(".").pop() ?? ownerNorm);
+  return names.has(ownerNorm) || names.has(ownerTail) || names.has(normalizeName(String(owner.alias ?? "")));
+}
+
+export function resolveColumnAtOffset(
+  params: ResolveParams & { tokenText: string }
+): BareColumnResolution {
+  const token = String(params.tokenText ?? "").trim();
+  if (!token) {
+    return { verdict: "unknown-owner", status: "unresolved", owners: [], matchedResolution: null, ambiguityCandidates: [], decisionReason: "" };
+  }
+
+  const dot = token.lastIndexOf(".");
+  if (dot <= 0) {
+    return resolveBareColumnAtOffset({
+      ...params,
+      columnName: token
+    });
+  }
+
+  const qualifierRaw = token.slice(0, dot).trim();
+  const columnRaw = token.slice(dot + 1).trim();
+  const qualifierNorm = normalizeName(qualifierRaw);
+  const columnNorm = normalizeName(columnRaw);
+  if (!qualifierNorm || !columnNorm) {
+    return { verdict: "unknown-owner", status: "unresolved", owners: [], matchedResolution: null, ambiguityCandidates: [], decisionReason: "" };
+  }
+
+  const scopeAtPos = params.scopeAtPos ?? params.parsed?.scope?.root?.findInnermost?.(params.offset) ?? params.parsed?.scope?.root;
+  const qualified = resolveQualifiedOwnerFromScope(params, scopeAtPos, qualifierNorm, columnNorm);
+  if (qualified.owner) {
+    return {
+      verdict: "resolved",
+      status: "resolved",
+      owner: qualified.owner,
+      owners: [qualified.owner],
+      matchedResolution: null,
+      ambiguityCandidates: [],
+      decisionReason: "qualified-scope-owner",
+      trace: { scopeType: "qualified", reason: "qualified-scope-owner", ownerCount: 1 }
+    };
+  }
+
+  if (params.resolverOptions?.allowQualifiedSchemaLookup) {
+    const fallback = resolveCandidateOwner(params, qualifierNorm, columnNorm);
+    if (fallback) {
+      return {
+        verdict: "resolved",
+        status: "resolved",
+        owner: fallback,
+        owners: [fallback],
+        matchedResolution: null,
+        ambiguityCandidates: [],
+        decisionReason: "qualified-schema-fallback",
+        trace: { scopeType: "qualified", reason: "qualified-schema-fallback", ownerCount: 1 }
+      };
+    }
+  }
+
+  return {
+    verdict: qualified.qualifierMatched ? "missing-column" : "unknown-owner",
+    status: "unresolved",
+    owners: [],
+    matchedResolution: null,
+    ambiguityCandidates: [],
+    decisionReason: "qualified-unresolved",
+    trace: {
+      scopeType: "qualified",
+      reason: qualified.qualifierMatched ? "qualified-owner-missing-column" : "qualified-owner-unresolved",
+      ownerCount: 0
+    }
+  };
+}
+
+function resolveQualifiedOwnerFromScope(
+  params: ResolveParams,
+  scopeAtPos: any,
+  qualifierNorm: string,
+  columnNorm: string
+): { owner: ScopeColumnOwner | null; qualifierMatched: boolean } {
+  if (!scopeAtPos) {
+    return { owner: null, qualifierMatched: false };
+  }
+
+  const visible = typeof scopeAtPos?.getVisibleSymbols === "function"
+    ? scopeAtPos.getVisibleSymbols()
+    : Object.values(scopeAtPos?.symbols ?? {});
+  const aliasCandidates = (visible as any[])
+    .filter((s: any) => s?.kind === "Alias" && normalizeName(String(s?.name ?? "")) === qualifierNorm);
+  if (aliasCandidates.length > 0) {
+    let anyKnown = false;
+    for (const candidate of aliasCandidates) {
+      const resolved = resolveQualifiedFromSymbol(params, scopeAtPos, candidate, qualifierNorm, columnNorm);
+      if (resolved) {
+        return { owner: resolved, qualifierMatched: true };
+      }
+      anyKnown = anyKnown || hasColumnKnowledgeForSymbol(params, scopeAtPos, candidate);
+    }
+    return { owner: null, qualifierMatched: anyKnown };
+  }
+
+  const sym = resolveSymbolCaseInsensitive(scopeAtPos, qualifierNorm);
+  if (sym) {
+    const fromSym = resolveQualifiedFromSymbol(params, scopeAtPos, sym, qualifierNorm, columnNorm);
+    if (fromSym) {
+      return { owner: fromSym, qualifierMatched: true };
+    }
+    return { owner: null, qualifierMatched: hasColumnKnowledgeForSymbol(params, scopeAtPos, sym) };
+  }
+
+  // Also try tail lookup (dbo.Table -> Table) against scope symbols.
+  const qualifierTail = normalizeName(qualifierNorm.split(".").pop() ?? qualifierNorm);
+  if (qualifierTail && qualifierTail !== qualifierNorm) {
+    const tailSym = resolveSymbolCaseInsensitive(scopeAtPos, qualifierTail);
+    if (tailSym) {
+      const fromTail = resolveQualifiedFromSymbol(params, scopeAtPos, tailSym, qualifierNorm, columnNorm);
+      if (fromTail) {
+        return { owner: fromTail, qualifierMatched: true };
+      }
+      return { owner: null, qualifierMatched: hasColumnKnowledgeForSymbol(params, scopeAtPos, tailSym) };
+    }
+  }
+
+  return { owner: null, qualifierMatched: false };
+}
+
+function hasColumnKnowledgeForSymbol(params: ResolveParams, scopeAtPos: any, sym: any): boolean {
+  if (Array.isArray(sym?.columns) && sym.columns.length > 0) {
+    return true;
+  }
+
+  if (sym?.kind === "CTE") {
+    return Array.isArray(sym?.columns) && sym.columns.length > 0;
+  }
+
+  if (sym?.kind === "Alias") {
+    const projected = getAliasProjectedColumns(params, sym);
+    if (projected.size > 0) {
+      return true;
+    }
+    const aliasTarget = normalizeName(resolveAliasTableName(sym) ?? "");
+    if (!aliasTarget) {
+      return false;
+    }
+    const targetSym = resolveSymbolCaseInsensitive(scopeAtPos, aliasTarget);
+    if (targetSym) {
+      return hasColumnKnowledgeForSymbol(params, scopeAtPos, targetSym);
+    }
+    const stripped = aliasTarget.replace(/^dbo\./, "");
+    const dbo = stripped ? `dbo.${stripped}` : aliasTarget;
+    const defs = [aliasTarget, stripped, dbo];
+    for (const key of defs) {
+      const tableDef = params.localDefsByName?.get(key) ?? params.tablesByName.get(key) ?? params.tableTypesByName.get(key);
+      if (Array.isArray(tableDef?.columns) && tableDef.columns.length > 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  const symName = normalizeName(String(sym?.name ?? ""));
+  if (!symName) {
+    return false;
+  }
+  const stripped = symName.replace(/^dbo\./, "");
+  const dbo = stripped ? `dbo.${stripped}` : symName;
+  const defs = [symName, stripped, dbo];
+  for (const key of defs) {
+    const tableDef = params.localDefsByName?.get(key) ?? params.tablesByName.get(key) ?? params.tableTypesByName.get(key);
+    if (Array.isArray(tableDef?.columns) && tableDef.columns.length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function resolveQualifiedFromSymbol(
+  params: ResolveParams,
+  scopeAtPos: any,
+  sym: any,
+  qualifierNorm: string,
+  columnNorm: string
+): ScopeColumnOwner | null {
+  if (Array.isArray(sym?.columns) && sym.columns.length > 0) {
+    const col = findColumn(sym.columns, columnNorm);
+    if (col) {
+      const kind = normalizeName(String(sym?.kind ?? ""));
+      const kindLabel = kind === "cte"
+        ? "CTE"
+        : kind === "temptable"
+          ? "temp table"
+          : (kind === "variable" || kind === "parameter")
+            ? "table variable"
+            : "table";
+      return {
+        kindLabel,
+        ownerName: String(sym?.rawName ?? sym?.name ?? qualifierNorm),
+        column: col,
+        alias: normalizeName(String(sym?.name ?? ""))
+      };
+    }
+  }
+
+  if (sym?.kind === "CTE") {
+    const c = getCteColumnByName(sym, columnNorm);
+    if (c) {
+      return {
+        kindLabel: "CTE",
+        ownerName: String(sym?.rawName ?? sym?.name ?? qualifierNorm),
+        column: c,
+        alias: normalizeName(String(sym?.name ?? ""))
+      };
+    }
+  }
+
+  if (sym?.kind === "Alias") {
+    const projected = getAliasProjectedColumns(params, sym);
+    if (projected.has(columnNorm)) {
+      return {
+        kindLabel: "derived table",
+        ownerName: String(sym?.rawName ?? sym?.name ?? qualifierNorm),
+        column: { name: columnNorm, rawName: columnNorm },
+        alias: normalizeName(String(sym?.name ?? ""))
+      };
+    }
+
+    const aliasTarget = normalizeName(resolveAliasTableName(sym) ?? "");
+    if (!aliasTarget) {
+      return null;
+    }
+    const targetSym = resolveSymbolCaseInsensitive(scopeAtPos, aliasTarget);
+    if (targetSym) {
+      const fromTargetSym = resolveQualifiedFromSymbol(params, scopeAtPos, targetSym, aliasTarget, columnNorm);
+      if (fromTargetSym) {
+        return {
+          ...fromTargetSym,
+          alias: normalizeName(String(sym?.name ?? ""))
+        };
+      }
+    }
+    const owner = resolveCandidateOwner(params, aliasTarget, columnNorm);
+    if (owner) {
+      return {
+        ...owner,
+        alias: normalizeName(String(sym?.name ?? ""))
+      };
+    }
+    return null;
+  }
+
+  const symName = normalizeName(String(sym?.name ?? ""));
+  if (symName) {
+    const owner = resolveCandidateOwner(params, symName, columnNorm);
+    if (owner) {
+      return owner;
+    }
+  }
+
+  return null;
+}
+
+function getAliasProjectedColumns(params: ResolveParams, sym: any): Set<string> {
+  const names = new Set<string>();
+  const aliasName = normalizeName(sym?.name ?? "");
+  if (!aliasName) {
+    return names;
+  }
+
+  if (Array.isArray(sym?.columns)) {
+    for (const col of sym.columns) {
+      const n = normalizeName(String(col?.rawName ?? col?.name ?? col ?? ""));
+      if (n) {
+        names.add(n);
+      }
+    }
+  }
+
+  const sources = Array.isArray(params.parsed?.lineage?.sources) ? params.parsed.lineage.sources : [];
+  for (const source of sources) {
+    const sourceName = normalizeName(source?.alias ?? source?.name ?? "");
+    if (sourceName !== aliasName || !Array.isArray(source?.projection)) {
+      continue;
+    }
+    for (const projection of source.projection) {
+      const n = normalizeName(String(projection?.name ?? ""));
+      if (n && n !== "*" && n !== "expression") {
+        names.add(n);
+      }
+    }
+  }
+
+  const queryCols = sym?.location?.table?.query?.columns;
+  if (Array.isArray(queryCols)) {
+    for (const col of queryCols) {
+      if (!col || col?.wildcard === true) {
+        continue;
+      }
+      const candidates = [
+        String(col?.alias ?? "").trim(),
+        String(col?.name ?? "").trim(),
+        String(col?.outputName ?? "").trim(),
+        String(col?.sourceName ?? "").trim()
+      ].filter(Boolean);
+      for (const candidate of candidates) {
+        const n = normalizeName(candidate);
+        if (n && n !== "*" && n !== "expression") {
+          names.add(n);
+        }
+      }
+    }
+  }
+
+  return names;
+}
+
+function getCteColumnByName(sym: any, columnNorm: string): any | null {
+  const cols = Array.isArray(sym?.columns) ? sym.columns : [];
+  for (const c of cols) {
+    const raw = normalizeName(String(c?.rawName ?? c?.name ?? c));
+    const name = normalizeName(String(c?.name ?? c));
+    if (raw === columnNorm || name === columnNorm) {
+      return c;
+    }
+  }
+  return null;
 }
 
 function resolveCorrelatedLexicalOwner(

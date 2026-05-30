@@ -2,6 +2,7 @@ import type { Location, Position } from "vscode-languageserver/node";
 import type { TextDocument } from "vscode-languageserver-textdocument";
 import { normalizeName, isSqlKeyword } from "./text-utils";
 import type { DefinitionProviderDeps } from "./provider-types";
+import { resolveColumnAtOffset } from "./column-resolution";
 
 export async function onDefinitionProvider(
   doc: TextDocument,
@@ -38,10 +39,19 @@ export async function onDefinitionProvider(
       }));
     }
     if (isBareColumnToken) {
-      const scopeAtPos = parsed?.scope?.root?.findInnermost(offset) ?? parsed?.scope?.root;
-      const stmtOwner = deps.findStatementLocalColumnOwner(deps.getCurrentStatement(doc, position), rawWord, scopeAtPos, parsed, offset, localDefsByName);
-      if (stmtOwner?.ownerName) {
-        const locs = deps.findColumnInTable(normalizeName(stmtOwner.ownerName), word);
+      const resolvedBare = resolveColumnAtOffset({
+        parsed,
+        offset,
+        columnName: rawWord,
+        tokenText: rawWord,
+        tablesByName: deps.tablesByName,
+        tableTypesByName: deps.tableTypesByName,
+        localDefsByName,
+        resolverOptions: { allowQualifiedSchemaLookup: false }
+      });
+      if (resolvedBare.verdict === "resolved" && resolvedBare.owner?.ownerName) {
+        const colName = String(resolvedBare.owner.column?.name ?? resolvedBare.owner.column?.rawName ?? rawWord);
+        const locs = deps.findColumnInTable(normalizeName(resolvedBare.owner.ownerName), colName);
         if (locs.length > 0) {
           return locs;
         }
@@ -69,6 +79,28 @@ export async function onDefinitionProvider(
 
   if (match.kind === "table") {
     const norm = normalizeName(match.name);
+    if (parsed?.scope?.root) {
+      const scopeAtPos = parsed.scope.root.findInnermost(offset);
+      const scopedSym = deps.resolveSymbolCaseInsensitive(scopeAtPos, norm);
+      if (scopedSym?.kind === "Alias" && typeof scopedSym.location?.start === "number" && typeof scopedSym.location?.end === "number") {
+        return [{
+          uri: doc.uri,
+          range: {
+            start: doc.positionAt(scopedSym.location.start),
+            end: doc.positionAt(scopedSym.location.end)
+          }
+        }];
+      }
+      if (scopedSym?.kind === "CTE" && typeof scopedSym.location?.start === "number" && typeof scopedSym.location?.end === "number") {
+        return [{
+          uri: doc.uri,
+          range: {
+            start: doc.positionAt(scopedSym.location.start),
+            end: doc.positionAt(scopedSym.location.end)
+          }
+        }];
+      }
+    }
     if (norm.startsWith("@")) {
       const byUri = deps.referencesIndex.get(norm);
       const fileRefs = byUri?.get(normUri) || [];
@@ -104,63 +136,40 @@ export async function onDefinitionProvider(
       }];
     }
 
-    if (parsed?.scope?.root) {
-      const scopeAtPos = parsed.scope.root.findInnermost(offset);
-      const cteSym = deps.resolveSymbolCaseInsensitive(scopeAtPos, norm);
-      if (cteSym?.kind === "CTE" && typeof cteSym.location?.start === "number" && typeof cteSym.location?.end === "number") {
-        return [{
-          uri: doc.uri,
-          range: {
-            start: doc.positionAt(cteSym.location.start),
-            end: doc.positionAt(cteSym.location.end)
-          }
-        }];
-      }
-    }
   }
 
   if (match.kind === "column") {
-    const parts = match.name.split(".");
-    if (parts.length === 2) {
-      const tableName = parts[0];
-      const colName = parts[1];
-      const derivedProjectionLoc = deps.findDerivedAliasProjectedColumnRange(doc, parsed, offset, tableName, colName);
-      if (derivedProjectionLoc && derivedProjectionLoc.length > 0) {
-        return derivedProjectionLoc;
+    const tokenRange = deps.getWordRangeAtPosition(doc, position);
+    const token = tokenRange ? doc.getText(tokenRange) : match.name;
+    const tokenForResolve = token.includes(".") ? token : String(match.name ?? token);
+    const resolved = resolveColumnAtOffset({
+      parsed,
+      offset,
+      columnName: tokenForResolve,
+      tokenText: tokenForResolve,
+      tablesByName: deps.tablesByName,
+      tableTypesByName: deps.tableTypesByName,
+      localDefsByName,
+      resolverOptions: { allowQualifiedSchemaLookup: false }
+    });
+    if (resolved.status === "resolved" && resolved.owner?.ownerName && resolved.owner?.column) {
+      const colName = String(resolved.owner.column?.name ?? resolved.owner.column?.rawName ?? "");
+      const locs = deps.findColumnInTable(normalizeName(resolved.owner.ownerName), colName);
+      if (locs.length > 0) {
+        return locs;
       }
-      const matchedResolution = parsed?.columns?.resolutions?.find((r: any) => {
-        const s = Number(r?.location?.start);
-        const e = Number(r?.location?.end);
-        return Number.isFinite(s) && Number.isFinite(e) && offset >= s && offset <= e;
-      });
-      if (matchedResolution) {
-        const sources = deps.getResolutionSourceColumns(matchedResolution);
-        if (sources.length > 0) {
-          for (const src of sources) {
-            const locs = deps.findColumnInTable(src.table, src.column);
-            if (locs.length > 0) {
-              return locs;
-            }
-          }
+      if (normalizeName(String(resolved.owner.kindLabel ?? "")).includes("derived")) {
+        const derivedLocs = deps.findDerivedAliasProjectedColumnRange(
+          doc,
+          parsed,
+          offset,
+          normalizeName(resolved.owner.ownerName),
+          normalizeName(colName)
+        );
+        if (derivedLocs && derivedLocs.length > 0) {
+          return derivedLocs;
         }
       }
-      if (parsed?.scope?.root) {
-        const scopeAtPos = parsed.scope.root.findInnermost(offset);
-        const cteSym = deps.resolveSymbolCaseInsensitive(scopeAtPos, tableName);
-        if (cteSym?.kind === "CTE") {
-          const cteCol = deps.getCteColumns(cteSym).find(c => c.name === normalizeName(colName));
-          if (cteCol?.start !== undefined && cteCol?.end !== undefined) {
-            return [{
-              uri: doc.uri,
-              range: {
-                start: doc.positionAt(cteCol.start),
-                end: doc.positionAt(cteCol.end)
-              }
-            }];
-          }
-        }
-      }
-      return deps.findColumnInTable(tableName, colName);
     }
   }
 

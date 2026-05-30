@@ -241,6 +241,78 @@ SELECT a.SomeName
   assert.strictEqual(resolveAliasFromAst("e", parsed?.ast), "employee", "Join alias e should resolve to Employee in sanitized completion parses");
 });
 
+runCase("procedure-shape-department-table-resolves-and-missing-alias-column-stays-schema-validated", () => {
+  const schemaUri = "file:///regression/proc-shape-schema.sql";
+  const procUri = "file:///regression/proc-shape.sql";
+  const schemaSql = `
+CREATE TABLE dbo.Department (
+  DepartmentId INT,
+  DepartmentName NVARCHAR(200),
+  HeadEmployeeId INT
+);
+CREATE TABLE dbo.Employee (
+  EmployeeId INT,
+  DepartmentId INT,
+  FirstName NVARCHAR(100),
+  LastName NVARCHAR(100),
+  Email NVARCHAR(200)
+);
+CREATE TABLE dbo.ProjectEmployee (
+  ProjectId INT,
+  EmployeeId INT
+);
+`;
+
+  const procSql = `
+CREATE OR ALTER PROCEDURE AssignEmployeeToProject
+    @EmployeeId INT,
+    @ProjectId INT
+AS
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM [dbo].[ProjectEmployee] pe
+        WHERE pe.ProjectId = @ProjectId
+          AND pe.EmployeeId = @EmployeeId
+    )
+    BEGIN
+        INSERT INTO ProjectEmployee (ProjectId, EmployeeId)
+        VALUES (@ProjectId, @EmployeeId);
+    END;
+
+    SELECT e.EmployeeId
+           , e.DepartmentId
+           , e.DoesNotExits
+    FROM Employee e
+    WHERE e.DepartmentId = 23378;
+
+    UPDATE d
+    SET d.DepartmentName = 'X'
+    FROM [dbo].[Department] d
+    WHERE d.DepartmentId = 23378;
+END;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(procUri, procSql);
+
+  const hasDepartmentTable =
+    tablesByName.has("dbo.department")
+    || tablesByName.has("department");
+  assert.ok(hasDepartmentTable, "Department should be present in workspace schema index");
+  const departmentCols =
+    columnsByTable.get("dbo.department")
+    || columnsByTable.get("department");
+  assert.ok(departmentCols?.has("departmentid"), "Department columns should be present in workspace schema index");
+
+  const refs = getReferencesForUri(procUri);
+  const missingColRefs = refs.filter((r) => r.kind === "column" && normalizeName(r.name) === "employee.doesnotexits");
+  assert.ok(missingColRefs.length > 0, "Alias-qualified missing column should be indexed as employee.doesnotexits");
+
+  const deptTableRef = refs.find((r) => r.kind === "table" && normalizeName(r.name) === "department");
+  assert.ok(deptTableRef, "Department table token should be indexed in procedure shape");
+});
+
 runCase("unknown-table-alias-reference-is-not-schema-validated", () => {
   const uri = "file:///regression/unknown-table-alias.sql";
   const sql = `
@@ -437,6 +509,27 @@ WHERE d.EmployeeId > 0;
 
   indexText(uri, sql);
   assert.ok(getRefs("employee.employeeid").length > 0, "Derived table alias projected columns should be indexed through parser lineage");
+});
+
+runCase("derived-table-computed-alias-column-is-projected", () => {
+  const uri = "file:///regression/derived-table-computed-alias-column.sql";
+  const sql = `
+SELECT d.DepartmentId, e.EmployeeId, e.deptId
+FROM Department d
+LEFT JOIN (
+  SELECT EmployeeId, e.DepartmentId - 2 deptId, e.FirstName, hw.Prize
+  FROM Employee e
+  JOIN dbo.HackathonWinners hw ON hw.EmployeeId = e.EmployeeId
+) AS e ON d.DepartmentId = e.deptId;
+`;
+
+  const parsed = parseSql(sql);
+  const alias = findSymbol(parsed?.scope?.root, "Alias", "e");
+  assert.ok(alias, "Derived alias e should exist");
+
+  indexText(uri, sql);
+  const derivedDeptRefs = getRefs("e.deptid");
+  assert.ok(derivedDeptRefs.length > 0, "Computed derived projection should be indexed for derived alias usage");
 });
 
 runCase("system-table-validation-exemption-preconditions", () => {
@@ -884,6 +977,92 @@ AS
     getRefs("someview.column1").length > 0,
     "CREATE VIEW columns should be indexed when view body is a UNION/set-operator shape"
   );
+});
+
+runCase("complex-shape-unaliased-and-missing-table-column-indexing", () => {
+  const schemaUri = "file:///regression/complex-shape-schema.sql";
+  const queryUri = "file:///regression/complex-shape-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.Employee (
+  EmployeeId INT,
+  DepartmentId INT,
+  FirstName NVARCHAR(100),
+  LastName NVARCHAR(100),
+  Email NVARCHAR(200)
+);
+CREATE TABLE dbo.Department (
+  DepartmentId INT,
+  DepartmentName NVARCHAR(200)
+);
+`;
+
+  const querySql = `
+SELECT EmployeeId
+FROM dbo.Employee e
+JOIN dbo.Department d ON d.DepartmentId = e.DepartmentId;
+
+SELECT e.DoesNotExist
+FROM dbo.Employee e;
+
+SELECT e.EmployeeId
+FROM dbo.Employee e
+JOIN dbo.MissingTable mt ON mt.EmployeeId = e.EmployeeId;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+
+  const refs = getReferencesForUri(queryUri);
+
+  const missingTableRef = refs.find((r) =>
+    r.kind === "table"
+    && (normalizeName(r.name) === "dbo.missingtable" || normalizeName(r.name) === "missingtable")
+    && r.validateSchema === true
+  );
+  assert.ok(missingTableRef, "Missing table should be indexed for schema validation");
+
+  const missingColRef = refs.find((r) => r.kind === "column" && normalizeName(r.name) === "employee.doesnotexist");
+  assert.ok(missingColRef, "Missing qualified column should be indexed as employee.doesnotexist");
+
+  const parsed = parseSql(querySql);
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+  assert.ok(
+    diagnostics.some((d) => String(d.message).includes("Ambiguous column 'EmployeeId'")),
+    "Unaliased EmployeeId across two sources should emit ambiguity"
+  );
+});
+
+runCase("complex-shape-order-by-non-projected-column-indexing", () => {
+  const schemaUri = "file:///regression/orderby-non-projected-schema.sql";
+  const queryUri = "file:///regression/orderby-non-projected-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.Employee (
+  EmployeeId INT,
+  DepartmentId INT,
+  FirstName NVARCHAR(100)
+);
+`;
+
+  const querySql = `
+SELECT e.EmployeeId
+FROM dbo.Employee e
+ORDER BY e.FirstName;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+
+  const refs = getReferencesForUri(queryUri);
+  const orderByRef = refs.find((r) => r.kind === "column" && normalizeName(r.name) === "employee.firstname");
+  assert.ok(orderByRef, "ORDER BY non-projected qualified column should still be indexed");
 });
 
 process.stdout.write("All regression index tests passed.\n");

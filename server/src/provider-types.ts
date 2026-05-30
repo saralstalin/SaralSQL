@@ -52,6 +52,7 @@ export type DefinitionProviderDeps = {
   findDerivedAliasProjectedColumnRange: (doc: TextDocument, parsed: any, offset: number, tableName: string, colName: string) => Location[] | null;
   getResolutionSourceColumns: (resolution: any) => Array<{ table: string; column: string }>;
   resolveSymbolCaseInsensitive: (scope: any, symbolName: string) => any;
+  resolveAliasTableName: (sym: any) => string | undefined;
   getCteColumns: (sym: any) => any[];
 };
 

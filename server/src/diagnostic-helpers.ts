@@ -2,7 +2,8 @@ import { CodeAction, CodeActionKind, Diagnostic, DiagnosticSeverity, TextEdit } 
 import { isSqlKeyword, normalizeName, offsetToPosition } from "./text-utils";
 import { getCteColumns, getDisplaySymbolName, normalizeAstTableName, resolveAliasTableName, resolveSymbolCaseInsensitive } from "./ast-utils";
 import { extractReferences } from "@saralsql/tsql-parser";
-import { resolveBareColumnAtOffset } from "./column-resolution";
+import { resolveColumnAtOffset } from "./column-resolution";
+import { collectOrderByAliasStarts, collectOrderByDuplicateAliasStarts } from "./orderby-resolution";
 
 export const SARAL_DIAGNOSTIC_CODES = {
   UnknownTable: "LSP001",
@@ -228,12 +229,14 @@ export function collectAmbiguousColumnDiagnostics(
       continue;
     }
 
-    const resolved = resolveBareColumnAtOffset({
+    const resolved = resolveColumnAtOffset({
       parsed,
       offset: ref.location.start,
       columnName: name,
+      tokenText: name,
       tablesByName,
-      tableTypesByName
+      tableTypesByName,
+      resolverOptions: { allowQualifiedSchemaLookup: false }
     });
     if (hasSingleSelectSourceAtOffset(parsed?.ast, ref.location.start)) {
       continue;
@@ -395,111 +398,6 @@ function getReadScopeSourceCountAtOffset(
   return best?.sourceCount ?? null;
 }
 
-function collectOrderByAliasStarts(ast: any): Set<number> {
-  const starts = new Set<number>();
-
-  const visit = (node: any): void => {
-    if (!node || typeof node !== "object") {
-      return;
-    }
-
-    if (node.type === "SelectStatement" && Array.isArray(node.columns) && Array.isArray(node.orderBy)) {
-      const aliasCounts = new Map<string, number>();
-      for (const col of node.columns) {
-        const alias = normalizeName(String(col?.alias ?? col?.outputName ?? ""));
-        if (alias) {
-          aliasCounts.set(alias, (aliasCounts.get(alias) ?? 0) + 1);
-        }
-      }
-
-      if (aliasCounts.size > 0) {
-        for (const order of node.orderBy) {
-          const expr = order?.expression;
-          if (expr?.type !== "Identifier") {
-            continue;
-          }
-
-          const raw = Array.isArray(expr.parts) && expr.parts.length > 0
-            ? String(expr.parts[expr.parts.length - 1] ?? "")
-            : String(expr.name ?? "");
-          const norm = normalizeName(raw);
-          if (norm && (aliasCounts.get(norm) ?? 0) === 1 && typeof expr.start === "number") {
-            starts.add(expr.start);
-          }
-        }
-      }
-    }
-
-    if (Array.isArray(node)) {
-      for (const item of node) {
-        visit(item);
-      }
-      return;
-    }
-
-    for (const value of Object.values(node)) {
-      if (value && typeof value === "object") {
-        visit(value);
-      }
-    }
-  };
-
-  visit(ast);
-  return starts;
-}
-
-function collectOrderByDuplicateAliasStarts(ast: any): Set<number> {
-  const starts = new Set<number>();
-
-  const visit = (node: any): void => {
-    if (!node || typeof node !== "object") {
-      return;
-    }
-
-    if (node.type === "SelectStatement" && Array.isArray(node.columns) && Array.isArray(node.orderBy)) {
-      const aliasCounts = new Map<string, number>();
-      for (const col of node.columns) {
-        const alias = normalizeName(String(col?.alias ?? col?.outputName ?? ""));
-        if (alias) {
-          aliasCounts.set(alias, (aliasCounts.get(alias) ?? 0) + 1);
-        }
-      }
-
-      if (aliasCounts.size > 0) {
-        for (const order of node.orderBy) {
-          const expr = order?.expression;
-          if (expr?.type !== "Identifier") {
-            continue;
-          }
-
-          const raw = Array.isArray(expr.parts) && expr.parts.length > 0
-            ? String(expr.parts[expr.parts.length - 1] ?? "")
-            : String(expr.name ?? "");
-          const norm = normalizeName(raw);
-          if (norm && (aliasCounts.get(norm) ?? 0) > 1 && typeof expr.start === "number") {
-            starts.add(expr.start);
-          }
-        }
-      }
-    }
-
-    if (Array.isArray(node)) {
-      for (const item of node) {
-        visit(item);
-      }
-      return;
-    }
-
-    for (const value of Object.values(node)) {
-      if (value && typeof value === "object") {
-        visit(value);
-      }
-    }
-  };
-
-  visit(ast);
-  return starts;
-}
 
 function collectQualifiedIdentifierStarts(ast: any): Set<number> {
   const starts = new Set<number>();
@@ -570,13 +468,15 @@ export function collectReadableBareColumnDiagnostics(
 
     const scopeAtPos = parsed.scope.root.findInnermost?.(ref.location.start) ?? parsed.scope.root;
     const colNorm = normalizeName(name);
-    const resolved = resolveBareColumnAtOffset({
+    const resolved = resolveColumnAtOffset({
       parsed,
       offset: ref.location.start,
       columnName: name,
+      tokenText: name,
       tablesByName,
       tableTypesByName,
-      scopeAtPos
+      scopeAtPos,
+      resolverOptions: { allowQualifiedSchemaLookup: false }
     });
     if (resolved.status !== "resolved") {
       continue;
@@ -1266,7 +1166,7 @@ function inferStringLikeType(
   if (parts.length === 2) {
     const tableOrAlias = normalizeName(parts[0]);
     const columnName = normalizeName(parts[1]);
-    const owner = resolveTableForQualifier(scopeAtPos, statement, tableOrAlias, tablesByName, tableTypesByName);
+    const owner = resolveTableForQualifier(scopeAtPos, tableOrAlias, tablesByName, tableTypesByName);
     const col = owner?.columns?.find((c: any) => normalizeName(c.rawName ?? c.name) === columnName || normalizeName(c.name) === columnName);
     if (col?.type) {
       return { type: getStringLikeType(String(col.type)), rawName: String(node.name ?? parts.join(".")) };
@@ -1297,16 +1197,10 @@ function getStringLikeType(typeText: string): StringLikeSqlType | null {
 
 function resolveTableForQualifier(
   scopeAtPos: any,
-  statement: any,
   qualifier: string,
   tablesByName: Map<string, any>,
   tableTypesByName: Map<string, any>
 ): any | null {
-  const direct = tablesByName.get(qualifier) || tableTypesByName.get(qualifier);
-  if (direct) {
-    return direct;
-  }
-
   if (scopeAtPos) {
     const visibleSymbols = typeof scopeAtPos.getVisibleSymbols === "function"
       ? scopeAtPos.getVisibleSymbols()
@@ -1395,6 +1289,8 @@ function resolveSingleColumnOwner(
     }
   }
 
+  // Statement-local synthesis fallback only:
+  // if scope symbols are sparse, try tables explicitly present in this statement.
   if (matches.length === 0 && statement) {
     const statementTables = collectTablesFromAstNode(statement);
     for (const table of statementTables) {

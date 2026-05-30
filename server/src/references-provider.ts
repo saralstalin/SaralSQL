@@ -1,7 +1,7 @@
 import type { Location, Position } from "vscode-languageserver/node";
 import type { TextDocument } from "vscode-languageserver-textdocument";
 import { getWordRangeAtPosition, isSqlKeyword, normalizeName } from "./text-utils";
-import { resolveBareColumnAtOffset } from "./column-resolution";
+import { resolveColumnAtOffset } from "./column-resolution";
 import type { ParseResult } from "./sql-parser";
 import type { ReferenceDef } from "./definitions";
 import type { RefsProviderDeps } from "./provider-types";
@@ -31,13 +31,15 @@ export function isAmbiguousBareColumnAtPositionProvider(
   for (const def of deps.definitions.get(normUri) ?? []) {
     localDefsByName.set(normalizeName(def.name), def);
   }
-  const resolved = resolveBareColumnAtOffset({
+  const resolved = resolveColumnAtOffset({
     parsed,
     offset,
     columnName: rawWord,
+    tokenText: rawWord,
     tablesByName: deps.tablesByName,
     tableTypesByName: deps.tableTypesByName,
-    localDefsByName
+    localDefsByName,
+    resolverOptions: { allowQualifiedSchemaLookup: false }
   });
   return resolved.status === "ambiguous";
 }
@@ -82,7 +84,8 @@ export function findReferencesForWordProvider(
       for (const r of localArr) {
         pushLocFromRef(r);
       }
-    } else if (byUri) {
+    }
+    if (byUri) {
       for (const arr of byUri.values()) {
         for (const r of arr) {
           pushLocFromRef(r);
@@ -107,24 +110,25 @@ export function findReferencesForWordProvider(
     return results;
   }
 
-  const isBareColumnToken = !rawWord.includes(".") && !rawWord.startsWith("@") && !isSqlKeyword(rawNorm);
-  if (isBareColumnToken && position) {
+  if (position && !rawWord.startsWith("@") && !isSqlKeyword(rawNorm)) {
     const scopeAtPos = parsed?.scope?.root?.findInnermost(offset) ?? parsed?.scope?.root;
     const localDefsByName = new Map<string, any>();
     for (const def of deps.definitions.get(normUri) ?? []) {
       localDefsByName.set(normalizeName(def.name), def);
     }
-    const stmtOwner = deps.findStatementLocalColumnOwner(
-      deps.getCurrentStatement(doc, position),
-      rawWord,
-      scopeAtPos,
+    const resolved = resolveColumnAtOffset({
       parsed,
       offset,
+      columnName: rawWord,
+      tokenText: rawWord,
+      tablesByName: deps.tablesByName,
+      tableTypesByName: deps.tableTypesByName,
+      scopeAtPos,
       localDefsByName
-    );
-    if (stmtOwner?.ownerName) {
-      const ownerNorm = normalizeName(stmtOwner.ownerName);
-      const colNorm = normalizeName(rawWord);
+    });
+    if (resolved.status === "resolved" && resolved.owner?.ownerName) {
+      const ownerNorm = normalizeName(resolved.owner.ownerName);
+      const colNorm = normalizeName(rawWord.split(".").pop() ?? rawWord);
       const key = `${ownerNorm}.${colNorm}`;
       const byUri = deps.referencesIndex.get(key);
       const localArr = byUri?.get(normUri) ?? [];
@@ -132,7 +136,6 @@ export function findReferencesForWordProvider(
         for (const r of localArr) {
           pushLocFromRef(r);
         }
-        return results;
       }
       if (byUri) {
         for (const arr of byUri.values()) {
@@ -140,7 +143,6 @@ export function findReferencesForWordProvider(
             pushLocFromRef(r);
           }
         }
-        return results;
       }
     }
     return results;

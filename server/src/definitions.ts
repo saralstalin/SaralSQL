@@ -174,11 +174,13 @@ function addRefsToUriIndex(uri: string, refs: ReferenceDef[]): void {
 
 export function findColumnInTable(tableName: string, colName: string): Location[] {
     const results: Location[] = [];
+    const tableNorm = normalizeName(tableName);
+    const colNorm = normalizeName(colName);
     for (const defs of definitions.values()) {
         for (const def of defs) {
-            if (normalizeName(def.name) === normalizeName(tableName) && def.columns) {
+            if (normalizeName(def.name) === tableNorm && def.columns) {
                 for (const col of def.columns) {
-                    if (col.name === colName) {
+                    if (normalizeName(String(col.name ?? col.rawName ?? "")) === colNorm) {
                         const startChar = typeof (col as any).start === "number" ? (col as any).start : 0;
                         const endChar = typeof (col as any).end === "number" ? (col as any).end : 200;
                         results.push({
@@ -432,12 +434,33 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                 ? scopeAtPos.getVisibleSymbols()
                 : [];
             const refNorm = normalizeName(ref.name);
+            const rangeTokenNorm = normalizeName(String(text.slice(ref.location.start, ref.location.end)).trim());
+            let tableTokenNorm = rangeTokenNorm.includes(".") ? rangeTokenNorm : refNorm;
+            if (!tableTokenNorm.includes(".")) {
+                const lineageSources = Array.isArray(parsed?.lineage?.sources) ? parsed.lineage.sources : [];
+                for (const src of lineageSources) {
+                    const srcStart = Number(src?.location?.start);
+                    const srcEnd = Number(src?.location?.end);
+                    if (!Number.isFinite(srcStart) || !Number.isFinite(srcEnd)) {
+                        continue;
+                    }
+                    if (ref.location.start < srcStart || ref.location.end > srcEnd) {
+                        continue;
+                    }
+                    const baseName = normalizeName(String(src?.baseName ?? src?.name ?? ""));
+                    const baseTail = normalizeName(baseName.split(".").pop() ?? baseName);
+                    if (baseName && baseName.includes(".") && baseTail === tableTokenNorm) {
+                        tableTokenNorm = baseName;
+                        break;
+                    }
+                }
+            }
             const isAliasReference = visibleSymbols.some((sym: any) =>
                 sym?.kind === "Alias" && normalizeName(String(sym?.name ?? "")) === refNorm
             );
             processedTableRefs.add(`${ref.location.start}:${ref.location.end}`);
             localRefs.push({
-                name: normalizeName(ref.name),
+                name: tableTokenNorm,
                 uri: normUri,
                 line: refPos.line,
                 start: startChar,
@@ -446,6 +469,25 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                 context: ref.context,
                 validateSchema: ref.context !== "execute-target" && !isFunctionCall && !isAliasReference
             });
+            if (
+                !tableTokenNorm.includes(".")
+                && !tableTokenNorm.startsWith("#")
+                && !tableTokenNorm.startsWith("@")
+                && ref.context !== "execute-target"
+                && !isFunctionCall
+                && !isAliasReference
+            ) {
+                localRefs.push({
+                    name: `dbo.${tableTokenNorm}`,
+                    uri: normUri,
+                    line: refPos.line,
+                    start: startChar,
+                    end: endChar,
+                    kind: "table",
+                    context: ref.context,
+                    validateSchema: true
+                });
+            }
         } else if (ref.kind === "variable") {
             localRefs.push({
                 name: ref.name.toLowerCase(),
@@ -520,7 +562,19 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                                 start: startChar,
                                 end: endChar,
                                 kind: "column",
-                                validateSchema: tablesByName.has(normalizeName(String(input.source))) || tableTypesByName.has(normalizeName(String(input.source)))
+                                validateSchema: (() => {
+                                    const srcNorm = normalizeName(String(input.source));
+                                    const srcStripped = srcNorm.replace(/^dbo\./, "");
+                                    const srcDbo = srcStripped ? `dbo.${srcStripped}` : srcNorm;
+                                    return (
+                                        tablesByName.has(srcNorm)
+                                        || tablesByName.has(srcStripped)
+                                        || tablesByName.has(srcDbo)
+                                        || tableTypesByName.has(srcNorm)
+                                        || tableTypesByName.has(srcStripped)
+                                        || tableTypesByName.has(srcDbo)
+                                    );
+                                })()
                             });
                             resolved = true;
                         } else if (input.kind === "variable") {
@@ -549,7 +603,13 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                     let resolvedTable: string | null = null;
                     for (const sym of visibleSymbols) {
                         if (sym.kind === "Alias" && normalizeName(sym.name) === aliasOrTableNorm) {
-                            resolvedTable = resolveAliasTableName(sym) ?? normalizeName(String(sym.name ?? "")) ?? null;
+                            const aliasTarget =
+                                resolveAliasTableName(sym)
+                                ?? normalizeName(String(sym?.metadata?.tableName ?? ""))
+                                ?? normalizeName(String((sym?.location as any)?.table?.name ?? ""))
+                                ?? normalizeName(String((sym?.location as any)?.table ?? ""))
+                                ?? normalizeName(String(sym.name ?? ""));
+                            resolvedTable = aliasTarget || null;
                             break;
                         } else if ((sym.kind === "Table" || sym.kind === "TempTable" || sym.kind === "CTE") && normalizeName(sym.name) === aliasOrTableNorm) {
                             resolvedTable = sym.name;
@@ -571,6 +631,16 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
 
                     if (resolvedTable) {
                         const resolvedTableNorm = normalizeName(resolvedTable);
+                        const resolvedStripped = resolvedTableNorm.replace(/^dbo\./, "");
+                        const resolvedDbo = resolvedStripped ? `dbo.${resolvedStripped}` : resolvedTableNorm;
+                        const hasSchemaTarget = (
+                            tablesByName.has(resolvedTableNorm)
+                            || tablesByName.has(resolvedStripped)
+                            || tablesByName.has(resolvedDbo)
+                            || tableTypesByName.has(resolvedTableNorm)
+                            || tableTypesByName.has(resolvedStripped)
+                            || tableTypesByName.has(resolvedDbo)
+                        );
                         localRefs.push({
                             name: `${resolvedTableNorm}.${colNorm}`,
                             uri: normUri,
@@ -578,7 +648,7 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                             start: startChar,
                             end: endChar,
                             kind: "column",
-                            validateSchema: !resolvedFromFileAlias && !resolvedTableNorm.startsWith("#") && !functionCallNames.has(resolvedTableNorm)
+                            validateSchema: hasSchemaTarget && !resolvedTableNorm.startsWith("#") && !functionCallNames.has(resolvedTableNorm)
                         });
                     }
                 } else if (parts.length === 1) {
