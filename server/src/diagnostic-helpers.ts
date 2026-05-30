@@ -185,6 +185,11 @@ export function collectAmbiguousColumnDiagnostics(
   const orderByDuplicateAliasStarts = collectOrderByDuplicateAliasStarts(parsed.ast);
   const outputPseudoColumnStarts = collectOutputPseudoColumnStarts(parsed.ast);
   const readScopeRanges = collectReadScopeRanges(parsed);
+  const propertyAccessStarts = new Set<number>(
+    Array.isArray(parsed.columns?.propertyAccesses)
+      ? parsed.columns.propertyAccesses.map((p: any) => Number(p?.location?.start)).filter((n: number) => Number.isFinite(n))
+      : []
+  );
 
   for (const ref of refs) {
     if (!ref || (ref.kind !== "column" && ref.kind !== "unknown")) {
@@ -207,6 +212,9 @@ export function collectAmbiguousColumnDiagnostics(
       continue;
     }
     if (orderByAliasStarts.has(ref.location.start)) {
+      continue;
+    }
+    if (propertyAccessStarts.has(ref.location.start)) {
       continue;
     }
     if (orderByDuplicateAliasStarts.has(ref.location.start)) {
@@ -452,6 +460,11 @@ export function collectReadableBareColumnDiagnostics(
   const refs = extractReferences(parsed.ast) ?? [];
   const qualifiedIdentifierStarts = collectQualifiedIdentifierStarts(parsed.ast);
   const outputPseudoColumnStarts = collectOutputPseudoColumnStarts(parsed.ast);
+  const propertyAccessStarts = new Set<number>(
+    Array.isArray(parsed.columns?.propertyAccesses)
+      ? parsed.columns.propertyAccesses.map((p: any) => Number(p?.location?.start)).filter((n: number) => Number.isFinite(n))
+      : []
+  );
 
   for (const ref of refs) {
     if (!ref || (ref.kind !== "column" && ref.kind !== "unknown")) {
@@ -469,6 +482,9 @@ export function collectReadableBareColumnDiagnostics(
       continue;
     }
     if (outputPseudoColumnStarts.has(ref.location.start)) {
+      continue;
+    }
+    if (propertyAccessStarts.has(ref.location.start)) {
       continue;
     }
 

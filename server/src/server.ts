@@ -585,14 +585,68 @@ function getParserAliasColumnNames(parsed: ParseResult | null | undefined, sym: 
 
   // Expand wildcard projections in derived/subquery aliases using lineage source projections.
   // Example: SELECT d.*, e.Address ... FROM ... AS s
-  const queryCols = sym?.location?.table?.query?.columns;
-  if (Array.isArray(queryCols)) {
+  const collectQueryProjectionColumns = (query: any): any[] => {
+    if (!query || typeof query !== "object") { return []; }
+    if (Array.isArray(query.columns) && query.columns.length > 0) { return query.columns; }
+    if (query.type === "SetOperator") {
+      const left = collectQueryProjectionColumns(query.left);
+      if (left.length > 0) { return left; }
+      return collectQueryProjectionColumns(query.right);
+    }
+    return [];
+  };
+
+  const getQueryFroms = (query: any): any[] => {
+    if (!query || typeof query !== "object") { return []; }
+    if (Array.isArray(query.from)) { return query.from; }
+    if (query.type === "SetOperator") {
+      const left = getQueryFroms(query.left);
+      if (left.length > 0) { return left; }
+      return getQueryFroms(query.right);
+    }
+    return [];
+  };
+
+  const queryCols = collectQueryProjectionColumns(sym?.location?.table?.query);
+  if (Array.isArray(queryCols) && queryCols.length > 0) {
     for (const col of queryCols) {
       if (col?.type !== "Column" || col?.wildcard !== true || col?.expression?.type !== "WildcardExpression") {
         continue;
       }
       const prefix = normalizeName(String(col?.expression?.tablePrefix?.name ?? ""));
       if (!prefix) {
+        // Expand from all FROM sources of this derived query
+        const froms = getQueryFroms(sym?.location?.table?.query);
+        if (Array.isArray(froms)) {
+          const addFromTable = (tableName: string) => {
+            if (!tableName) return;
+            const stripped = tableName.replace(/^dbo\./, "");
+            const def = localDefsByName?.get(tableName)
+              || localDefsByName?.get(stripped)
+              || tablesByName.get(tableName)
+              || tablesByName.get(stripped)
+              || tableTypesByName.get(tableName)
+              || tableTypesByName.get(stripped);
+            if (def && Array.isArray(def.columns)) {
+              for (const c of def.columns) {
+                const raw = String(c?.rawName ?? c?.name ?? "").trim();
+                const norm = normalizeName(raw);
+                if (norm) {
+                  names.set(norm, raw);
+                }
+              }
+            }
+          };
+
+          for (const f of froms) {
+            addFromTable(normalizeName(String(f?.table?.name ?? f?.name ?? "")));
+            if (Array.isArray(f?.joins)) {
+              for (const j of f.joins) {
+                addFromTable(normalizeName(String(j?.table?.name ?? j?.name ?? "")));
+              }
+            }
+          }
+        }
         continue;
       }
       for (const source of sources) {
@@ -1812,6 +1866,45 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
             }
             const prefix = normalizeName(String(col?.expression?.tablePrefix?.name ?? ""));
             if (!prefix) {
+              const getQueryFroms = (query: any): any[] => {
+                if (!query || typeof query !== "object") { return []; }
+                if (Array.isArray(query.from)) { return query.from; }
+                if (query.type === "SetOperator") {
+                  const left = getQueryFroms(query.left);
+                  if (left.length > 0) { return left; }
+                  return getQueryFroms(query.right);
+                }
+                return [];
+              };
+              const froms = getQueryFroms(aliasSym?.location?.table?.query);
+              if (Array.isArray(froms)) {
+                const addFromTable = (tableName: string) => {
+                  if (!tableName) return;
+                  const stripped = tableName.replace(/^dbo\./, "");
+                  const def = localDefsByName.get(tableName)
+                    || localDefsByName.get(stripped)
+                    || tablesByName.get(tableName)
+                    || tablesByName.get(stripped)
+                    || tableTypesByName.get(tableName)
+                    || tableTypesByName.get(stripped);
+                  if (def && Array.isArray(def.columns)) {
+                    for (const c of def.columns) {
+                      const n = normalizeName(String(c?.rawName ?? c?.name ?? ""));
+                      if (n) {
+                        out.add(n);
+                      }
+                    }
+                  }
+                };
+                for (const f of froms) {
+                  addFromTable(normalizeName(String(f?.table?.name ?? f?.name ?? "")));
+                  if (Array.isArray(f?.joins)) {
+                    for (const j of f.joins) {
+                      addFromTable(normalizeName(String(j?.table?.name ?? j?.name ?? "")));
+                    }
+                  }
+                }
+              }
               continue;
             }
             for (const src of sources) {
@@ -1851,7 +1944,8 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
             if (aliasTarget) { return true; }
             // CROSS APPLY with TVF or .nodes(): location.table is a FunctionCall expression.
             // resolveAliasTableName returns undefined for these, but the alias is valid.
-            return String(s?.location?.table?.type ?? "") === "FunctionCall";
+            const tableType = String(s?.location?.table?.type ?? "");
+            return tableType === "FunctionCall" || tableType === "TableValuedFunction";
           });
       }
 
@@ -1938,6 +2032,10 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         }
 
         const refOffset = (lineStarts[ref.line] ?? 0) + ref.start;
+        if (propertyAccessStarts.has(refOffset)) {
+          continue;
+        }
+
         const refRangeText = getTextAtRange(ref.line, ref.start, ref.line, ref.end);
         const refNameFromRange = normalizeName(refRangeText.replace(/\s+/g, ""));
         const recoveredQualifiedUnknown = ref.kind === "unknown"
@@ -2372,7 +2470,7 @@ function isFunctionCallInAst(ast: any, functionNameNorm: string): { isFunc: bool
   let rawName = functionNameNorm;
   const visit = (n: any) => {
     if (!n || typeof n !== "object" || isFunc) {return;}
-    if (n.type === "FunctionCall" && normalizeName(n.name) === functionNameNorm) {
+    if ((n.type === "FunctionCall" || n.type === "TableValuedFunction") && normalizeName(n.name) === functionNameNorm) {
       isFunc = true;
       if (n.name) {rawName = n.name;}
       return;

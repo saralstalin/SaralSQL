@@ -186,7 +186,8 @@ function resolveSymbolColumns(
     // FunctionCall node so resolveAliasTableName returns undefined.  We can't look up
     // column types, but the alias is a valid scope source — return a passthrough entry
     // so hover shows "Column from TVF alias `v`" and definition doesn't silently fail.
-    if (String(sym?.location?.table?.type ?? "") === "FunctionCall") {
+    const tableType = String(sym?.location?.table?.type ?? "");
+    if (tableType === "FunctionCall" || tableType === "TableValuedFunction") {
       return {
         kindLabel: "TVF alias",
         ownerName: String(sym?.rawName ?? sym?.name ?? aliasDisplay),

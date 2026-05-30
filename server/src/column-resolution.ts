@@ -636,7 +636,8 @@ function resolveQualifiedFromSymbol(
       return null;
     }
 
-    if (String(sym?.location?.table?.type ?? "") === "FunctionCall") {
+    const tableType = String(sym?.location?.table?.type ?? "");
+    if (tableType === "FunctionCall" || tableType === "TableValuedFunction") {
       return {
         kindLabel: "TVF alias",
         ownerName: String(sym?.rawName ?? sym?.name ?? qualifierNorm),

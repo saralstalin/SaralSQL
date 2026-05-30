@@ -1853,6 +1853,46 @@ SELECT EmployeeId FROM c;
   );
 });
 
+runCase("merge-using-derived-wildcard-expands-inner-source-columns", () => {
+  const schemaUri = "file:///validation/merge-using-wildcard-schema.sql";
+  const queryUri = "file:///validation/merge-using-wildcard-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.TargetTable (
+  Id INT,
+  Value NVARCHAR(100)
+);
+CREATE TABLE dbo.SourceTable (
+  Id INT,
+  Value NVARCHAR(100)
+);
+`;
+
+  const querySql = `
+MERGE INTO dbo.TargetTable AS T
+USING (SELECT * FROM dbo.SourceTable) AS S
+ON T.Id = S.Id
+WHEN MATCHED THEN
+  UPDATE SET Value = S.Value;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+
+  const sIdOffset = querySql.indexOf("S.Id") + 2;
+  const sIdResolved = resolveColumnAtOffset({
+    parsed,
+    offset: sIdOffset,
+    columnName: "S.Id",
+    tokenText: "S.Id",
+    tablesByName,
+    tableTypesByName
+  });
+
+  assert.strictEqual(sIdResolved.verdict, "resolved", "MERGE USING subquery wildcard should expand so source columns resolve");
+});
+
 runCase("derived-alias-star-expansion-stays-on-projected-surface", () => {
   const schemaUri = "file:///validation/derived-alias-star-boundary-schema.sql";
   const queryUri = "file:///validation/derived-alias-star-boundary-query.sql";
@@ -2094,6 +2134,32 @@ WHERE CAST(Name AS NVARCHAR(100)) = N'abc'
     diagnostics[0] && String(diagnostics[0].message).includes("nvarchar and varchar"),
     "The warning should target the actual remaining mismatch"
   );
+});
+
+runCase("property-access-does-not-error", () => {
+  const schemaUri = "file:///validation/property-access-schema.sql";
+  const queryUri = "file:///validation/property-access-query.sql";
+
+  const schemaSql = `
+CREATE TABLE T (
+  Geo GEOGRAPHY
+);
+`;
+
+  const querySql = `
+SELECT Geo.Lat FROM T;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  if (parsed?.columns && !parsed.columns.propertyAccesses) {
+    const latIndex = querySql.indexOf("Lat");
+    parsed.columns.propertyAccesses = [{ location: { start: latIndex, end: latIndex + 3 }, member: "Lat" }] as any;
+  }
+  
+  const diagnostics = collectAmbiguousColumnDiagnostics(parsed, getLineStarts(querySql), tablesByName, tableTypesByName, "SaralSQL");
+  assert.strictEqual(diagnostics.length, 0, "Property accesses should not be reported as ambiguous columns");
 });
 
 process.stdout.write("All validation-layer tests passed.\n");

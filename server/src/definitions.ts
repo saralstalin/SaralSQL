@@ -424,7 +424,7 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
     const functionCallStarts = new Set<number>();
     const functionCallNames = new Set<string>();
     walkAst(parsed.ast, (node: any) => {
-        if (node?.type === "FunctionCall") {
+        if (node?.type === "FunctionCall" || node?.type === "TableValuedFunction") {
             const nameStart = typeof node.nameNode?.start === "number" ? node.nameNode.start : node.start;
             if (typeof nameStart === "number") {
                 functionCallStarts.add(nameStart);
