@@ -4,6 +4,7 @@ import { getWordRangeAtPosition, isSqlKeyword, normalizeName } from "./text-util
 import { resolveColumnAtOffset } from "./column-resolution";
 import type { ParseResult } from "./sql-parser";
 import type { ReferenceDef } from "./definitions";
+import { buildLocalDefsByName } from "./definitions";
 import type { RefsProviderDeps } from "./provider-types";
 
 export function isAmbiguousBareColumnAtPositionProvider(
@@ -27,10 +28,7 @@ export function isAmbiguousBareColumnAtPositionProvider(
 
   const offset = doc.offsetAt(position);
   const normUri = deps.toNormUri(doc.uri);
-  const localDefsByName = new Map<string, any>();
-  for (const def of deps.definitions.get(normUri) ?? []) {
-    localDefsByName.set(normalizeName(def.name), def);
-  }
+  const localDefsByName = buildLocalDefsByName(deps.definitions.get(normUri) ?? []);
   const resolved = resolveColumnAtOffset({
     parsed,
     offset,
@@ -59,6 +57,7 @@ export function findReferencesForWordProvider(
   const seen = new Set<string>();
 
   const pushLocFromRef = (r: ReferenceDef) => {
+    if (r.context === "alias-declaration") { return; }
     const key = `${r.uri}:${r.line}:${r.start}:${r.end}`;
     if (seen.has(key)) { return; }
     seen.add(key);
@@ -112,10 +111,7 @@ export function findReferencesForWordProvider(
 
   if (position && !rawWord.startsWith("@") && !isSqlKeyword(rawNorm)) {
     const scopeAtPos = parsed?.scope?.root?.findInnermost(offset) ?? parsed?.scope?.root;
-    const localDefsByName = new Map<string, any>();
-    for (const def of deps.definitions.get(normUri) ?? []) {
-      localDefsByName.set(normalizeName(def.name), def);
-    }
+    const localDefsByName = buildLocalDefsByName(deps.definitions.get(normUri) ?? []);
     const resolved = resolveColumnAtOffset({
       parsed,
       offset,

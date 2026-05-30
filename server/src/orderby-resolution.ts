@@ -49,53 +49,53 @@ function getOrderByExpressionName(expr: any): string {
 function collectOrderByStartsByUniqueness(ast: any, duplicates: boolean): Set<number> {
   const starts = new Set<number>();
 
-  const visit = (node: any): void => {
-    if (!node || typeof node !== "object") {
-      return;
+  // Collect every SelectStatement in the tree without descending INTO nested
+  // SelectStatements from within another SelectStatement — each SELECT's ORDER BY
+  // aliases are scoped to that SELECT only and must not bleed into sibling scopes.
+  const selects: any[] = [];
+  const collectSelects = (node: any): void => {
+    if (!node || typeof node !== "object") { return; }
+    if (node.type === "SelectStatement") {
+      selects.push(node);
+      // Deliberately do NOT recurse into this node's children here; nested
+      // SelectStatements will be pushed when we process subsequent array/object
+      // children at the top-level walk below.
     }
-
-    if (node.type === "SelectStatement" && Array.isArray(node.columns) && Array.isArray(node.orderBy)) {
-      const aliasCounts = new Map<string, number>();
-      for (const col of node.columns) {
-        const name = getSelectOutputName(col);
-        if (name) {
-          aliasCounts.set(name, (aliasCounts.get(name) ?? 0) + 1);
-        }
-      }
-
-      if (aliasCounts.size > 0) {
-        for (const order of node.orderBy) {
-          const expr = order?.expression;
-          if (typeof expr?.start !== "number") {
-            continue;
-          }
-          const name = getOrderByExpressionName(expr);
-          if (!name) {
-            continue;
-          }
-          const count = aliasCounts.get(name) ?? 0;
-          if (duplicates ? count > 1 : count === 1) {
-            starts.add(expr.start);
-          }
-        }
-      }
-    }
-
     if (Array.isArray(node)) {
-      for (const item of node) {
-        visit(item);
-      }
+      for (const item of node) { collectSelects(item); }
       return;
     }
-
     for (const value of Object.values(node)) {
-      if (value && typeof value === "object") {
-        visit(value);
-      }
+      if (value && typeof value === "object") { collectSelects(value); }
     }
   };
+  collectSelects(ast);
 
-  visit(ast);
+  for (const node of selects) {
+    if (!Array.isArray(node.columns) || !Array.isArray(node.orderBy)) { continue; }
+
+    const aliasCounts = new Map<string, number>();
+    for (const col of node.columns) {
+      const name = getSelectOutputName(col);
+      if (name) {
+        aliasCounts.set(name, (aliasCounts.get(name) ?? 0) + 1);
+      }
+    }
+
+    if (aliasCounts.size === 0) { continue; }
+
+    for (const order of node.orderBy) {
+      const expr = order?.expression;
+      if (typeof expr?.start !== "number") { continue; }
+      const name = getOrderByExpressionName(expr);
+      if (!name) { continue; }
+      const count = aliasCounts.get(name) ?? 0;
+      if (duplicates ? count > 1 : count === 1) {
+        starts.add(expr.start);
+      }
+    }
+  }
+
   return starts;
 }
 

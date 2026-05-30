@@ -265,8 +265,44 @@ export function resolveColumnAtOffset(
     }
   }
 
+  const lineageDerived = resolveQualifiedFromLineageDerived(params, qualifierNorm, columnNorm);
+  if (lineageDerived) {
+    return {
+      verdict: "resolved",
+      status: "resolved",
+      owner: lineageDerived,
+      owners: [lineageDerived],
+      matchedResolution: null,
+      ambiguityCandidates: [],
+      decisionReason: "qualified-lineage-derived-owner",
+      trace: { scopeType: "qualified", reason: "qualified-lineage-derived-owner", ownerCount: 1 }
+    };
+  }
+
+  const statementDerived = resolveQualifiedFromStatementDerivedAlias(params.parsed?.ast, params.offset, qualifierNorm, columnNorm);
+  if (statementDerived?.columnExists === true) {
+    return {
+      verdict: "resolved",
+      status: "resolved",
+      owner: {
+        kindLabel: "derived table",
+        ownerName: qualifierNorm,
+        column: { name: columnNorm, rawName: columnNorm },
+        alias: qualifierNorm
+      },
+      owners: [],
+      matchedResolution: null,
+      ambiguityCandidates: [],
+      decisionReason: "qualified-statement-derived-owner",
+      trace: { scopeType: "qualified", reason: "qualified-statement-derived-owner", ownerCount: 1 }
+    };
+  }
+
+  const lineageDerivedQualifierKnown = hasLineageDerivedQualifierKnowledge(params, qualifierNorm);
+  const statementDerivedQualifierKnown = statementDerived?.knownQualifier === true;
+
   return {
-    verdict: qualified.qualifierMatched ? "missing-column" : "unknown-owner",
+    verdict: (qualified.qualifierMatched || lineageDerivedQualifierKnown || statementDerivedQualifierKnown) ? "missing-column" : "unknown-owner",
     status: "unresolved",
     owners: [],
     matchedResolution: null,
@@ -274,7 +310,7 @@ export function resolveColumnAtOffset(
     decisionReason: "qualified-unresolved",
     trace: {
       scopeType: "qualified",
-      reason: qualified.qualifierMatched ? "qualified-owner-missing-column" : "qualified-owner-unresolved",
+      reason: (qualified.qualifierMatched || lineageDerivedQualifierKnown || statementDerivedQualifierKnown) ? "qualified-owner-missing-column" : "qualified-owner-unresolved",
       ownerCount: 0
     }
   };
@@ -290,11 +326,7 @@ function resolveQualifiedOwnerFromScope(
     return { owner: null, qualifierMatched: false };
   }
 
-  const visible = typeof scopeAtPos?.getVisibleSymbols === "function"
-    ? scopeAtPos.getVisibleSymbols()
-    : Object.values(scopeAtPos?.symbols ?? {});
-  const aliasCandidates = (visible as any[])
-    .filter((s: any) => s?.kind === "Alias" && normalizeName(String(s?.name ?? "")) === qualifierNorm);
+  const aliasCandidates = collectAliasCandidatesFromScopeChain(scopeAtPos, qualifierNorm);
   if (aliasCandidates.length > 0) {
     let anyKnown = false;
     for (const candidate of aliasCandidates) {
@@ -332,7 +364,148 @@ function resolveQualifiedOwnerFromScope(
   return { owner: null, qualifierMatched: false };
 }
 
+function resolveQualifiedFromLineageDerived(
+  params: ResolveParams,
+  qualifierNorm: string,
+  columnNorm: string
+): ScopeColumnOwner | null {
+  const sources = Array.isArray(params.parsed?.lineage?.sources) ? params.parsed.lineage.sources : [];
+  for (const src of sources) {
+    const aliasNorm = normalizeName(String(src?.alias ?? src?.name ?? ""));
+    if (aliasNorm !== qualifierNorm) {
+      continue;
+    }
+    const isDerived = normalizeName(String(src?.kind ?? "")) === "derived_subquery"
+      || Boolean(src?.location?.table?.query);
+    if (!isDerived) {
+      continue;
+    }
+    const projection = Array.isArray(src?.projection) ? src.projection : [];
+    for (const p of projection) {
+      const projNorm = normalizeName(String(p?.name ?? ""));
+      if (projNorm === columnNorm) {
+        return {
+          kindLabel: "derived table",
+          ownerName: String(src?.alias ?? src?.name ?? qualifierNorm),
+          column: { name: columnNorm, rawName: columnNorm },
+          alias: qualifierNorm
+        };
+      }
+    }
+  }
+  return null;
+}
+
+function hasLineageDerivedQualifierKnowledge(params: ResolveParams, qualifierNorm: string): boolean {
+  const sources = Array.isArray(params.parsed?.lineage?.sources) ? params.parsed.lineage.sources : [];
+  for (const src of sources) {
+    const aliasNorm = normalizeName(String(src?.alias ?? src?.name ?? ""));
+    if (aliasNorm !== qualifierNorm) {
+      continue;
+    }
+    const isDerived = normalizeName(String(src?.kind ?? "")) === "derived_subquery"
+      || Boolean(src?.location?.table?.query);
+    if (!isDerived) {
+      continue;
+    }
+    const projection = Array.isArray(src?.projection) ? src.projection : [];
+    if (projection.length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function resolveQualifiedFromStatementDerivedAlias(
+  ast: any,
+  offset: number,
+  qualifierNorm: string,
+  columnNorm: string
+): { knownQualifier: boolean; columnExists: boolean } | null {
+  const select = findContainingSelectAtOffset(ast, offset);
+  if (!select || !Array.isArray(select.from)) {
+    return null;
+  }
+
+  const allSources: any[] = [];
+  for (const src of select.from) {
+    if (src) {
+      allSources.push(src);
+    }
+    if (Array.isArray(src?.joins)) {
+      for (const join of src.joins) {
+        if (join?.table) {
+          allSources.push(join.table);
+        }
+      }
+    }
+  }
+
+  for (const source of allSources) {
+    const aliasNorm = normalizeName(String(source?.alias ?? source?.tableAlias ?? ""));
+    if (!aliasNorm || aliasNorm !== qualifierNorm) {
+      continue;
+    }
+    const queryColumns = source?.query?.columns;
+    if (!Array.isArray(queryColumns)) {
+      return { knownQualifier: true, columnExists: false };
+    }
+    const projected = new Set<string>();
+    for (const c of queryColumns) {
+      if (!c || c?.wildcard === true) {
+        continue;
+      }
+      const alias = normalizeName(String(c?.alias ?? c?.name ?? ""));
+      if (alias) {
+        projected.add(alias);
+      }
+    }
+    return {
+      knownQualifier: true,
+      columnExists: projected.has(columnNorm)
+    };
+  }
+
+  return null;
+}
+
+function collectAliasCandidatesFromScopeChain(scopeAtPos: any, qualifierNorm: string): any[] {
+  const out: any[] = [];
+  const seen = new Set<any>();
+  let current: any = scopeAtPos;
+  while (current) {
+    const ownSymbols = typeof current?.getOwnSymbols === "function"
+      ? current.getOwnSymbols()
+      : Object.values(current?.symbols ?? {});
+    for (const sym of ownSymbols as any[]) {
+      if (!sym || seen.has(sym)) {
+        continue;
+      }
+      const kindNorm = normalizeName(String(sym?.kind ?? ""));
+      const isAliasKind = kindNorm === "alias";
+      const isDerivedSurface = Boolean(sym?.location?.table?.query);
+      if (!isAliasKind && !isDerivedSurface) {
+        continue;
+      }
+      if (normalizeName(String(sym?.name ?? "")) !== qualifierNorm) {
+        continue;
+      }
+      seen.add(sym);
+      out.push(sym);
+    }
+    current = current.parent ?? null;
+  }
+  return out;
+}
+
 function hasColumnKnowledgeForSymbol(params: ResolveParams, scopeAtPos: any, sym: any): boolean {
+  if (Boolean(sym?.location?.table?.query)) {
+    const projected = getAliasProjectedColumns(params, sym);
+    if (projected.size > 0) {
+      return true;
+    }
+  }
+
   if (Array.isArray(sym?.columns) && sym.columns.length > 0) {
     return true;
   }
@@ -342,6 +515,12 @@ function hasColumnKnowledgeForSymbol(params: ResolveParams, scopeAtPos: any, sym
   }
 
   if (sym?.kind === "Alias") {
+    if (Boolean(sym?.location?.table?.query)) {
+      // Only claim column knowledge when we can enumerate the projected columns.
+      // Zero-column derived aliases (e.g. FOR XML/JSON subqueries) are opaque —
+      // returning true here would cause false "missing-column" verdicts.
+      return getAliasProjectedColumns(params, sym).size > 0;
+    }
     const projected = getAliasProjectedColumns(params, sym);
     if (projected.size > 0) {
       return true;
@@ -364,6 +543,14 @@ function hasColumnKnowledgeForSymbol(params: ResolveParams, scopeAtPos: any, sym
       }
     }
     return false;
+  }
+
+  if ((sym?.kind === "Variable" || sym?.kind === "Parameter") && sym.dataType) {
+    const typeKey = normalizeName(String(sym.dataType));
+    const typeDef = params.tableTypesByName.get(typeKey) || params.tablesByName.get(typeKey);
+    if (Array.isArray(typeDef?.columns) && typeDef.columns.length > 0) {
+      return true;
+    }
   }
 
   const symName = normalizeName(String(sym?.name ?? ""));
@@ -389,6 +576,18 @@ function resolveQualifiedFromSymbol(
   qualifierNorm: string,
   columnNorm: string
 ): ScopeColumnOwner | null {
+  if (Boolean(sym?.location?.table?.query)) {
+    const projected = getAliasProjectedColumns(params, sym);
+    if (projected.has(columnNorm)) {
+      return {
+        kindLabel: "derived table",
+        ownerName: String(sym?.rawName ?? sym?.name ?? qualifierNorm),
+        column: { name: columnNorm, rawName: columnNorm },
+        alias: normalizeName(String(sym?.name ?? ""))
+      };
+    }
+  }
+
   if (Array.isArray(sym?.columns) && sym.columns.length > 0) {
     const col = findColumn(sym.columns, columnNorm);
     if (col) {
@@ -432,6 +631,20 @@ function resolveQualifiedFromSymbol(
       };
     }
 
+    // TVF / .nodes() APPLY alias: location.table is a FunctionCall — passthrough so hover works.
+    if (Boolean(sym?.location?.table?.query)) {
+      return null;
+    }
+
+    if (String(sym?.location?.table?.type ?? "") === "FunctionCall") {
+      return {
+        kindLabel: "TVF alias",
+        ownerName: String(sym?.rawName ?? sym?.name ?? qualifierNorm),
+        column: { name: columnNorm, rawName: columnNorm },
+        alias: normalizeName(String(sym?.name ?? ""))
+      };
+    }
+
     const aliasTarget = normalizeName(resolveAliasTableName(sym) ?? "");
     if (!aliasTarget) {
       return null;
@@ -456,6 +669,22 @@ function resolveQualifiedFromSymbol(
     return null;
   }
 
+  if (sym?.kind === "Variable" || sym?.kind === "Parameter") {
+    if (sym.dataType) {
+      const typeKey = normalizeName(String(sym.dataType));
+      const typeDef = params.tableTypesByName.get(typeKey) || params.tablesByName.get(typeKey);
+      const col = findColumn(typeDef?.columns ?? [], columnNorm);
+      if (col) {
+        return {
+          kindLabel: "table type",
+          ownerName: String(sym?.rawName ?? sym?.name ?? qualifierNorm),
+          column: col,
+          alias: normalizeName(String(sym?.name ?? ""))
+        };
+      }
+    }
+  }
+
   const symName = normalizeName(String(sym?.name ?? ""));
   if (symName) {
     const owner = resolveCandidateOwner(params, symName, columnNorm);
@@ -470,11 +699,12 @@ function resolveQualifiedFromSymbol(
 function getAliasProjectedColumns(params: ResolveParams, sym: any): Set<string> {
   const names = new Set<string>();
   const aliasName = normalizeName(sym?.name ?? "");
+  const isDerivedAlias = Boolean(sym?.location?.table?.query);
   if (!aliasName) {
     return names;
   }
 
-  if (Array.isArray(sym?.columns)) {
+  if (!isDerivedAlias && Array.isArray(sym?.columns)) {
     for (const col of sym.columns) {
       const n = normalizeName(String(col?.rawName ?? col?.name ?? col ?? ""));
       if (n) {
@@ -962,6 +1192,17 @@ function resolveMutationTargetOwner(params: ResolveParams, colNorm: string): Sco
       return aliasOwner;
     }
 
+    // For MERGE, also try the target alias (e.g. "t" in MERGE Employee AS t …)
+    if (stmt.type === "MergeStatement") {
+      const mergeAlias = normalizeName(String(stmt?.targetAlias ?? ""));
+      if (mergeAlias) {
+        const aliasOwnerFromMerge = resolveAliasMutationTargetOwner(scopeAtPos, mergeAlias, params, colNorm);
+        if (aliasOwnerFromMerge) {
+          return aliasOwnerFromMerge;
+        }
+      }
+    }
+
     const owner = resolveCandidateOwner(params, targetName, colNorm);
     if (owner) {
       return owner;
@@ -982,7 +1223,7 @@ function collectMutationStatementsAtOffset(ast: any, offset: number): any[] {
     if (Number.isFinite(start) && Number.isFinite(end) && (offset < start || offset > end)) {
       return;
     }
-    if (node?.type === "UpdateStatement" || node?.type === "DeleteStatement") {
+    if (node?.type === "UpdateStatement" || node?.type === "DeleteStatement" || node?.type === "MergeStatement") {
       matches.push(node);
     }
     if (Array.isArray(node)) {

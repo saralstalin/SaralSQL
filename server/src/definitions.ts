@@ -37,7 +37,7 @@ export interface ReferenceDef {
     start: number;
     end: number;
     kind: "table" | "column" | "parameter";
-    context?: ExtractedReferenceContext | "create-definition";
+    context?: ExtractedReferenceContext | "create-definition" | "alias-declaration";
     validateSchema?: boolean;
 }
 
@@ -49,6 +49,7 @@ const referencesByUri = new Map<string, Map<number, ReferenceDef[]>>();
 export const tablesByName = indexStore.tablesByName as Map<string, SymbolDef>;
 export const tableTypesByName = indexStore.tableTypesByName as Map<string, SymbolDef>;
 export const tempTablesByUri = indexStore.tempTablesByUri as Map<string, Map<string, { columns: Set<string>; declaredAt: number }>>;
+export const tableReferencersByName = indexStore.tableReferencersByName as Map<string, Set<string>>;
 
 const MAX_FILE_SIZE_BYTES = 250 * 1024;  // 250 KB (skip larger files)
 const DEPLOY_BLOCK_SUBSTRING = "deploy"; // block any path that contains this substring
@@ -69,6 +70,19 @@ export function setRefsForFile(name: string, uri: string, refs: ReferenceDef[]) 
     removeRefsFromUriIndex(name, uri);
     byUri.set(uri, refs);
     addRefsToUriIndex(uri, refs);
+    // Maintain reverse dependency index: table name → set of referencing URIs.
+    const tableKey = tableKeyFromRefName(name);
+    if (tableKey) {
+        let uris = tableReferencersByName.get(tableKey);
+        if (!uris) { uris = new Set(); tableReferencersByName.set(tableKey, uris); }
+        uris.add(uri);
+    }
+}
+
+function tableKeyFromRefName(refName: string): string {
+    const n = normalizeName(refName);
+    const dot = n.lastIndexOf(".");
+    return dot > 0 ? n.slice(0, dot) : n;
 }
 
 export function deleteRefsForFile(uri: string) {
@@ -77,6 +91,11 @@ export function deleteRefsForFile(uri: string) {
         if (byUri.size === 0) { referencesIndex.delete(name); }
     }
     referencesByUri.delete(uri);
+    // Clean up reverse dependency index
+    for (const [tableKey, uris] of Array.from(tableReferencersByName.entries())) {
+        uris.delete(uri);
+        if (uris.size === 0) { tableReferencersByName.delete(tableKey); }
+    }
 }
 
 export function getRefs(name: string): ReferenceDef[] {
@@ -513,13 +532,30 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
             const qualifierNorm = parts.length === 2 ? normalizeName(parts[0].trim()) : "";
             const explicitQualified = parts.length === 2 && qualifierNorm.length > 0;
             let explicitQualifiedTarget: string | null = null;
+            let explicitQualifiedDerivedAlias = false;
+            let explicitQualifiedDerivedProjected = new Set<string>();
             if (explicitQualified) {
                 if (qualifierNorm.startsWith("@") || qualifierNorm.startsWith("#")) {
                     explicitQualifiedTarget = qualifierNorm;
                 } else {
                     for (const sym of visibleSymbols) {
                         if (sym.kind === "Alias" && normalizeName(sym.name) === qualifierNorm) {
-                            explicitQualifiedTarget = normalizeName(resolveAliasTableName(sym) ?? "");
+                            if (Boolean((sym as any)?.location?.table?.query)) {
+                                // Derived alias projection is a sealed surface. Keep alias ownership local.
+                                explicitQualifiedTarget = qualifierNorm;
+                                explicitQualifiedDerivedAlias = true;
+                                const cols = (sym as any)?.location?.table?.query?.columns;
+                                if (Array.isArray(cols)) {
+                                    for (const c of cols) {
+                                        const projected = extractSelectProjectedColumnName(c);
+                                        if (projected) {
+                                            explicitQualifiedDerivedProjected.add(projected);
+                                        }
+                                    }
+                                }
+                            } else {
+                                explicitQualifiedTarget = normalizeName(resolveAliasTableName(sym) ?? "");
+                            }
                             break;
                         }
                         if ((sym.kind === "Table" || sym.kind === "TempTable" || sym.kind === "CTE") && normalizeName(sym.name) === qualifierNorm) {
@@ -551,9 +587,25 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                         if (input.kind === "column" && input.source) {
                             if (explicitQualifiedTarget) {
                                 const inputSourceNorm = normalizeName(String(input.source));
-                                if (inputSourceNorm !== explicitQualifiedTarget) {
+                                if (!explicitQualifiedDerivedAlias && inputSourceNorm !== explicitQualifiedTarget) {
                                     continue;
                                 }
+                            }
+                            if (explicitQualifiedDerivedAlias) {
+                                if (explicitQualifiedDerivedProjected.size > 0 && !explicitQualifiedDerivedProjected.has(colNameNorm)) {
+                                    continue;
+                                }
+                                localRefs.push({
+                                    name: `${qualifierNorm}.${normalizeName(input.name.split('.').pop()!)}`,
+                                    uri: normUri,
+                                    line: refPos.line,
+                                    start: startChar,
+                                    end: endChar,
+                                    kind: "column",
+                                    validateSchema: false
+                                });
+                                resolved = true;
+                                continue;
                             }
                             localRefs.push({
                                 name: `${normalizeName(input.source)}.${normalizeName(input.name.split('.').pop()!)}`,
@@ -601,15 +653,24 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                     const colNorm = normalizeName(col);
 
                     let resolvedTable: string | null = null;
+                    let resolvedFromDerivedAlias = false;
                     for (const sym of visibleSymbols) {
                         if (sym.kind === "Alias" && normalizeName(sym.name) === aliasOrTableNorm) {
-                            const aliasTarget =
-                                resolveAliasTableName(sym)
-                                ?? normalizeName(String(sym?.metadata?.tableName ?? ""))
-                                ?? normalizeName(String((sym?.location as any)?.table?.name ?? ""))
-                                ?? normalizeName(String((sym?.location as any)?.table ?? ""))
-                                ?? normalizeName(String(sym.name ?? ""));
-                            resolvedTable = aliasTarget || null;
+                            const symLocation: any = sym?.location;
+                            if (Boolean(symLocation?.table?.query)) {
+                                // Derived alias columns belong to the projected surface (alias),
+                                // not to inner source tables.
+                                resolvedTable = aliasOrTableNorm;
+                                resolvedFromDerivedAlias = true;
+                            } else {
+                                const aliasTarget =
+                                    resolveAliasTableName(sym)
+                                    ?? normalizeName(String(sym?.metadata?.tableName ?? ""))
+                                    ?? normalizeName(String(symLocation?.table?.name ?? ""))
+                                    ?? normalizeName(String(symLocation?.table ?? ""))
+                                    ?? normalizeName(String(sym.name ?? ""));
+                                resolvedTable = aliasTarget || null;
+                            }
                             break;
                         } else if ((sym.kind === "Table" || sym.kind === "TempTable" || sym.kind === "CTE") && normalizeName(sym.name) === aliasOrTableNorm) {
                             resolvedTable = sym.name;
@@ -631,6 +692,9 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
 
                     if (resolvedTable) {
                         const resolvedTableNorm = normalizeName(resolvedTable);
+                        if (resolvedFromDerivedAlias && explicitQualifiedDerivedProjected.size > 0 && !explicitQualifiedDerivedProjected.has(colNorm)) {
+                            continue;
+                        }
                         const resolvedStripped = resolvedTableNorm.replace(/^dbo\./, "");
                         const resolvedDbo = resolvedStripped ? `dbo.${resolvedStripped}` : resolvedTableNorm;
                         const hasSchemaTarget = (
@@ -1067,15 +1131,23 @@ function indexQualifiedColumnReferencesFromAst(
         const tableName = resolveAliasTableName(sym) ?? normalizeName(String(sym.name ?? ""));
         if (!tableName) { return; }
 
+        const tableNorm = normalizeName(tableName);
+        const tableStripped = tableNorm.replace(/^dbo\./, "");
+        const tableDbo = tableStripped ? `dbo.${tableStripped}` : tableNorm;
+        const isKnownTable = (
+            tablesByName.has(tableNorm) || tablesByName.has(tableStripped) || tablesByName.has(tableDbo)
+            || tableTypesByName.has(tableNorm) || tableTypesByName.has(tableStripped) || tableTypesByName.has(tableDbo)
+        );
+
         const pos = offsetToPosition(node.start, lineStarts);
         localRefs.push({
-            name: `${normalizeName(tableName)}.${columnName}`,
+            name: `${tableNorm}.${columnName}`,
             uri: normUri,
             line: pos.line,
             start: node.start - lineStarts[pos.line],
             end: (node.end ?? node.start + String(node.name).length) - lineStarts[pos.line],
             kind: "column",
-            validateSchema: false
+            validateSchema: isKnownTable
         });
     });
 }
@@ -1284,6 +1356,7 @@ function indexAliasReferencesFromAst(
             start: aliasRange.start - lineStarts[pos.line],
             end: aliasRange.end - lineStarts[pos.line],
             kind: "table",
+            context: "alias-declaration",
             validateSchema: false
         });
     });
@@ -1608,6 +1681,14 @@ function addVariableRef(
         end: endOffset - lineStarts[pos.line],
         kind: "parameter"
     });
+}
+
+export function buildLocalDefsByName(defs: SymbolDef[]): Map<string, SymbolDef> {
+    const map = new Map<string, SymbolDef>();
+    for (const def of defs) {
+        map.set(normalizeName(def.name), def);
+    }
+    return map;
 }
 
 export function parseColumnsFromCreateView(viewText: string, fileStartLine = 0): ColumnDef[] {

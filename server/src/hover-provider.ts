@@ -5,6 +5,7 @@ import { normalizeName } from "./text-utils";
 import type { HoverProviderDeps } from "./provider-types";
 import { isOrderByDuplicateOutputAtOffset } from "./orderby-resolution";
 import { resolveColumnAtOffset } from "./column-resolution";
+import { buildLocalDefsByName } from "./definitions";
 
 function getColumnTypeText(col: any): string | undefined {
   const raw = col?.type ?? col?.dataType ?? col?.sqlType ?? col?.declaredType ?? col?.returnType;
@@ -136,10 +137,7 @@ export async function doHoverProvider(
       return { contents: { kind: MarkupKind.Markdown, value }, range };
     }
     const localDefs = deps.definitions.get(normUri) ?? [];
-    const localDefsByName = new Map<string, any>();
-    for (const def of localDefs) {
-      localDefsByName.set(normalizeName(def.name), def);
-    }
+    const localDefsByName = buildLocalDefsByName(localDefs);
 
     if (!match) {
       const word = normalizeName(wordRangeText);
@@ -324,15 +322,23 @@ export async function doHoverProvider(
 
     if (match.kind === "column") {
       const tokenText = String(wordRangeText ?? match.name ?? "").trim();
+      // For bare tokens (no dot in wordRangeText) use the bare word so that
+      // INSERT..SELECT context narrowing applies — match.name may be pre-qualified with
+      // the wrong table if the parser attributed the column to the INSERT target.
+      // For qualified tokens (e.g. "e.FirstName") prefer match.name which has the
+      // alias already resolved to the real table name ("employee.firstname"), allowing
+      // schema lookup even when the alias is not in scope (e.g. UPDATE SET columns).
+      const isBareToken = !tokenText.includes(".");
+      const resolvedTokenText = isBareToken ? tokenText : (String(match.name ?? tokenText).trim() || tokenText);
       const resolved = resolveColumnAtOffset({
         parsed,
         offset,
-        columnName: tokenText,
-        tokenText,
+        columnName: resolvedTokenText,
+        tokenText: resolvedTokenText,
         tablesByName: deps.tablesByName,
         tableTypesByName: deps.tableTypesByName,
         localDefsByName,
-        resolverOptions: { allowQualifiedSchemaLookup: false }
+        resolverOptions: { allowQualifiedSchemaLookup: !isBareToken }
       });
       if (resolved.status === "resolved" && resolved.owner?.column) {
         const ownerType = getDisplayColumnType(

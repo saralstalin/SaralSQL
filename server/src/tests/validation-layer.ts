@@ -4,7 +4,7 @@ import { parseSql } from "../sql-parser";
 import { getLineStarts, normalizeName } from "../text-utils";
 import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, buildSelectStarExpansionCodeActions, buildUpdateNoLockCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "../diagnostic-helpers";
 import { indexText, definitions, referencesIndex, columnsByTable, tablesByName, tableTypesByName, aliasesByUri } from "../definitions";
-import { resolveBareColumnAtOffset } from "../column-resolution";
+import { resolveBareColumnAtOffset, resolveColumnAtOffset } from "../column-resolution";
 
 function resetState(): void {
   aliasesByUri.clear();
@@ -1635,6 +1635,69 @@ WHERE FirstName IS NOT NULL;
     resolved.status,
     "unresolved",
     "Outer scope must not see non-projected inner source columns through derived alias"
+  );
+});
+
+runCase("derived-alias-exposes-projected-names-not-inner-source-names", () => {
+  const schemaUri = "file:///validation/derived-projected-names-schema.sql";
+  const queryUri = "file:///validation/derived-projected-names-query.sql";
+
+  const schemaSql = `
+CREATE TABLE Department (
+  DepartmentId INT
+);
+CREATE TABLE Employee (
+  EmployeeId INT,
+  DepartmentId INT,
+  FirstName NVARCHAR(100)
+);
+CREATE TABLE HackathonWinners (
+  EmployeeId INT,
+  Prize NVARCHAR(100)
+);
+`;
+
+  const querySql = `
+SELECT d.DepartmentId, e.EmployeeId, e.deptId, e.Prize
+FROM Department d
+LEFT JOIN (
+  SELECT EmployeeId, e.DepartmentId - 2 AS deptId, e.FirstName AS Name, hw.Prize
+  FROM Employee e
+  JOIN dbo.HackathonWinners hw ON hw.EmployeeId = e.EmployeeId
+) AS e ON d.DepartmentId = e.deptId
+WHERE e.Name IS NOT NULL AND e.FirstName IS NOT NULL;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const firstNameOffset = querySql.indexOf("e.FirstName");
+  assert.ok(firstNameOffset >= 0, "e.FirstName token must exist");
+  const nameOffset = querySql.indexOf("e.Name");
+  assert.ok(nameOffset >= 0, "e.Name token must exist");
+
+  const nameResolved = resolveColumnAtOffset({
+    parsed,
+    offset: nameOffset + 2,
+    columnName: "e.Name",
+    tokenText: "e.Name",
+    tablesByName,
+    tableTypesByName
+  });
+  assert.strictEqual(nameResolved.verdict, "resolved", "Derived alias should expose projected alias name");
+
+  const firstNameResolved = resolveColumnAtOffset({
+    parsed,
+    offset: firstNameOffset + 2,
+    columnName: "e.FirstName",
+    tokenText: "e.FirstName",
+    tablesByName,
+    tableTypesByName
+  });
+  assert.notStrictEqual(
+    firstNameResolved.verdict,
+    "unknown-owner",
+    "Qualified derived alias should be recognized as an in-scope owner"
   );
 });
 

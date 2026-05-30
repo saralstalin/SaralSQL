@@ -3,6 +3,7 @@ import type { TextDocument } from "vscode-languageserver-textdocument";
 import { normalizeName, isSqlKeyword } from "./text-utils";
 import type { DefinitionProviderDeps } from "./provider-types";
 import { resolveColumnAtOffset } from "./column-resolution";
+import { buildLocalDefsByName } from "./definitions";
 
 export async function onDefinitionProvider(
   doc: TextDocument,
@@ -12,10 +13,7 @@ export async function onDefinitionProvider(
   const normUri = deps.toNormUri(doc.uri);
   const parsed = deps.getParsedDocument(doc);
   const offset = doc.offsetAt(position);
-  const localDefsByName = new Map<string, any>();
-  for (const def of deps.definitions.get(normUri) ?? []) {
-    localDefsByName.set(normalizeName(def.name), def);
-  }
+  const localDefsByName = buildLocalDefsByName(deps.definitions.get(normUri) ?? []);
 
   const match = deps.findReferenceAtPosition(normUri, position.line, position.character);
   if (deps.isAmbiguousBareColumnAtPosition(doc, position, parsed)) {
@@ -141,7 +139,8 @@ export async function onDefinitionProvider(
   if (match.kind === "column") {
     const tokenRange = deps.getWordRangeAtPosition(doc, position);
     const token = tokenRange ? doc.getText(tokenRange) : match.name;
-    const tokenForResolve = token.includes(".") ? token : String(match.name ?? token);
+    const isBareToken = !token.includes(".");
+    const tokenForResolve = isBareToken ? token : (String(match.name ?? token).trim() || token);
     const resolved = resolveColumnAtOffset({
       parsed,
       offset,
@@ -150,7 +149,7 @@ export async function onDefinitionProvider(
       tablesByName: deps.tablesByName,
       tableTypesByName: deps.tableTypesByName,
       localDefsByName,
-      resolverOptions: { allowQualifiedSchemaLookup: false }
+      resolverOptions: { allowQualifiedSchemaLookup: !isBareToken }
     });
     if (resolved.status === "resolved" && resolved.owner?.ownerName && resolved.owner?.column) {
       const colName = String(resolved.owner.column?.name ?? resolved.owner.column?.rawName ?? "");

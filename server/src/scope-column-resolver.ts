@@ -76,14 +76,17 @@ function hasColumnBearingLocalSource(
 function hasPotentialLocalSourceSymbol(symbols: any[]): boolean {
   for (const sym of symbols) {
     const kind = String(sym?.kind ?? "");
-    if (
-      kind === "Alias"
-      || kind === "Table"
-      || kind === "TempTable"
-      || kind === "CTE"
-      || kind === "Variable"
-      || kind === "Parameter"
-    ) {
+    if (kind === "Table" || kind === "TempTable" || kind === "CTE" || kind === "Variable" || kind === "Parameter") {
+      return true;
+    }
+    if (kind === "Alias") {
+      // A derived alias (subquery source) with zero projected columns is opaque —
+      // e.g. a FOR XML/JSON subquery whose shape the parser cannot enumerate.
+      // Don't treat it as a local source blocker; let the scope walk continue.
+      const isDerived = Boolean(sym?.location?.table?.query);
+      if (isDerived && !(Array.isArray(sym?.columns) && sym.columns.length > 0)) {
+        continue;
+      }
       return true;
     }
   }
@@ -177,6 +180,20 @@ function resolveSymbolColumns(
         };
       }
       return null;
+    }
+
+    // CROSS APPLY / OUTER APPLY with a TVF or .nodes() call: location.table is a
+    // FunctionCall node so resolveAliasTableName returns undefined.  We can't look up
+    // column types, but the alias is a valid scope source — return a passthrough entry
+    // so hover shows "Column from TVF alias `v`" and definition doesn't silently fail.
+    if (String(sym?.location?.table?.type ?? "") === "FunctionCall") {
+      return {
+        kindLabel: "TVF alias",
+        ownerName: String(sym?.rawName ?? sym?.name ?? aliasDisplay),
+        column: { name: colNorm, rawName: colNorm },
+        alias: normalizeName(String(sym?.name ?? "")),
+        displayAlias: aliasDisplay
+      };
     }
 
     const targetName = normalizeName(resolveAliasTableName(sym) ?? "");

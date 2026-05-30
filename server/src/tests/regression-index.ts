@@ -530,6 +530,27 @@ LEFT JOIN (
   indexText(uri, sql);
   const derivedDeptRefs = getRefs("e.deptid");
   assert.ok(derivedDeptRefs.length > 0, "Computed derived projection should be indexed for derived alias usage");
+  assert.strictEqual(
+    getRefs("employee.deptid").length,
+    0,
+    "Derived alias projection must not be canonicalized to base table owner"
+  );
+});
+
+runCase("derived-table-renamed-projection-does-not-export-inner-source-name", () => {
+  const uri = "file:///regression/derived-table-renamed-projection.sql";
+  const sql = `
+SELECT d.DepartmentId, e.EmployeeId, e.Name, e.Prize
+FROM Department d
+LEFT JOIN (
+  SELECT EmployeeId, e.DepartmentId - 2 AS deptId, e.FirstName AS Name, hw.Prize
+  FROM Employee e
+  JOIN dbo.HackathonWinners hw ON hw.EmployeeId = e.EmployeeId
+) AS e ON d.DepartmentId = e.deptId;
+`;
+
+  indexText(uri, sql);
+  assert.ok(getRefs("e.name").length > 0, "Derived alias should export projected alias Name");
 });
 
 runCase("system-table-validation-exemption-preconditions", () => {
@@ -998,7 +1019,7 @@ CREATE TABLE dbo.Department (
 `;
 
   const querySql = `
-SELECT EmployeeId
+SELECT DepartmentId
 FROM dbo.Employee e
 JOIN dbo.Department d ON d.DepartmentId = e.DepartmentId;
 
@@ -1034,8 +1055,8 @@ JOIN dbo.MissingTable mt ON mt.EmployeeId = e.EmployeeId;
     "SaralSQL"
   );
   assert.ok(
-    diagnostics.some((d) => String(d.message).includes("Ambiguous column 'EmployeeId'")),
-    "Unaliased EmployeeId across two sources should emit ambiguity"
+    diagnostics.some((d) => String(d.message).includes("Ambiguous column 'DepartmentId'")),
+    "Unaliased DepartmentId across two sources should emit ambiguity"
   );
 });
 
@@ -1063,6 +1084,30 @@ ORDER BY e.FirstName;
   const refs = getReferencesForUri(queryUri);
   const orderByRef = refs.find((r) => r.kind === "column" && normalizeName(r.name) === "employee.firstname");
   assert.ok(orderByRef, "ORDER BY non-projected qualified column should still be indexed");
+});
+
+runCase("alias-resolved-missing-column-is-indexed-for-schema-validation", () => {
+  const schemaUri = "file:///regression/alias-missing-col-schema.sql";
+  const queryUri = "file:///regression/alias-missing-col-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.Employee (EmployeeId INT, FirstName NVARCHAR(100), LastName NVARCHAR(100));
+`;
+  const querySql = `
+SELECT e.EmployeeId, e.WrongColumn
+FROM dbo.Employee e;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+
+  const refs = getReferencesForUri(queryUri);
+  // The ref may be indexed as "e.wrongcolumn" (alias kept) or "employee.wrongcolumn" (alias resolved).
+  const wrongColRef = refs.find((r) =>
+    r.kind === "column" &&
+    (normalizeName(r.name) === "employee.wrongcolumn" || normalizeName(r.name) === "e.wrongcolumn")
+  );
+  assert.ok(wrongColRef, "Missing qualified column through alias should be indexed for schema validation");
 });
 
 process.stdout.write("All regression index tests passed.\n");

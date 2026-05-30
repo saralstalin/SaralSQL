@@ -35,6 +35,9 @@ export class IndexStore {
   readonly tablesByName = new Map<string, IndexSymbolDef>();
   readonly tableTypesByName = new Map<string, IndexSymbolDef>();
   readonly tempTablesByUri = new Map<string, Map<string, { columns: Set<string>; declaredAt: number }>>();
+  // Reverse dependency index: normalized table name → set of file URIs that reference it.
+  // Maintained by setRefsForFile/deleteRefsForFile; replaces the O(n) referencesIndex scan.
+  readonly tableReferencersByName = new Map<string, Set<string>>();
 
   clearAll(): void {
     this.columnsByTable.clear();
@@ -44,6 +47,7 @@ export class IndexStore {
     this.tablesByName.clear();
     this.tableTypesByName.clear();
     this.tempTablesByUri.clear();
+    this.tableReferencersByName.clear();
   }
 }
 

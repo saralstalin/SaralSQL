@@ -290,20 +290,26 @@ function isBareColumnInMutationStatementAtOffset(ast: any, offset: number): bool
     return false;
   }
 
-  const body = Array.isArray(ast?.body) ? ast.body : [];
-  for (const stmt of body) {
-    const start = Number(stmt?.start);
-    const end = Number(stmt?.end);
-    if (!Number.isFinite(start) || !Number.isFinite(end) || offset < start || offset > end) {
-      continue;
+  let found = false;
+  const visit = (node: any): void => {
+    if (found || !node || typeof node !== "object") { return; }
+    const start = Number(node?.start);
+    const end = Number(node?.end);
+    if (Number.isFinite(start) && Number.isFinite(end) && (offset < start || offset > end)) { return; }
+    if (node.type === "UpdateStatement" || node.type === "DeleteStatement" || node.type === "MergeStatement") {
+      found = true;
+      return;
     }
-
-    if (stmt?.type === "UpdateStatement" || stmt?.type === "DeleteStatement") {
-      return true;
+    if (Array.isArray(node)) {
+      for (const item of node) { visit(item); }
+      return;
     }
-  }
-
-  return false;
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") { visit(value); }
+    }
+  };
+  visit(ast);
+  return found;
 }
 
 function hasSingleSelectSourceAtOffset(ast: any, offset: number): boolean {

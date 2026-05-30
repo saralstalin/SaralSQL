@@ -65,6 +65,7 @@ import {
   , getRefs
   , tableTypesByName
   , tempTablesByUri
+  , tableReferencersByName
 } from "./definitions";
 import { parseSql, type ParseResult } from "./sql-parser";
 import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, buildSelectStarExpansionCodeActions, buildUpdateNoLockCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, normalizeSaralSqlSettings, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "./diagnostic-helpers";
@@ -1384,6 +1385,34 @@ async function doHover(doc: TextDocument, pos: Position): Promise<Hover | null> 
 }
 
 
+function getDependentUrisForTable(tableNorm: string): Set<string> {
+  // O(1) lookup via the reverse dependency index maintained in definitions.ts.
+  const direct = tableReferencersByName.get(tableNorm) ?? new Set<string>();
+  // Also check dbo-prefixed variant in case some refs were indexed that way.
+  const dboVariant = tableReferencersByName.get(`dbo.${tableNorm}`) ?? new Set<string>();
+  if (dboVariant.size === 0) { return direct; }
+  const merged = new Set<string>(direct);
+  for (const uri of dboVariant) { merged.add(uri); }
+  return merged;
+}
+
+async function triggerDependentRevalidation(changedUri: string, changedTableNames: string[]): Promise<void> {
+  const dependentUris = new Set<string>();
+  for (const tableName of changedTableNames) {
+    for (const uri of getDependentUrisForTable(tableName)) {
+      if (uri !== changedUri) { dependentUris.add(uri); }
+    }
+  }
+  if (dependentUris.size === 0) { return; }
+  safeLog(`[dep-revalidate] schema change in ${changedUri} affects ${dependentUris.size} file(s): ${[...changedTableNames].join(", ")}`);
+  for (const depUri of dependentUris) {
+    let depDoc: TextDocument | undefined;
+    for (const d of documents.all()) { if (toNormUri(d.uri) === depUri) { depDoc = d; break; } }
+    if (!depDoc) { depDoc = workspaceDocuments.get(depUri); }
+    if (depDoc) { await validateTextDocument(depDoc); }
+  }
+}
+
 export async function validateTextDocument(doc: TextDocument): Promise<void> {
   if (typeof enableValidation !== "undefined" && !enableValidation) {
     connection.sendDiagnostics({ uri: doc.uri, diagnostics: [] });
@@ -1450,10 +1479,48 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
   // Publish parser/local diagnostics first so users get quick feedback,
   // then publish again after slower schema validation completes.
   if (schemaValidationReady) {
-    // Ensure the current document's local schema/references are indexed for this exact text
-    // before running schema-dependent diagnostics.
+    const normDocUri = toNormUri(doc.uri);
+
+    // Snapshot all objects defined in this file BEFORE re-indexing so we can detect
+    // any schema drift (column changes, object removal, procedure signature changes, etc.)
+    // and trigger immediate re-validation of dependent files.
+    const preIndexColumnSchemas = new Map<string, Set<string>>();
+    for (const def of (definitions.get(normDocUri) ?? [])) {
+      // For TABLE/VIEW/TYPE store column set; for PROCEDURE/FUNCTION store empty set (presence only).
+      const cols = Array.isArray(def.columns)
+        ? new Set(def.columns.map((c: any) => normalizeName(String(c.name ?? ""))))
+        : new Set<string>();
+      preIndexColumnSchemas.set(def.name, cols);
+    }
+
     if (!isSqlProjectFileUri(doc.uri)) {
       indexText(doc.uri, text, { includeInWorkspaceSchema: shouldContributeToWorkspaceSchema(doc.uri) });
+    }
+
+    // Detect any schema change (column added/removed/renamed, or object kind changed) and
+    // re-validate every file that references any object defined here.
+    // Covers all object types: TABLE, VIEW, PROCEDURE, FUNCTION, TYPE.
+    const definedObjectNames: string[] = [];
+    for (const def of (definitions.get(normDocUri) ?? [])) {
+      const oldCols = preIndexColumnSchemas.get(def.name);
+      if (oldCols !== undefined) {
+        // For objects with columns (TABLE/VIEW/TYPE), check for column-level drift.
+        const newCols = new Set((def.columns ?? []).map((c: any) => normalizeName(String(c.name ?? ""))));
+        const changed = [...oldCols].some(c => !newCols.has(c)) || [...newCols].some(c => !oldCols.has(c));
+        if (changed) { definedObjectNames.push(def.name); }
+      } else if (preIndexColumnSchemas.size > 0) {
+        // Object existed before (other defs were captured) but wasn't in the column snapshot
+        // (e.g. PROCEDURE/FUNCTION with no columns) — treat any edit as a potential change.
+        definedObjectNames.push(def.name);
+      }
+    }
+    // Also trigger when definitions were removed (object deleted from file).
+    for (const oldName of preIndexColumnSchemas.keys()) {
+      const stillExists = (definitions.get(normDocUri) ?? []).some(d => d.name === oldName);
+      if (!stillExists) { definedObjectNames.push(oldName); }
+    }
+    if (definedObjectNames.length > 0) {
+      void triggerDependentRevalidation(normDocUri, definedObjectNames);
     }
 
     sendDiagnosticsIfCurrent([...diagnostics]);
@@ -1781,7 +1848,10 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
               return true;
             }
             const aliasTarget = normalizeName(resolveAliasTableName(s) ?? "");
-            return Boolean(aliasTarget);
+            if (aliasTarget) { return true; }
+            // CROSS APPLY with TVF or .nodes(): location.table is a FunctionCall expression.
+            // resolveAliasTableName returns undefined for these, but the alias is valid.
+            return String(s?.location?.table?.type ?? "") === "FunctionCall";
           });
       }
 
@@ -1901,9 +1971,33 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
             resolverOptions: { allowQualifiedSchemaLookup: false }
           });
           if (resolvedBare.status !== "resolved") {
-            const hintedOwner = normalizeName(String(resolvedBare.context?.parserHintOwner?.ownerName ?? ""));
-            if (hintedOwner && tableExistsInContext(hintedOwner) && !columnExistsInContext(hintedOwner, bareToken)) {
-              addWrongColumn(hintedOwner, bareToken, ref.line, ref.start, ref.end, getDisplayTableName(hintedOwner));
+            // parserHintOwner (from resolveCandidateOwner) only succeeds when the column EXISTS,
+            // so it can never fire here. Read the raw parser decision owner directly instead.
+            const rawParserOwner = normalizeName(String(
+              resolvedBare.matchedResolution?.owner ??
+              resolvedBare.matchedResolution?.decision?.owner ??
+              ""
+            ));
+            if (rawParserOwner && !rawParserOwner.startsWith("@") && !cteNames.has(rawParserOwner)) {
+              let effectiveOwner = rawParserOwner;
+              const ownerSym = resolveSymbolCaseInsensitive(scopeAtPos, rawParserOwner);
+              if (ownerSym?.kind === "Alias") {
+                if (Boolean(ownerSym?.location?.table?.query)) {
+                  // Derived alias: check against its projected columns
+                  const projectedCols = getDerivedAliasProjectedColumns(rawParserOwner, ownerSym);
+                  if (projectedCols.size > 0 && !projectedCols.has(bareToken)) {
+                    addWrongColumn(rawParserOwner, bareToken, ref.line, ref.start, ref.end, rawParserOwner);
+                  }
+                  continue;
+                }
+                const aliasTable = normalizeName(resolveAliasTableName(ownerSym) ?? "");
+                if (aliasTable) {
+                  effectiveOwner = aliasTable;
+                }
+              }
+              if (tableExistsInContext(effectiveOwner) && !columnExistsInContext(effectiveOwner, bareToken)) {
+                addWrongColumn(effectiveOwner, bareToken, ref.line, ref.start, ref.end, getDisplayTableName(effectiveOwner));
+              }
             }
           }
           continue;
@@ -1927,6 +2021,27 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
           continue;
         }
         if (resolvedQualified.verdict === "missing-column") {
+          const tokenFromText = normalizeName(refRangeText.replace(/\s+/g, ""));
+          if (tokenFromText.includes(".") && tokenFromText !== `${table}.${column}`) {
+            const textResolved = resolveColumnAtOffset({
+              parsed,
+              offset: refOffset,
+              columnName: tokenFromText,
+              tokenText: tokenFromText,
+              tablesByName,
+              tableTypesByName,
+              scopeAtPos,
+              localDefsByName,
+              resolverOptions: { allowQualifiedSchemaLookup: false }
+            });
+            if (textResolved.verdict === "resolved") {
+              continue;
+            }
+          }
+          const aliasCandidates = getAliasCandidatesAtOffset(scopeAtPos, table);
+          if (aliasCandidates.some((sym: any) => getAliasProjectedColumnSet(table, sym).has(column))) {
+            continue;
+          }
           addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplayTableName(table));
           continue;
         }
@@ -1934,6 +2049,12 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
           continue;
         }
         if (!table || table.startsWith("@") || cteNames.has(table) || isSystemTableReference(table)) {
+          continue;
+        }
+        // Qualifier resolved to a known table name but the column wasn't resolved through
+        // scope (scope only has the alias, not the real table name). Do a direct schema check.
+        if (tableExistsInContext(table) && !columnExistsInContext(table, column)) {
+          addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplayTableName(table));
           continue;
         }
         const tableRef = getSchemaEquivalentTableRefCandidates(table)
