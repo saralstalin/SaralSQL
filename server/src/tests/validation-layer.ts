@@ -897,6 +897,68 @@ WHERE ItemNumber = @ItemNumber
   );
 });
 
+runCase("mixed-update-variable-assignment-predicate-uses-parser-mutation-inputs", () => {
+  const schemaUri = "file:///validation/mixed-update-parser-mutation-schema.sql";
+  const queryUri = "file:///validation/mixed-update-parser-mutation-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.ReservationItem (
+  ReservationId INT,
+  IsExpired BIT,
+  IsCommitted BIT
+);
+CREATE TABLE dbo.OtherReservationItem (
+  ReservationId INT
+);
+`;
+
+  const querySql = `
+DECLARE @Event INT;
+UPDATE ri
+SET IsCommitted = 1,
+    @Event = CASE WHEN ri.IsExpired = 1 THEN 1 ELSE @Event END
+FROM dbo.ReservationItem ri
+WHERE ReservationId = 1;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const assignmentKinds = (parsed?.lineage?.mutations?.[0]?.location as any)?.assignments?.map((a: any) => a?.targetKind) ?? [];
+  assert.ok(assignmentKinds.includes("variable"), "Parser should classify mixed UPDATE variable assignment target");
+  assert.ok(
+    (parsed?.lineage?.mutations?.[0]?.predicateInputs ?? []).some((i: any) => String(i?.name ?? "").endsWith(".ReservationId")),
+    "Parser should expose UPDATE predicate inputs"
+  );
+
+  const offset = querySql.lastIndexOf("ReservationId = 1");
+  const resolved = resolveBareColumnAtOffset({
+    parsed,
+    offset,
+    columnName: "ReservationId",
+    tablesByName,
+    tableTypesByName
+  });
+
+  assert.strictEqual(resolved.status, "resolved", "Bare UPDATE predicate column should resolve through parser mutation predicate inputs");
+  assert.ok(
+    String(resolved.owner?.ownerName ?? "").toLowerCase().includes("reservationitem"),
+    "Resolved predicate owner should be the UPDATE target source"
+  );
+
+  const diagnostics = collectAmbiguousColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+  assert.ok(
+    !diagnostics.some(d => String(d.message).includes("Ambiguous column 'ReservationId'")),
+    "Mixed UPDATE predicate column should not be marked ambiguous"
+  );
+});
+
 runCase("simple-delete-bare-where-column-uses-delete-target-not-global-collisions", () => {
   const queryUri = "file:///validation/simple-delete-bare-where-target-query.sql";
   const querySql = `

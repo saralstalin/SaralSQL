@@ -48,6 +48,11 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
       : [];
   const decisionReason = normalizeName(String(matchedResolution?.decisionReason ?? matchedResolution?.decision?.decisionReason ?? ""));
 
+  const parserNativeOwner = resolveParserNativeDecisionOwner(params, matchedResolution, colNorm, owners);
+  if (parserNativeOwner) {
+    return { status: "resolved", owner: parserNativeOwner, owners: [parserNativeOwner], matchedResolution, ambiguityCandidates, decisionReason };
+  }
+
   const parserOwner = resolveParserDecisionOwner(params, matchedResolution, colNorm);
   if (parserOwner && ownerInList(parserOwner, owners)) {
     return { status: "resolved", owner: parserOwner, owners: [parserOwner], matchedResolution, ambiguityCandidates, decisionReason };
@@ -383,6 +388,11 @@ function resolveSingleInputOwner(params: ResolveParams, matchedResolution: any, 
 }
 
 function resolveMutationTargetOwner(params: ResolveParams, colNorm: string): ScopeColumnOwner | null {
+  const predicateInputOwner = resolveMutationPredicateInputOwner(params, colNorm);
+  if (predicateInputOwner) {
+    return predicateInputOwner;
+  }
+
   const ast = params.parsed?.ast;
   if (!ast) {
     return null;
@@ -391,6 +401,9 @@ function resolveMutationTargetOwner(params: ResolveParams, colNorm: string): Sco
   const scopeAtPos = params.scopeAtPos ?? params.parsed?.scope?.root?.findInnermost?.(params.offset) ?? params.parsed?.scope?.root;
   const candidates = collectMutationStatementsAtOffset(ast, params.offset);
   for (const stmt of candidates) {
+    if (isInsideVariableAssignmentTarget(stmt, params.offset)) {
+      continue;
+    }
 
     const targetName = normalizeName(normalizeAstTableName(stmt?.target) ?? "");
     if (!targetName) {
@@ -414,6 +427,51 @@ function resolveMutationTargetOwner(params: ResolveParams, colNorm: string): Sco
   }
 
   return null;
+}
+
+function resolveMutationPredicateInputOwner(params: ResolveParams, colNorm: string): ScopeColumnOwner | null {
+  const mutations = Array.isArray(params.parsed?.lineage?.mutations) ? params.parsed.lineage.mutations : [];
+  for (const mutation of mutations) {
+    const inputs = Array.isArray(mutation?.predicateInputs) ? mutation.predicateInputs : [];
+    for (const input of inputs) {
+      if (input?.kind !== "column" || !input?.source || !input?.location) {
+        continue;
+      }
+      if (!locationContainsOffset(input.location, params.offset)) {
+        continue;
+      }
+      const inputCol = normalizeName(String(input.name ?? "").split(".").pop() ?? "");
+      const locationName = normalizeName(String(input.location?.name ?? "").split(".").pop() ?? "");
+      if (inputCol !== colNorm && locationName !== colNorm) {
+        continue;
+      }
+      const owner = resolveCandidateOwner(params, normalizeName(String(input.source)), colNorm);
+      if (owner) {
+        return owner;
+      }
+    }
+  }
+  return null;
+}
+
+function isInsideVariableAssignmentTarget(stmt: any, offset: number): boolean {
+  const assignments = Array.isArray(stmt?.assignments) ? stmt.assignments : [];
+  for (const assignment of assignments) {
+    if (normalizeName(String(assignment?.targetKind ?? "")) !== "variable") {
+      continue;
+    }
+    const target = assignment?.columnNode ?? assignment?.target ?? null;
+    if (target && locationContainsOffset(target, offset)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function locationContainsOffset(location: any, offset: number): boolean {
+  const start = Number(location?.start);
+  const end = Number(location?.end);
+  return Number.isFinite(start) && Number.isFinite(end) && offset >= start && offset <= end;
 }
 
 function collectMutationStatementsAtOffset(ast: any, offset: number): any[] {
@@ -563,6 +621,43 @@ function resolveParserDecisionOwner(params: ResolveParams, matchedResolution: an
     return null;
   }
   return owner;
+}
+
+function resolveParserNativeDecisionOwner(
+  params: ResolveParams,
+  matchedResolution: any,
+  colNorm: string,
+  owners: ScopeColumnOwner[]
+): ScopeColumnOwner | null {
+  if (!matchedResolution) {
+    return null;
+  }
+
+  const decisionReason = normalizeName(String(matchedResolution?.decisionReason ?? matchedResolution?.decision?.decisionReason ?? ""));
+  if (!decisionReason || decisionReason === "ambiguous_candidates" || decisionReason === "unresolved_external" || decisionReason === "non_column") {
+    return null;
+  }
+
+  const scopeDepth = matchedResolution?.scopeDepth ?? matchedResolution?.decision?.scopeDepth;
+  const hasParserScopeSignal = Number.isFinite(Number(scopeDepth))
+    || decisionReason === "qualified_reference"
+    || decisionReason === "single_scope_owner"
+    || decisionReason === "single_candidate_promotion";
+  if (!hasParserScopeSignal) {
+    return null;
+  }
+
+  const fromInputs = resolveSingleInputOwner(params, matchedResolution, colNorm);
+  if (fromInputs && (owners.length === 0 || ownerInList(fromInputs, owners))) {
+    return fromInputs;
+  }
+
+  const fromOwner = resolveParserDecisionOwner(params, matchedResolution, colNorm);
+  if (fromOwner && (owners.length === 0 || ownerInList(fromOwner, owners))) {
+    return fromOwner;
+  }
+
+  return null;
 }
 
 function resolveNarrowedAmbiguityOwner(params: ResolveParams, parserCandidates: any[], colNorm: string): ScopeColumnOwner | null {

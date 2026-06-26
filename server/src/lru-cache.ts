@@ -37,4 +37,12 @@ export class LruCache {
         }
         this.map.set(k, { value: v, ts: Date.now() });
     }
+
+    deleteWhere(predicate: (key: string) => boolean): void {
+        for (const key of Array.from(this.map.keys())) {
+            if (predicate(key)) {
+                this.map.delete(key);
+            }
+        }
+    }
 }

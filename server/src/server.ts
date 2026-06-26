@@ -24,7 +24,8 @@ import {
   RenameParams,
   WorkspaceEdit,
   TextEdit,
-  Position
+  Position,
+  FileChangeType
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import * as fs from "fs";
@@ -48,7 +49,7 @@ import {
   , columnsByTable
   , tablesByName
   , aliasesByUri
-  , deleteRefsForFile
+  , deleteFileFromIndex
   , referencesIndex
   , findReferenceAtPosition
   , getReferencesForUri
@@ -164,6 +165,23 @@ function clearWorkspaceDiagnostics(): void {
       diagnostics: []
     });
   }
+}
+
+function clearDeletedSqlFileState(uri: string): void {
+  const normUri = toNormUri(uri);
+  const timer = pending.get(normUri);
+  if (timer) {
+    clearTimeout(timer);
+    pending.delete(normUri);
+  }
+
+  workspaceDocuments.delete(normUri);
+  deleteFileFromIndex(normUri);
+  parsedDocumentCache.deleteWhere((key: string) => key.startsWith(`${normUri}::`));
+  connection.sendDiagnostics({
+    uri: normUri,
+    diagnostics: []
+  });
 }
 
 function toNormUri(rawUri: string) {
@@ -442,6 +460,14 @@ connection.onInitialized(async () => {
 
 connection.onDidChangeWatchedFiles(async (change) => {
   try {
+    const deletedSqlUris = (change?.changes ?? [])
+      .filter(c => c.type === FileChangeType.Deleted && toNormUri(c.uri).toLowerCase().endsWith(".sql"))
+      .map(c => toNormUri(c.uri));
+
+    for (const uri of deletedSqlUris) {
+      clearDeletedSqlFileState(uri);
+    }
+
     const hasSqlProjChange = (change?.changes ?? []).some(c => toNormUri(c.uri).toLowerCase().endsWith(".sqlproj"));
     if (!hasSqlProjChange) {
       return;
@@ -2690,11 +2716,14 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
       const seenColumns = new Set<string>();
       const diagnosticTextCache = new Map<string, string>();
       const tableRefsByName = new Map<string, ReferenceDef[]>();
-      const propertyAccessStarts = new Set<number>(
+      const propertyAccessRanges = (
         Array.isArray(parsed?.columns?.propertyAccesses)
           ? parsed.columns.propertyAccesses
-            .map((p: any) => Number(p?.location?.start))
-            .filter((n: number) => Number.isFinite(n))
+            .map((p: any) => ({
+              start: Number(p?.location?.start),
+              end: Number(p?.location?.end)
+            }))
+            .filter((r: { start: number; end: number }) => Number.isFinite(r.start) && Number.isFinite(r.end))
           : []
       );
 
@@ -3206,7 +3235,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
           continue;
         }
 
-        if (propertyAccessStarts.has(refOffset)) {
+        if (propertyAccessRanges.some((r: { start: number; end: number }) => refOffset >= r.start && refOffset <= r.end)) {
           continue;
         }
         const tempTableSym = resolveTempTableSymbolAtOffset(table, refOffset);

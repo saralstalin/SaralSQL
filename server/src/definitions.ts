@@ -77,6 +77,20 @@ export function deleteRefsForFile(uri: string) {
     referencesByUri.delete(uri);
 }
 
+export function deleteFileFromIndex(uri: string): void {
+    const normUri = normalizeIndexUri(uri);
+    const oldDefs = definitions.get(normUri) || [];
+    for (const d of oldDefs) {
+        tablesByName.delete(d.name);
+        columnsByTable.delete(d.name);
+        tableTypesByName.delete(d.name);
+    }
+    definitions.delete(normUri);
+    aliasesByUri.delete(normUri);
+    tempTablesByUri.delete(normUri);
+    deleteRefsForFile(normUri);
+}
+
 export function getRefs(name: string): ReferenceDef[] {
     const byUri = referencesIndex.get(name);
     if (!byUri) { return []; }
@@ -328,15 +342,7 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
         return;
     }
 
-    const oldDefs = definitions.get(normUri) || [];
-    for (const d of oldDefs) { 
-        tablesByName.delete(d.name); 
-        columnsByTable.delete(d.name); 
-        tableTypesByName.delete(d.name);
-    }
-    definitions.delete(normUri);
-    tempTablesByUri.delete(normUri);
-    deleteRefsForFile(normUri);
+    deleteFileFromIndex(normUri);
 
     const parsed: ParseResult | null = parseSql(text);
     if (!parsed || !parsed.ast) {

@@ -15,7 +15,8 @@ import {
   columnsByTable,
   tablesByName,
   tableTypesByName,
-  tempTablesByUri
+  tempTablesByUri,
+  deleteFileFromIndex
 } from "../definitions";
 
 function resetIndexState(): void {
@@ -363,6 +364,26 @@ FROM Employee;
   assert.ok(schema?.columns.has("name"), "Projected column Name should be registered on temp table");
 });
 
+runCase("delete-file-from-index-removes-diagnostics-linked-state", () => {
+  const uri = "file:///regression/deleted-file.sql";
+  const sql = `
+CREATE TABLE dbo.DeletedFileTable (
+  Id INT
+);
+SELECT Id FROM dbo.DeletedFileTable;
+`;
+
+  indexText(uri, sql);
+  assert.ok(definitions.has(uri), "Indexed file should have definitions before deletion");
+  assert.ok(tablesByName.has("deletedfiletable") || tablesByName.has("dbo.deletedfiletable"), "Indexed table should exist before deletion");
+  assert.ok(getReferencesForUri(uri).length > 0, "Indexed file should have references before deletion");
+
+  deleteFileFromIndex(uri);
+  assert.ok(!definitions.has(uri), "Deleted file definitions should be removed");
+  assert.ok(!tablesByName.has("deletedfiletable") && !tablesByName.has("dbo.deletedfiletable"), "Deleted file table symbols should be removed");
+  assert.strictEqual(getReferencesForUri(uri).length, 0, "Deleted file references should be removed");
+});
+
 runCase("tvp-type-reference-is-indexed-for-navigation", () => {
   const uri = "file:///regression/tvp-type-reference-navigation.sql";
   const sql = `
@@ -666,13 +687,18 @@ SELECT Geo.Lat FROM T;
     refs.some(r => r.kind === "column" && normalizeName(r.name) === "t.geo"),
     "Property access should keep base typed column reference"
   );
+  assert.ok(
+    !refs.some(r => r.kind === "column" && normalizeName(r.name) === "geo.lat"),
+    "Property access member chain should not be indexed as a schema column"
+  );
 });
 
-runCase("sqlcmd-unresolved-include-is-surfaced", () => {
+runCase("sqlcmd-include-is-blanked-for-single-file-parse-safety", () => {
   const pre = new SqlCmdPreprocessor();
   const parsed = pre.process(":r missing.sql\nSELECT 1;");
-  const hasUnresolvedInclude = (parsed?.issues ?? []).some((i: any) => String(i.code ?? "").toUpperCase() === "SQLCMD_UNRESOLVED_INCLUDE");
-  assert.ok(hasUnresolvedInclude, "Unresolved SQLCMD include should be surfaced as parser issue");
+  assert.strictEqual((parsed?.issues ?? []).length, 0, "SQLCMD :r should not create parser noise in single-file mode");
+  assert.ok(String(parsed?.text ?? "").includes("SELECT 1;"), "SQLCMD :r preprocessing should preserve following SQL");
+  assert.ok(!String(parsed?.text ?? "").includes(":r missing.sql"), "SQLCMD :r directive should be blanked before parse");
 });
 
 runCase("go-batches-do-not-trigger-duplicate-variable-errors", () => {
