@@ -19,6 +19,7 @@ import {
   Hover,
   MarkupKind,
   DocumentSymbol,
+  CodeLens,
   SymbolKind,
   Range,
   RenameParams,
@@ -42,6 +43,7 @@ import {
 } from "./text-utils";
 import {
   setIndexReady
+  , setIndexNotReady
   , getIndexReady
   , indexText
   , definitions
@@ -372,7 +374,38 @@ function parseSeveritySetting(value: unknown, fallback: DiagnosticSeverity): Dia
   }
 }
 
+let indexWorkspaceInFlight: Promise<void> | null = null;
+let indexWorkspaceQueued = false;
+
+// Guard against concurrent reindexing: if a reindex is requested while one is already
+// running (e.g. two .sqlproj change events in quick succession), the second caller
+// doesn't start its own pass — it marks a re-run as queued and waits on the same
+// in-flight promise. That promise only resolves once no more re-runs are queued, so
+// every caller observes results from the most recent request, not a stale in-progress one.
 async function indexWorkspace(): Promise<void> {
+  if (indexWorkspaceInFlight) {
+    indexWorkspaceQueued = true;
+    await indexWorkspaceInFlight;
+    return;
+  }
+
+  indexWorkspaceInFlight = runIndexWorkspaceUntilSettled();
+  try {
+    await indexWorkspaceInFlight;
+  } finally {
+    indexWorkspaceInFlight = null;
+  }
+}
+
+async function runIndexWorkspaceUntilSettled(): Promise<void> {
+  do {
+    indexWorkspaceQueued = false;
+    await indexWorkspaceInternal();
+  } while (indexWorkspaceQueued);
+}
+
+async function indexWorkspaceInternal(): Promise<void> {
+  setIndexNotReady();
   try {
     const folders = await connection.workspace.getWorkspaceFolders?.();
     if (!folders) {
@@ -415,6 +448,7 @@ async function indexWorkspace(): Promise<void> {
       }
     }
     safeLog("Workspace indexing complete.");
+    setIndexReady();
   } catch (err) {
     safeError("Workspace indexing failed", err);
   }
@@ -430,6 +464,9 @@ connection.onInitialize((_params: InitializeParams): InitializeResult => {
       completionProvider: { triggerCharacters: [".", " "] },
       hoverProvider: true,
       documentSymbolProvider: true,
+      codeLensProvider: {
+        resolveProvider: false
+      },
       workspaceSymbolProvider: true,
       renameProvider: true,
       codeActionProvider: {
@@ -504,12 +541,10 @@ connection.onDidChangeWatchedFiles(async (change) => {
       indexText(uri, doc.getText(), { includeInWorkspaceSchema: shouldContributeToWorkspaceSchema(uri) });
     }
 
-    for (const uri of impactedUris) {
-      const openDoc = documents.get(uri);
-      const doc = openDoc ?? workspaceDocuments.get(uri);
-      if (doc) {
-        await validateTextDocument(doc);
-      }
+    if (enableValidation) {
+      await validateWorkspaceDocuments();
+    } else {
+      clearWorkspaceDiagnostics();
     }
   } catch (err) {
     safeError("Watched file change handling failed", err);
@@ -520,6 +555,7 @@ documents.onDidOpen(async (e) => {
   workspaceDocuments.set(e.document.uri, e.document);
   if (isSqlProjectFileUri(e.document.uri)) {
     await indexWorkspace();
+    await markIndexReady();
   } else {
     indexText(e.document.uri, e.document.getText(), { includeInWorkspaceSchema: shouldContributeToWorkspaceSchema(e.document.uri) });
   }
@@ -554,6 +590,7 @@ documents.onDidChangeContent((e) => {
         workspaceDocuments.set(uri, e.document);
         if (isSqlProjectFileUri(uri)) {
           await indexWorkspace();
+          await markIndexReady();
         } else {
           indexText(uri, e.document.getText(), { includeInWorkspaceSchema: shouldContributeToWorkspaceSchema(uri) });
         }
@@ -2057,7 +2094,97 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
   }
 });
 
+connection.onCodeLens((params): CodeLens[] => {
+  try {
+    const uri = toNormUri(params.textDocument.uri);
+    const defs = definitions.get(uri) || [];
+    const lenses: CodeLens[] = [];
+
+    for (const def of defs) {
+      const kind = String(def.kind ?? "").toUpperCase();
+      if (kind !== "TABLE" && kind !== "VIEW" && kind !== "TYPE") {
+        continue;
+      }
+
+      const locations = getDefinitionReferenceLocations(def);
+      const count = locations.length;
+      const title = `${count} reference${count === 1 ? "" : "s"}`;
+
+      lenses.push({
+        range: Range.create(def.line, 0, def.line, 0),
+        command: {
+          title,
+          command: "saralsql.showReferences",
+          arguments: [
+            def.uri,
+            { line: def.line, character: 0 },
+            locations
+          ]
+        }
+      });
+    }
+
+    return lenses;
+  } catch (err) {
+    safeError("[codeLens] handler error", err);
+    return [];
+  }
+});
+
 // ---------- Helpers ----------
+function getDefinitionReferenceLocations(def: { name: string; uri: string; line: number; rawName: string }): Location[] {
+  const locations: Location[] = [];
+  const seen = new Set<string>();
+
+  for (const key of getDefinitionReferenceKeys(def.name)) {
+    const byUri = referencesIndex.get(key);
+    if (!byUri) {
+      continue;
+    }
+
+    for (const refs of byUri.values()) {
+      for (const ref of refs) {
+        if (isReferenceHiddenFromObjectUsage(ref)) {
+          continue;
+        }
+
+        const locationKey = `${ref.uri}:${ref.line}:${ref.start}:${ref.end}`;
+        if (seen.has(locationKey)) {
+          continue;
+        }
+        seen.add(locationKey);
+
+        locations.push({
+          uri: ref.uri,
+          range: {
+            start: { line: ref.line, character: ref.start },
+            end: { line: ref.line, character: ref.end }
+          }
+        });
+      }
+    }
+  }
+
+  return locations;
+}
+
+function getDefinitionReferenceKeys(name: string): string[] {
+  const norm = normalizeName(name);
+  const keys = new Set<string>([norm]);
+
+  if (norm.startsWith("dbo.")) {
+    keys.add(norm.slice("dbo.".length));
+  } else if (!norm.includes(".")) {
+    keys.add(`dbo.${norm}`);
+  }
+
+  return [...keys];
+}
+
+function isReferenceHiddenFromObjectUsage(ref: ReferenceDef): boolean {
+  return ref.context === "create-definition" || ref.context === "alias-declaration";
+}
+
 export function getCurrentStatement(doc: TextDocument, position: Position): string {
   const text = doc.getText();
   const offset = doc.offsetAt(position);
@@ -2091,6 +2218,10 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
   const seen = new Set<string>();
 
   const pushLocFromRef = (r: ReferenceDef) => {
+    if (isReferenceHiddenFromObjectUsage(r)) {
+      return;
+    }
+
     const key = `${r.uri}:${r.line}:${r.start}:${r.end}`;
     if (seen.has(key)) { return; }
     seen.add(key);
@@ -2110,16 +2241,32 @@ function findReferencesForWord(rawWord: string, doc: TextDocument, position?: Po
   const offset = position ? doc.offsetAt(position) : -1;
 
   if (match) {
-    const byUri = referencesIndex.get(match.name);
-    const localArr = byUri?.get(normUri) ?? [];
-    if (localArr.length > 0) {
-      for (const r of localArr) {
-        pushLocFromRef(r);
+    const keys = match.kind === "table" ? getDefinitionReferenceKeys(match.name) : [match.name];
+
+    if (match.kind === "table") {
+      for (const key of keys) {
+        const byUri = referencesIndex.get(key);
+        if (!byUri) {
+          continue;
+        }
+        for (const arr of byUri.values()) {
+          for (const r of arr) {
+            pushLocFromRef(r);
+          }
+        }
       }
-    } else if (byUri) {
-      for (const arr of byUri.values()) {
-        for (const r of arr) {
+    } else {
+      const byUri = referencesIndex.get(match.name);
+      const localArr = byUri?.get(normUri) ?? [];
+      if (localArr.length > 0) {
+        for (const r of localArr) {
           pushLocFromRef(r);
+        }
+      } else if (byUri) {
+        for (const arr of byUri.values()) {
+          for (const r of arr) {
+            pushLocFromRef(r);
+          }
         }
       }
     }
@@ -2791,6 +2938,28 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
         });
       }
 
+      // T-SQL disallows referencing a table by its original name once it has been
+      // aliased within the same statement — only the alias is a valid qualifier from
+      // that point on. addUnknownTable wouldn't fire here because the table genuinely
+      // exists; this is a distinct "wrong qualifier in this scope" condition.
+      function addShadowedByAliasTable(name: string, aliasName: string, line: number, start: number, end: number) {
+        if (shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.UnknownTable, disabledDiagnosticCodes)) { return; }
+        const key = `shadowed:${normalizeName(name)}:${line}:${start}`;
+        if (seenTables.has(key)) { return; }
+        seenTables.add(key);
+
+        diagnostics.push({
+          code: SARAL_DIAGNOSTIC_CODES.UnknownTable,
+          severity: resolveDiagnosticSeverity(SARAL_DIAGNOSTIC_CODES.UnknownTable, DiagnosticSeverity.Error, diagnosticSeverityOverrides),
+          range: {
+            start: { line, character: start },
+            end: { line, character: end }
+          },
+          message: `Table '${name}' has been aliased as '${aliasName}' in this statement; use '${aliasName}' instead of the table name`,
+          source: "SaralSQL"
+        });
+      }
+
       function addWrongColumn(
         table: string,
         column: string,
@@ -3131,6 +3300,19 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
           }
 
           const refOffset = (lineStarts[ref.line] ?? 0) + ref.start;
+
+          if (ref.context === "shadowed-by-alias") {
+            const scopeAtPos = parsed?.scope?.root?.findInnermost?.(refOffset) ?? parsed?.scope?.root;
+            const visible = typeof scopeAtPos?.getVisibleSymbols === "function" ? scopeAtPos.getVisibleSymbols() : [];
+            const shadowingAlias = (visible as any[]).find((sym: any) =>
+              sym?.kind === "Alias" && normalizeName(resolveAliasTableName(sym) ?? "") === normalizeName(ref.name)
+            );
+            if (shadowingAlias) {
+              addShadowedByAliasTable(getDisplayTableName(ref.name), String(shadowingAlias.name ?? ""), ref.line, ref.start, ref.end);
+            }
+            continue;
+          }
+
           if (fileAliases?.has(normalizeName(ref.name))) {
             continue;
           }
@@ -3190,33 +3372,61 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
                 : false;
               const projected = getDerivedAliasProjectedColumns(table, sym);
               const projectedHas = projected.has(column);
-              const hasKnowledge = explicitCols.length > 0 || projected.size > 0 || Array.isArray(aliasTargetDef?.columns);
-              return { sym, explicitHas, targetHas, projectedHas, hasKnowledge };
+              const hasTargetKnowledge = Array.isArray(aliasTargetDef?.columns);
+              const hasProjectedKnowledge = projected.size > 0;
+              const hasExplicitKnowledge = explicitCols.length > 0;
+              return { sym, aliasTarget, explicitHas, targetHas, projectedHas, hasTargetKnowledge, hasProjectedKnowledge, hasExplicitKnowledge };
             });
 
-          if (withColumns.some(x => x.explicitHas || x.projectedHas || x.targetHas)) {
+          if (withColumns.some(x =>
+            (x.hasTargetKnowledge && x.targetHas)
+            || (!x.hasTargetKnowledge && x.hasProjectedKnowledge && x.projectedHas)
+            || (!x.hasTargetKnowledge && !x.hasProjectedKnowledge && x.explicitHas)
+          )) {
             continue;
           }
 
           // Emit missing column only when at least one alias candidate has known projection shape.
-          const known = withColumns.find(x => x.hasKnowledge);
+          const known = withColumns.find(x => x.hasTargetKnowledge || x.hasProjectedKnowledge || x.hasExplicitKnowledge);
           if (known) {
-            addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplaySymbolName(known.sym) || table);
+            const display = known.hasTargetKnowledge && known.aliasTarget
+              ? getDisplayTableName(known.aliasTarget)
+              : getDisplaySymbolName(known.sym) || table;
+            addWrongColumn(table, column, ref.line, ref.start, ref.end, display);
             continue;
           }
         }
 
-        if (scopedSym?.kind === "Alias" && Array.isArray(scopedSym.columns) && scopedSym.columns.length > 0) {
-          const hasLocalCol = scopedSym.columns.some((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === column);
-          if (!hasLocalCol) {
-            addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplaySymbolName(scopedSym) || table);
-          }
-          continue;
-        }
         if (scopedSym?.kind === "Alias") {
           const projected = getDerivedAliasProjectedColumns(table, scopedSym);
           if (projected.size > 0) {
             if (!projected.has(column)) {
+              addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplaySymbolName(scopedSym) || table);
+            }
+            continue;
+          }
+
+          const aliasTarget = normalizeName(resolveAliasTableName(scopedSym) ?? "");
+          const aliasTargetStripped = aliasTarget.replace(/^dbo\./, "");
+          const aliasTargetDef = aliasTarget
+            ? (localDefsByName.get(aliasTarget)
+              || localDefsByName.get(aliasTargetStripped)
+              || tablesByName.get(aliasTarget)
+              || tablesByName.get(aliasTargetStripped)
+              || tableTypesByName.get(aliasTarget)
+              || tableTypesByName.get(aliasTargetStripped))
+            : null;
+          if (Array.isArray(aliasTargetDef?.columns)) {
+            const hasTargetCol = aliasTargetDef.columns.some((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === column);
+            if (!hasTargetCol) {
+              addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplayTableName(aliasTarget));
+            }
+            continue;
+          }
+
+          if (Array.isArray(scopedSym.columns) && scopedSym.columns.length > 0) {
+            const hasLocalCol = scopedSym.columns.some((c: any) => normalizeName(String(c?.rawName ?? c?.name ?? c)) === column);
+            if (!hasLocalCol) {
               addWrongColumn(table, column, ref.line, ref.start, ref.end, getDisplaySymbolName(scopedSym) || table);
             }
             continue;

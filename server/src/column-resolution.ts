@@ -555,16 +555,20 @@ function dedupeOwners(owners: ScopeColumnOwner[]): ScopeColumnOwner[] {
 }
 
 function ownerInList(owner: ScopeColumnOwner, owners: ScopeColumnOwner[]): boolean {
+  return Boolean(findEquivalentScopeOwner(owner, owners));
+}
+
+function findEquivalentScopeOwner(owner: ScopeColumnOwner, owners: ScopeColumnOwner[]): ScopeColumnOwner | null {
   if (!owner || !Array.isArray(owners) || owners.length === 0) {
-    return false;
+    return null;
   }
   const ownerName = normalizeName(String(owner.ownerName ?? ""));
   const ownerCol = normalizeName(String(owner.column?.rawName ?? owner.column?.name ?? ""));
-  return owners.some((o) => {
+  return owners.find((o) => {
     const n = normalizeName(String(o.ownerName ?? ""));
     const c = normalizeName(String(o.column?.rawName ?? o.column?.name ?? ""));
     return n === ownerName && c === ownerCol;
-  });
+  }) ?? null;
 }
 
 
@@ -648,13 +652,19 @@ function resolveParserNativeDecisionOwner(
   }
 
   const fromInputs = resolveSingleInputOwner(params, matchedResolution, colNorm);
-  if (fromInputs && (owners.length === 0 || ownerInList(fromInputs, owners))) {
-    return fromInputs;
+  if (fromInputs) {
+    const scopeOwner = findEquivalentScopeOwner(fromInputs, owners);
+    if (owners.length === 0 || scopeOwner) {
+      return scopeOwner ?? fromInputs;
+    }
   }
 
   const fromOwner = resolveParserDecisionOwner(params, matchedResolution, colNorm);
-  if (fromOwner && (owners.length === 0 || ownerInList(fromOwner, owners))) {
-    return fromOwner;
+  if (fromOwner) {
+    const scopeOwner = findEquivalentScopeOwner(fromOwner, owners);
+    if (owners.length === 0 || scopeOwner) {
+      return scopeOwner ?? fromOwner;
+    }
   }
 
   return null;

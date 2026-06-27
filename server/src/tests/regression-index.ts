@@ -9,6 +9,7 @@ import {
   indexText,
   getRefs,
   getReferencesForUri,
+  findReferenceAtPosition,
   aliasesByUri,
   definitions,
   referencesIndex,
@@ -489,6 +490,57 @@ VALUES (1, 'John', 1000);
   assert.ok(getRefs("employee.salary").length > 0, "INSERT target column list should index Salary to target table");
 });
 
+runCase("if-exists-subquery-table-reference-is-indexed", () => {
+  const schemaUri = "file:///regression/patent-schema.sql";
+  const queryUri = "file:///regression/if-exists-patent-query.sql";
+
+  const schemaSql = `
+CREATE TABLE Patent (
+  PatentId INT
+);
+`;
+
+  const querySql = `
+IF NOT EXISTS (SELECT 1 FROM Patent WHERE PatentId = @PatentId)
+BEGIN
+  RAISERROR('Patent with id %d not found.', 16, 1, @PatentId);
+  RETURN;
+END;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+
+  const refs = getRefs("patent").filter(r => r.uri === queryUri && r.kind === "table");
+  assert.ok(refs.length > 0, "Table reference inside IF EXISTS subquery should be indexed");
+
+  const doc = TextDocument.create(queryUri, "sql", 0, querySql);
+  const patentOffset = querySql.indexOf("Patent WHERE");
+  const patentPos = doc.positionAt(patentOffset);
+  const match = findReferenceAtPosition(queryUri, patentPos.line, patentPos.character);
+  assert.ok(match && match.kind === "table" && match.name === "patent", "Definition/hover lookup should find the Patent table token inside IF EXISTS");
+});
+
+runCase("aliased-missing-column-stays-schema-validated", () => {
+  const uri = "file:///regression/aliased-missing-column-schema-validation.sql";
+  const sql = `
+CREATE TABLE dbo.Employee (
+  EmployeeId INT,
+  FirstName NVARCHAR(50)
+);
+SELECT e.EmployeeId, e.DoesNotExist
+FROM dbo.Employee e;
+`;
+
+  indexText(uri, sql);
+  const missingRefs = getRefs("employee.doesnotexist");
+  assert.ok(missingRefs.length > 0, "Aliased missing column should still be indexed against the backing table");
+  assert.ok(
+    missingRefs.some(r => r.validateSchema !== false),
+    "Aliased missing column should remain schema-validated so LSP002 can be emitted"
+  );
+});
+
 runCase("bare-column-no-global-fallback", () => {
   const baseUri = "file:///regression/bare-column-base-table.sql";
   const queryUri = "file:///regression/bare-column-no-from.sql";
@@ -533,6 +585,63 @@ JOIN Department d ON e.DepartmentId = d.DepartmentId;
   const parsed = parseSql(querySql);
   const diagnostics = collectAmbiguousColumnDiagnostics(parsed, getLineStarts(querySql), tablesByName, tableTypesByName, "SaralSQL");
   assert.ok(diagnostics.some(d => String(d.message).includes("Ambiguous column 'Id'")), "Ambiguous bare column should emit warning diagnostic");
+});
+
+runCase("table-alias-declaration-is-not-a-table-object-usage", () => {
+  const uri = "file:///regression/table-alias-reference-count.sql";
+  const sql = `
+CREATE TABLE Department (
+  DepartmentId INT
+);
+
+SELECT d.DepartmentId
+FROM Department d;
+`;
+
+  indexText(uri, sql);
+
+  const refs = getRefs("department");
+  const objectUsages = refs.filter(r => r.context !== "create-definition" && r.context !== "alias-declaration");
+  const aliasDeclarations = refs.filter(r => r.context === "alias-declaration");
+
+  assert.strictEqual(objectUsages.length, 1, "Table object references should count the FROM table token once");
+  assert.strictEqual(aliasDeclarations.length, 1, "Alias declaration should remain indexed but separated from object usage counts");
+});
+
+runCase("join-table-token-is-not-indexed-as-bare-column", () => {
+  const uri = "file:///regression/join-table-token-not-bare-column.sql";
+  const sql = `
+CREATE TABLE Employee (
+  EmployeeId INT,
+  EndDate DATETIME
+);
+CREATE TABLE LuckyDropWinners (
+  WinnerId INT,
+  ContestId INT,
+  EmployeeId INT
+);
+
+INSERT INTO LuckyDropWinners (ContestId, EmployeeId)
+SELECT @ContestId, EmployeeId
+FROM (
+  SELECT TOP (@NumberOfWinners) e.EmployeeId
+  FROM Employee e
+  LEFT JOIN LuckyDropWinners lw ON lw.EmployeeId = e.EmployeeId AND lw.ContestId = @ContestId
+  WHERE lw.WinnerId IS NULL
+) AS picks;
+`;
+
+  indexText(uri, sql);
+
+  assert.ok(
+    getRefs("luckydropwinners").some(r => r.kind === "table" && r.context !== "create-definition"),
+    "LuckyDropWinners JOIN token should be indexed as a table reference"
+  );
+  assert.strictEqual(
+    getRefs("employee.luckydropwinners").length,
+    0,
+    "JOIN table token should not be inferred as a bare column owned by Employee"
+  );
 });
 
 runCase("resolve-column-does-not-leak-from-nested-select", () => {
@@ -910,6 +1019,31 @@ AS
     getRefs("someview.column1").length > 0,
     "CREATE VIEW columns should be indexed when view body is a UNION/set-operator shape"
   );
+});
+
+runCase("table-name-used-after-aliasing-is-flagged-as-shadowed", () => {
+  const schemaUri = "file:///regression/shadowed-by-alias-schema.sql";
+  const queryUri = "file:///regression/shadowed-by-alias-query.sql";
+
+  const schemaSql = `
+CREATE TABLE dbo.Employee (
+  EmployeeId INT,
+  DepartmentId INT,
+  FirstName NVARCHAR(100)
+);
+`;
+  const querySql = `
+SELECT e.EmployeeId, e.DepartmentId, e.FirstName
+FROM Employee e
+WHERE Employee.EmployeeId = 12345;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+
+  const refs = getReferencesForUri(queryUri).filter(r => r.kind === "table" && r.context === "shadowed-by-alias");
+  assert.strictEqual(refs.length, 1, "Bare table name used after the table was aliased should be indexed as shadowed-by-alias");
+  assert.strictEqual(normalizeName(refs[0].name), "employee", "Shadowed ref should carry the literal table name");
 });
 
 process.stdout.write("All regression index tests passed.\n");

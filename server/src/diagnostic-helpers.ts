@@ -659,17 +659,20 @@ function collectOutputPseudoColumnStarts(ast: any): Set<number> {
 
 export function buildReadableBareColumnCodeAction(uri: string, diagnostic: Diagnostic): CodeAction | null {
   const data = diagnostic.data as any;
-  if (!data || data.kind !== "qualify-bare-column") {
+  const fallback = parseReadableBareColumnDiagnosticMessage(String(diagnostic.message ?? ""));
+  const hasStructuredData = data && data.kind === "qualify-bare-column";
+  if (!hasStructuredData && !fallback) {
     return null;
   }
 
-  const replacement = String(data.replacement ?? "");
+  const replacement = String(hasStructuredData ? data.replacement ?? "" : fallback?.replacement ?? "");
   if (!replacement || !diagnostic.range) {
     return null;
   }
 
+  const alias = String(hasStructuredData ? data.alias ?? "" : fallback?.alias ?? "");
   return {
-    title: `Qualify with ${String(data.alias ?? replacement.split(".")[0] ?? "")}`,
+    title: `Qualify with ${alias || replacement.split(".")[0] || ""}`,
     kind: CodeActionKind.QuickFix,
     diagnostics: [diagnostic],
     edit: {
@@ -677,6 +680,23 @@ export function buildReadableBareColumnCodeAction(uri: string, diagnostic: Diagn
         [uri]: [TextEdit.replace(diagnostic.range, replacement)]
       }
     }
+  };
+}
+
+function parseReadableBareColumnDiagnosticMessage(message: string): { alias: string; replacement: string } | null {
+  const match = /^Consider qualifying '([^']+)' as '([^']+)' for readability$/i.exec(message.trim());
+  if (!match) {
+    return null;
+  }
+
+  const replacement = String(match[2] ?? "");
+  if (!replacement.includes(".")) {
+    return null;
+  }
+
+  return {
+    alias: replacement.split(".")[0] ?? "",
+    replacement
   };
 }
 

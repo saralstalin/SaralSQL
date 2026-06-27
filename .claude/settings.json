@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node esbuild.js)",
+      "Bash(node -e ' *)"
+    ]
+  }
+}

@@ -209,6 +209,47 @@ WHERE EmployeeId > 0;
   assert.ok(action, "Readability diagnostic should produce a quick fix code action");
   assert.ok(String(action?.title ?? "").includes("Qualify with e"), "Code action should name the visible alias");
   assert.ok(action?.edit?.changes?.[queryUri]?.[0]?.newText === "e.EmployeeId", "Code action should qualify the bare column");
+
+  const dataLessAction = buildReadableBareColumnCodeAction(queryUri, { ...diag!, data: undefined });
+  assert.ok(dataLessAction, "Readability diagnostic should still produce a quick fix if diagnostic.data is not returned by the client");
+  assert.ok(dataLessAction?.edit?.changes?.[queryUri]?.[0]?.newText === "e.EmployeeId", "Data-less readability quick fix should recover replacement from the diagnostic message");
+});
+
+runCase("readable-bare-column-uses-visible-alias-when-parser-owner-is-base-table", () => {
+  const schemaUri = "file:///validation/readable-single-alias-schema.sql";
+  const queryUri = "file:///validation/readable-single-alias-query.sql";
+
+  const schemaSql = `
+CREATE TABLE HackathonDeliveries (
+  DeliveryId INT,
+  EmployeeId INT,
+  GoodieName NVARCHAR(100),
+  Quantity INT,
+  DeliveryDate DATETIME
+);
+`;
+
+  const querySql = `
+SELECT hd.DeliveryId, hd.EmployeeId, hd.GoodieName, Quantity, hd.DeliveryDate
+FROM HackathonDeliveries hd
+WHERE hd.DeliveryId = @NewDeliveryId;
+`;
+
+  indexText(schemaUri, schemaSql);
+  indexText(queryUri, querySql);
+  const parsed = parseSql(querySql);
+  const diagnostics = collectReadableBareColumnDiagnostics(
+    parsed,
+    getLineStarts(querySql),
+    tablesByName,
+    tableTypesByName,
+    "SaralSQL"
+  );
+
+  assert.ok(
+    diagnostics.some(d => String(d.message).includes("Consider qualifying 'Quantity' as 'hd.Quantity'")),
+    "Single-table bare column should suggest the visible table alias even when parser owner is the base table"
+  );
 });
 
 runCase("quick-fix-expands-select-star", () => {

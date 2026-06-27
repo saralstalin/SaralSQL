@@ -35,7 +35,7 @@ export interface ReferenceDef {
     start: number;
     end: number;
     kind: "table" | "column" | "parameter";
-    context?: ExtractedReferenceContext | "create-definition";
+    context?: ExtractedReferenceContext | "create-definition" | "alias-declaration" | "shadowed-by-alias";
     validateSchema?: boolean;
 }
 
@@ -55,6 +55,10 @@ let isIndexReady = false;
 
 export function setIndexReady() {
     isIndexReady = true;
+}
+
+export function setIndexNotReady() {
+    isIndexReady = false;
 }
 
 export function getIndexReady(): boolean {
@@ -420,7 +424,7 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
     indexInsertColumnReferencesFromAst(parsed.ast, normUri, lineStarts, localRefs);
     indexUpdateAssignmentColumnsFromAst(parsed.ast, parsed.scope?.root, normUri, lineStarts, localRefs);
     indexTableVariableColumnReferencesFromAst(parsed.ast, parsed.scope?.root, normUri, lineStarts, localRefs);
-    indexQualifiedColumnReferencesFromAst(parsed.ast, parsed.scope?.root, normUri, lineStarts, localRefs);
+    indexQualifiedColumnReferencesFromAst(parsed.ast, parsed.scope?.root, normUri, lineStarts, localRefs, defs);
 
     // 2. Extract and resolve all references using extractReferences and column resolutions
     const functionCallStarts = new Set<number>();
@@ -441,7 +445,6 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
     
     const resolutions = parsed.columns?.resolutions ?? [];
     const processedTableRefs = new Set<string>();
-
     for (const ref of references) {
         
         const refPos = offsetToPosition(ref.location.start, lineStarts);
@@ -532,7 +535,7 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                         if (input.kind === "column" && input.source) {
                             if (explicitQualifiedTarget) {
                                 const inputSourceNorm = normalizeName(String(input.source));
-                                if (inputSourceNorm !== explicitQualifiedTarget) {
+                                if (!schemaNamesEquivalent(inputSourceNorm, explicitQualifiedTarget)) {
                                     continue;
                                 }
                             }
@@ -543,7 +546,7 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                                 start: startChar,
                                 end: endChar,
                                 kind: "column",
-                                validateSchema: tablesByName.has(normalizeName(String(input.source))) || tableTypesByName.has(normalizeName(String(input.source)))
+                                validateSchema: hasSchemaDefinitionForName(input.source, defs)
                             });
                             resolved = true;
                         } else if (input.kind === "variable") {
@@ -586,7 +589,7 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                         const matchedTable = fileAliases?.get(aliasOrTableNorm);
                         if (matchedTable && matchedTable.toLowerCase() !== "__subquery__") {
                             resolvedTable = matchedTable;
-                            resolvedFromFileAlias = true;
+                            resolvedFromFileAlias = !hasSchemaDefinitionForName(matchedTable, defs);
                         } else if (matchedTable && matchedTable.toLowerCase() === "__subquery__") {
                             resolvedTable = aliasOrTableNorm;
                         }
@@ -601,8 +604,33 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                             start: startChar,
                             end: endChar,
                             kind: "column",
-                            validateSchema: !resolvedFromFileAlias && !resolvedTableNorm.startsWith("#") && !functionCallNames.has(resolvedTableNorm)
+                            validateSchema: (
+                                hasSchemaDefinitionForName(resolvedTable, defs)
+                                || (!resolvedFromFileAlias && !resolvedTableNorm.startsWith("#") && !functionCallNames.has(resolvedTableNorm))
+                            )
                         });
+                    } else {
+                        // Qualifier didn't resolve to any alias/table/CTE in scope. If it is the
+                        // literal table name of an alias that IS visible here, this is unambiguous —
+                        // not a property-access guess: once a table is aliased, T-SQL no longer
+                        // allows the original name as a qualifier in that statement. Flag it.
+                        const shadowingAlias = visibleSymbols.find((sym: any) =>
+                            sym.kind === "Alias"
+                            && normalizeName(String(sym.name ?? "")) !== aliasOrTableNorm
+                            && normalizeName(resolveAliasTableName(sym) ?? "") === aliasOrTableNorm
+                        );
+                        if (shadowingAlias) {
+                            localRefs.push({
+                                name: aliasOrTableNorm,
+                                uri: normUri,
+                                line: refPos.line,
+                                start: startChar,
+                                end: startChar + aliasOrTable.length,
+                                kind: "table",
+                                context: "shadowed-by-alias",
+                                validateSchema: true
+                            });
+                        }
                     }
                 } else if (parts.length === 1) {
                     const colNorm = normalizeName(parts[0]);
@@ -665,6 +693,7 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
             }
         }
     }
+    indexMissingTableReferencesFromAst(parsed.ast, normUri, lineStarts, localRefs, processedTableRefs);
 
     definitions.set(normUri, defs);
 
@@ -973,12 +1002,50 @@ function extractSelectProjectedColumnName(col: any): string | null {
     return null;
 }
 
+function hasSchemaDefinitionForName(name: any, localDefs?: SymbolDef[]): boolean {
+    const norm = normalizeName(String(name ?? ""));
+    if (!norm) {
+        return false;
+    }
+    const stripped = norm.replace(/^dbo\./, "");
+    const dbo = stripped ? `dbo.${stripped}` : norm;
+    const hasLocalDef = Array.isArray(localDefs) && localDefs.some((d) => {
+        const defName = normalizeName(String(d?.name ?? ""));
+        return defName === norm || defName === stripped || defName === dbo;
+    });
+    return (
+        hasLocalDef
+        ||
+        tablesByName.has(norm)
+        || tablesByName.has(stripped)
+        || tablesByName.has(dbo)
+        || tableTypesByName.has(norm)
+        || tableTypesByName.has(stripped)
+        || tableTypesByName.has(dbo)
+    );
+}
+
+function schemaNamesEquivalent(left: any, right: any): boolean {
+    const l = normalizeName(String(left ?? ""));
+    const r = normalizeName(String(right ?? ""));
+    if (!l || !r) {
+        return false;
+    }
+    if (l === r) {
+        return true;
+    }
+    const lStripped = l.replace(/^dbo\./, "");
+    const rStripped = r.replace(/^dbo\./, "");
+    return lStripped === rStripped;
+}
+
 function indexQualifiedColumnReferencesFromAst(
     ast: ParseResult["ast"] | null,
     rootScope: any,
     normUri: string,
     lineStarts: number[],
-    localRefs: ReferenceDef[]
+    localRefs: ReferenceDef[],
+    localDefs: SymbolDef[]
 ): void {
     if (!rootScope) {
         return;
@@ -1019,6 +1086,7 @@ function indexQualifiedColumnReferencesFromAst(
 
         const tableName = resolveAliasTableName(sym) ?? normalizeName(String(sym.name ?? ""));
         if (!tableName) { return; }
+        const schemaValidated = hasSchemaDefinitionForName(tableName, localDefs);
 
         const pos = offsetToPosition(node.start, lineStarts);
         localRefs.push({
@@ -1028,7 +1096,7 @@ function indexQualifiedColumnReferencesFromAst(
             start: node.start - lineStarts[pos.line],
             end: (node.end ?? node.start + String(node.name).length) - lineStarts[pos.line],
             kind: "column",
-            validateSchema: false
+            validateSchema: schemaValidated
         });
     });
 }
@@ -1066,6 +1134,59 @@ function indexInsertColumnReferencesFromAst(
             });
         }
     });
+}
+
+function indexMissingTableReferencesFromAst(
+    ast: ParseResult["ast"] | null,
+    normUri: string,
+    lineStarts: number[],
+    localRefs: ReferenceDef[],
+    processedTableRefs: Set<string>
+): void {
+    walkAst(ast, (node: any) => {
+        if (!node || node.type !== "TableReference") {
+            return;
+        }
+
+        const tableName = resolveTableNameFromNode(node.table);
+        const nameNode = getTableReferenceNameNode(node);
+        if (!tableName || !nameNode || typeof nameNode.start !== "number" || typeof nameNode.end !== "number") {
+            return;
+        }
+
+        const key = `${nameNode.start}:${nameNode.end}`;
+        if (processedTableRefs.has(key)) {
+            return;
+        }
+        processedTableRefs.add(key);
+
+        const pos = offsetToPosition(nameNode.start, lineStarts);
+        localRefs.push({
+            name: normalizeName(tableName),
+            uri: normUri,
+            line: pos.line,
+            start: nameNode.start - lineStarts[pos.line],
+            end: nameNode.end - lineStarts[pos.line],
+            kind: "table"
+        });
+    });
+}
+
+function getTableReferenceNameNode(node: any): any | null {
+    const table = node?.table;
+    if (!table || typeof table !== "object") {
+        return null;
+    }
+
+    if (table.type === "Identifier" && typeof table.name === "string") {
+        return table;
+    }
+
+    if (table.nameNode && typeof table.nameNode === "object") {
+        return table.nameNode;
+    }
+
+    return null;
 }
 
 function indexUpdateAssignmentColumnsFromAst(
@@ -1237,6 +1358,7 @@ function indexAliasReferencesFromAst(
             start: aliasRange.start - lineStarts[pos.line],
             end: aliasRange.end - lineStarts[pos.line],
             kind: "table",
+            context: "alias-declaration",
             validateSchema: false
         });
     });

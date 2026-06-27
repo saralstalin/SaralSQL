@@ -51,6 +51,25 @@ export function activate(context: vscode.ExtensionContext) {
 		clientOptions
 	);
 
+	context.subscriptions.push(
+		vscode.commands.registerCommand(
+			'saralsql.showReferences',
+			async (uriString: string, position: { line: number; character: number }, locations: any[]) => {
+				const uri = vscode.Uri.parse(uriString);
+				const pos = new vscode.Position(position.line, position.character);
+				const refs = (locations ?? []).map((loc) => new vscode.Location(
+					vscode.Uri.parse(loc.uri),
+					new vscode.Range(
+						new vscode.Position(loc.range.start.line, loc.range.start.character),
+						new vscode.Position(loc.range.end.line, loc.range.end.character)
+					)
+				));
+
+				await vscode.commands.executeCommand('editor.action.showReferences', uri, pos, refs);
+			}
+		)
+	);
+
 	client.start();
 }
 
