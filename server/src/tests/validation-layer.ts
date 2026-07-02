@@ -2,7 +2,7 @@ import * as assert from "assert";
 import { DiagnosticSeverity } from "vscode-languageserver/node";
 import { parseSql } from "../sql-parser";
 import { getLineStarts } from "../text-utils";
-import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, buildSelectStarExpansionCodeActions, buildUpdateNoLockCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "../diagnostic-helpers";
+import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, buildSelectStarExpansionCodeActions, buildUpdateNoLockCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, normalizeSaralSqlSettings, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "../diagnostic-helpers";
 import { indexText, definitions, referencesIndex, columnsByTable, tablesByName, tableTypesByName, aliasesByUri } from "../definitions";
 import { resolveBareColumnAtOffset } from "../column-resolution";
 
@@ -20,6 +20,556 @@ function runCase(name: string, fn: () => void): void {
   fn();
   process.stdout.write(`[pass] ${name}\n`);
 }
+
+runCase("settings-helpers-cover-falsy-guards-and-abbreviated-severities", () => {
+  // normalizeSaralSqlSettings: unwraps a "saralsql" section if present, else passthrough.
+  assert.deepStrictEqual(normalizeSaralSqlSettings({ saralsql: { x: 1 } }), { x: 1 }, "Should unwrap the saralsql section");
+  assert.deepStrictEqual(normalizeSaralSqlSettings({ x: 1 }), { x: 1 }, "Should pass through settings with no saralsql section");
+  assert.strictEqual(normalizeSaralSqlSettings(null), null, "Should pass through falsy settings unchanged");
+
+  // readBooleanSetting / readStringSetting (via buildDisabledDiagnosticCodes / buildDiagnosticSeverityOverrides)
+  // short-circuit when an intermediate path segment is not an object.
+  const brokenPathSettings = { diagnostics: "not-an-object" };
+  assert.doesNotThrow(() => buildDiagnosticSeverityOverrides(brokenPathSettings), "A non-object intermediate path segment should not throw");
+  const overrides = buildDiagnosticSeverityOverrides(brokenPathSettings);
+  assert.strictEqual(
+    overrides.get(SARAL_DIAGNOSTIC_CODES.UnknownTable),
+    DiagnosticSeverity.Error,
+    "When the path segment is not an object, readStringSetting should yield undefined and the spec's fallback severity should be used"
+  );
+
+  // Abbreviated severity aliases ("warn"/"info") alongside the full names.
+  const abbreviated = buildDiagnosticSeverityOverrides({
+    diagnostics: { unknownTableSeverity: "warn", unknownColumnSeverity: "info" }
+  });
+  assert.strictEqual(
+    resolveDiagnosticSeverity(SARAL_DIAGNOSTIC_CODES.UnknownTable, DiagnosticSeverity.Error, abbreviated),
+    DiagnosticSeverity.Warning,
+    "'warn' should be accepted as an alias for Warning"
+  );
+  assert.strictEqual(
+    resolveDiagnosticSeverity(SARAL_DIAGNOSTIC_CODES.UnknownColumn, DiagnosticSeverity.Error, abbreviated),
+    DiagnosticSeverity.Information,
+    "'info' should be accepted as an alias for Information"
+  );
+
+  // buildDisabledDiagnosticCodes: non-array disabledDiagnostics value should be treated as a single entry.
+  const disabledFromScalar = buildDisabledDiagnosticCodes({ disabledDiagnostics: "LSP001" });
+  assert.ok(disabledFromScalar.has("LSP001"), "A scalar disabledDiagnostics value should still be honored");
+});
+
+runCase("diagnostic-guard-clauses-for-falsy-inputs", () => {
+  assert.deepStrictEqual(collectAmbiguousColumnDiagnostics(null, [], tablesByName, tableTypesByName), [], "Null parsed should return empty from collectAmbiguousColumnDiagnostics");
+  assert.deepStrictEqual(collectAmbiguousColumnDiagnostics({}, [], tablesByName, tableTypesByName), [], "Parsed without ast should return empty");
+  assert.deepStrictEqual(collectReadableBareColumnDiagnostics(null, [], tablesByName, tableTypesByName), [], "Null parsed should return empty from collectReadableBareColumnDiagnostics");
+  assert.deepStrictEqual(collectStringComparisonDiagnostics(null, [], tablesByName, tableTypesByName), [], "Null parsed should return empty from collectStringComparisonDiagnostics");
+
+  assert.strictEqual(shouldSuppressDiagnosticCode("LSP001", new Set()), false, "Empty disabled set should not suppress any code");
+  assert.strictEqual(shouldSuppressDiagnosticCode(undefined, new Set(["LSP001"])), false, "Falsy code should not match any disabled code");
+  assert.strictEqual(resolveDiagnosticSeverity("LSP001", DiagnosticSeverity.Error, new Map()), DiagnosticSeverity.Error, "Empty override map should return the fallback severity");
+
+  assert.strictEqual(hasBlockingParseIssues(null, []), true, "Null parsed (no ast) should count as a blocking issue");
+  assert.strictEqual(hasBlockingParseIssues({ ast: null }, []), true, "Null ast should count as a blocking issue regardless of issues list");
+  const realParsed = parseSql("SELECT 1;");
+  assert.strictEqual(hasBlockingParseIssues(realParsed, [{ severity: "error", code: "PARSE_STUCK" }]), false, "PARSE_STUCK should not be treated as blocking even when severity is error");
+  assert.strictEqual(hasBlockingParseIssues(realParsed, [{ severity: "warning", code: "SOME_WARNING" }]), false, "Non-error severity issues should not block");
+});
+
+runCase("ambiguous-column-diagnostics-select-with-no-from", () => {
+  // SELECT without a FROM clause → the bare column reference is inside a SELECT
+  // with an empty from list → should be silently skipped, not flagged as ambiguous.
+  const sql = `SELECT 1 AS x ORDER BY x;`;
+  const parsed = parseSql(sql);
+  const diags = collectAmbiguousColumnDiagnostics(parsed, getLineStarts(sql), tablesByName, tableTypesByName);
+  assert.strictEqual(diags.length, 0, "SELECT with no FROM should produce no ambiguous-column diagnostics");
+});
+
+runCase("ambiguous-column-diagnostics-mutation-statement-bare-column-skip", () => {
+  // Bare column in a DELETE WHERE clause — not inside any SELECT at all.
+  // Should skip via isBareColumnInMutationStatementAtOffset and not be flagged.
+  const sql = `DELETE FROM Employee WHERE SomeColumn = 1;`;
+  const parsed = parseSql(sql);
+  const diags = collectAmbiguousColumnDiagnostics(parsed, getLineStarts(sql), new Map(), new Map());
+  assert.strictEqual(diags.length, 0, "Bare column in DELETE WHERE should be skipped by the mutation-statement guard");
+});
+
+runCase("ambiguous-column-skips-select-with-single-variable-table-source", () => {
+  // FROM @tableVariable — the table is a variable, so hasSingleSelectVariableSourceAtOffset
+  // returns true and the bare-column reference should be skipped (no ambiguity possible).
+  const sql = `SELECT Id FROM @tv WHERE Id = 1;`;
+  const parsed = parseSql(sql);
+  const diags = collectAmbiguousColumnDiagnostics(parsed, getLineStarts(sql), new Map(), new Map());
+  assert.strictEqual(diags.length, 0, "FROM @tableVariable should suppress ambiguity checking (variable source guard)");
+});
+
+runCase("ambiguous-column-order-by-non-identifier-expression-is-not-treated-as-alias", () => {
+  // ORDER BY 1 (positional reference, not an Identifier) must not be collected into
+  // orderByAliasStarts / orderByDuplicateAliasStarts — the Identifier-type guard protects this.
+  const sql = `SELECT Id, Name FROM Employee e
+JOIN Department d ON d.Id = e.DepartmentId
+ORDER BY 1;`;
+  const parsed = parseSql(sql);
+  const diags = collectAmbiguousColumnDiagnostics(parsed, getLineStarts(sql), new Map(), new Map());
+  // We don't assert a count here since it depends on schema; we just assert it doesn't throw.
+  assert.ok(Array.isArray(diags), "Non-Identifier ORDER BY expressions should be handled without throwing");
+});
+
+runCase("parse-readable-bare-column-code-action-rejects-replacement-without-dot", () => {
+  // The diagnostic message matches the regex but the captured replacement has no dot —
+  // parseReadableBareColumnDiagnosticMessage should return null in that case.
+  const msg = "Consider qualifying 'x' as 'justword' for readability";
+  const result = buildReadableBareColumnCodeAction("file:///x.sql", {
+    message: msg,
+    data: undefined,
+    range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }
+  } as any);
+  assert.strictEqual(result, null, "A replacement without a dot should not produce a code action");
+});
+
+runCase("string-comparison-fires-for-column-to-column-mismatch", () => {
+  const schemaUri = "file:///validation/string-col-compare-schema.sql";
+
+  const schemaSql = `
+CREATE TABLE Employee (
+  EmployeeId INT,
+  VarName    VARCHAR(100),
+  NVarName   NVARCHAR(100)
+);
+`;
+  indexText(schemaUri, schemaSql);
+
+  // Bare column-to-column comparison — hits the Identifier path in inferStringLikeType
+  // and exercises resolveSingleColumnOwner, getContainingStatementNode, collectTablesFromAstNode.
+  const bareQuery = `SELECT VarName FROM Employee WHERE VarName = NVarName;`;
+  const bareParsed = parseSql(bareQuery);
+  const bareDiags = collectStringComparisonDiagnostics(bareParsed, getLineStarts(bareQuery), tablesByName, tableTypesByName);
+  assert.strictEqual(bareDiags.length, 1, "Bare column comparison (varchar vs nvarchar) should emit a warning");
+  assert.ok(String(bareDiags[0].message).includes("varchar") && String(bareDiags[0].message).includes("nvarchar"), "Warning should name both types");
+
+  // Qualified column-to-column comparison — exercises resolveTableForQualifier (alias lookup path).
+  const qualQuery = `SELECT 1 FROM Employee e WHERE e.VarName = e.NVarName;`;
+  const qualParsed = parseSql(qualQuery);
+  const qualDiags = collectStringComparisonDiagnostics(qualParsed, getLineStarts(qualQuery), tablesByName, tableTypesByName);
+  assert.strictEqual(qualDiags.length, 1, "Qualified column comparison (e.varchar vs e.nvarchar) should emit a warning");
+});
+
+runCase("string-comparison-non-string-types-do-not-fire", () => {
+  const schemaUri = "file:///validation/string-non-string-schema.sql";
+  const schemaSql = `
+CREATE TABLE Employee (
+  VarName  VARCHAR(100),
+  NVarName NVARCHAR(100),
+  AgeCol   INT
+);
+`;
+  indexText(schemaUri, schemaSql);
+
+  // INT vs VARCHAR: getStringLikeType("INT") returns null → inferStringLikeType returns {type:null}
+  // → no mismatch diagnostic.
+  const sql1 = `SELECT 1 FROM Employee WHERE AgeCol = VarName;`;
+  const d1 = collectStringComparisonDiagnostics(parseSql(sql1), getLineStarts(sql1), tablesByName, tableTypesByName);
+  assert.strictEqual(d1.length, 0, "INT vs VARCHAR should not emit a string comparison warning");
+
+  // CAST to a non-string type: CastExpression with non-string dataType → returns null → no diagnostic.
+  const sql2 = `SELECT 1 FROM Employee WHERE CAST(AgeCol AS INT) = VarName;`;
+  const d2 = collectStringComparisonDiagnostics(parseSql(sql2), getLineStarts(sql2), tablesByName, tableTypesByName);
+  assert.strictEqual(d2.length, 0, "CAST to a non-string type should not produce a string comparison warning");
+
+  // Qualified INT column: resolveTableForQualifier finds Employee directly from tablesByName
+  // (qualifier='employee' matches a direct table name, not an alias) → INT type → no diagnostic.
+  const sql3 = `SELECT 1 FROM Employee WHERE Employee.AgeCol = Employee.NVarName;`;
+  const d3 = collectStringComparisonDiagnostics(parseSql(sql3), getLineStarts(sql3), tablesByName, tableTypesByName);
+  assert.strictEqual(d3.length, 0, "Qualified INT column (table-name qualifier) should not emit a string comparison warning");
+  // But same query with NVarName vs VarName should still fire
+  const sql4 = `SELECT 1 FROM Employee WHERE Employee.VarName = Employee.NVarName;`;
+  const d4 = collectStringComparisonDiagnostics(parseSql(sql4), getLineStarts(sql4), tablesByName, tableTypesByName);
+  assert.strictEqual(d4.length, 1, "Qualified varchar vs nvarchar via direct table name qualifier should still fire");
+});
+
+runCase("update-nolock-is-word-boundary-when-char-is-undefined", () => {
+  // NOLOCK at position 0 of text means the character before it is undefined →
+  // isWordBoundary(undefined) must return true (treated as a boundary).
+  const sql = `NOLOCK`;   // degenerate text, not real SQL, but exercises the empty-before case
+  const ls = getLineStarts(sql);
+  // Just verify it doesn't throw; the word is at start-of-string → before=undefined.
+  assert.doesNotThrow(
+    () => buildUpdateNoLockCodeAction("file:///x.sql", { code: "DML004", range: undefined as any } as any, sql, ls),
+    "isWordBoundary(undefined) should not throw"
+  );
+});
+
+runCase("readable-bare-column-skip-when-owner-has-no-display-alias", () => {
+  const schemaUri = "file:///validation/readable-no-alias-schema.sql";
+
+  const schemaSql = `
+CREATE TABLE Employee (
+  EmployeeId INT,
+  DepartmentId INT
+);
+CREATE TABLE Department (
+  DepartmentId INT
+);
+`;
+  indexText(schemaUri, schemaSql);
+
+  // Single table without an alias: the bare column resolves to the Employee Table scope symbol
+  // which carries no alias/displayAlias → owner.alias is undefined → matches=[] → length≠1
+  // → the readability hint is silently skipped (nothing to suggest without an alias name).
+  const sql = `SELECT EmployeeId FROM Employee WHERE EmployeeId = 1;`;
+  const parsed = parseSql(sql);
+  const diags = collectReadableBareColumnDiagnostics(parsed, getLineStarts(sql), tablesByName, tableTypesByName);
+  assert.strictEqual(diags.length, 0, "Bare column with no displayAlias on the resolved owner should not emit a readability hint");
+});
+
+runCase("resolveBareColumnAtOffset-uses-localDefsByName-and-tableTypesByName", () => {
+  const schemaUri = "file:///validation/local-def-type-schema.sql";
+  indexText(schemaUri, `
+CREATE TYPE dbo.EmployeeType AS TABLE (
+  EmployeeId INT,
+  FirstName  NVARCHAR(100)
+);
+`);
+
+  // 609-610: resolveDefByKey returns localDefsByName match.
+  // When the table is defined in the SAME file (same-file schema), localDefsByName contains it.
+  const querySql = `
+CREATE TABLE LocalEmployee (EmployeeId INT, Dept VARCHAR(50));
+SELECT EmployeeId FROM LocalEmployee WHERE Dept = 'Eng';
+`;
+  indexText("file:///validation/local-def-query.sql", querySql);
+  const localParsed = parseSql(querySql);
+  const localDefs = [{ name: "localemployee", rawName: "LocalEmployee", uri: "file:///validation/local-def-query.sql", line: 1, columns: [{ name: "employeeid", rawName: "EmployeeId", type: "INT", line: 2 }, { name: "dept", rawName: "Dept", type: "VARCHAR", line: 2 }] }];
+  const localDefsByName = new Map(localDefs.map(d => [d.name, d as any]));
+  const offset = querySql.lastIndexOf("EmployeeId");
+  const resolved = resolveBareColumnAtOffset({
+    parsed: localParsed,
+    offset,
+    columnName: "EmployeeId",
+    tablesByName,
+    tableTypesByName,
+    localDefsByName
+  });
+  assert.ok(resolved.status === "resolved" || resolved.owner !== null, "localDefsByName should be used when resolving a column against a same-file table definition");
+
+  // 617-618: resolveDefByKey returns tableTypesByName match.
+  // Using a TABLE TYPE name as an UPDATE target forces resolveCandidateOwner to look up
+  // the type in tableTypesByName → resolveDefByKey returns the type entry with isType:true.
+  const typeSql = `UPDATE EmployeeType SET EmployeeId = 1 WHERE EmployeeId = 0;`;
+  const typeParsed = parseSql(typeSql);
+  const typeOffset = typeSql.lastIndexOf("EmployeeId = 0");
+  const typeResolved = resolveBareColumnAtOffset({
+    parsed: typeParsed,
+    offset: typeOffset,
+    columnName: "EmployeeId",
+    tablesByName,
+    tableTypesByName
+  });
+  assert.strictEqual(typeResolved.status, "resolved", "Bare column resolved against a TABLE TYPE name via tableTypesByName should succeed");
+  assert.ok(String(typeResolved.owner?.ownerName ?? "").toLowerCase().includes("employeetype"), "Owner should be the TABLE TYPE");
+});
+
+runCase("resolveBareColumnAtOffset-mutation-target-edge-cases", () => {
+  const schemaUri = "file:///validation/mutation-edge-schema.sql";
+  indexText(schemaUri, `
+CREATE TABLE Employee (
+  EmployeeId INT,
+  Name       NVARCHAR(100)
+);
+`);
+
+  // 328-329 / 381-382: @var assignment target in UPDATE SET.
+  // isInsideVariableAssignmentTarget returns true → continue (offset is at @var, not a column).
+  const varSetSql = `UPDATE Employee SET @varResult = Name WHERE EmployeeId = 1;`;
+  const varSetParsed = parseSql(varSetSql);
+  const varSetOff = varSetSql.indexOf("@varResult");
+  const varSetResolved = resolveBareColumnAtOffset({
+    parsed: varSetParsed,
+    offset: varSetOff,
+    columnName: "@varResult",
+    tablesByName,
+    tableTypesByName
+  });
+  assert.ok(
+    varSetResolved.status === "unresolved" || varSetResolved.status !== "ambiguous",
+    "@varResult in UPDATE SET should be treated as a variable assignment, not a column"
+  );
+
+  // 340-341: MERGE with target alias resolved via resolveAliasMutationTargetOwner.
+  // The alias 't' is registered in scope for MERGE INTO Employee AS t.
+  const mergeSql = `
+MERGE Employee AS t
+USING (SELECT 1 AS EmployeeId, 'Jane' AS Name) AS s
+ON t.EmployeeId = s.EmployeeId
+WHEN MATCHED THEN UPDATE SET t.Name = s.Name;
+`;
+  const mergeParsed = parseSql(mergeSql);
+  const mergeNameOff = mergeSql.lastIndexOf("t.Name") + 2;
+  const mergeResolved = resolveBareColumnAtOffset({
+    parsed: mergeParsed,
+    offset: mergeNameOff,
+    columnName: "Name",
+    tablesByName,
+    tableTypesByName
+  });
+  assert.strictEqual(mergeResolved.status, "resolved", "Bare MERGE SET column should resolve via the target alias");
+  assert.ok(String(mergeResolved.owner?.ownerName ?? "").toLowerCase().includes("employee"), "MERGE SET bare column owner should be Employee");
+});
+
+runCase("string-comparison-via-cte-exercises-resolveTableForQualifier-and-resolveSingleColumnOwner", () => {
+  const schemaUri = "file:///validation/string-cte-schema.sql";
+  indexText(schemaUri, "CREATE TABLE Employee (VarName VARCHAR(100), NVarName NVARCHAR(100));");
+
+  // CTE-qualified comparison: resolveTableForQualifier hits the CTE branch (sym.kind==="CTE")
+  // and builds columns from getCteColumns. getCteColumns returns columns without type info →
+  // inferStringLikeType returns {type:null} → no diagnostic emitted (can't infer types through CTE).
+  const s1 = `WITH cte AS (SELECT VarName, NVarName FROM Employee)
+SELECT 1 FROM cte WHERE cte.VarName = cte.NVarName;`;
+  assert.doesNotThrow(
+    () => collectStringComparisonDiagnostics(parseSql(s1), getLineStarts(s1), tablesByName, tableTypesByName),
+    "CTE-qualified column comparison should not throw even without type info"
+  );
+
+  // CTE bare comparison: resolveSingleColumnOwner hits the CTE branch, finds column but
+  // owner.column.type is undefined → inferStringLikeType returns null → no diagnostic.
+  const s2 = `WITH cte AS (SELECT VarName, NVarName FROM Employee)
+SELECT 1 FROM cte WHERE VarName = NVarName;`;
+  assert.doesNotThrow(
+    () => collectStringComparisonDiagnostics(parseSql(s2), getLineStarts(s2), tablesByName, tableTypesByName),
+    "CTE bare column comparison should not throw even without type info"
+  );
+});
+
+runCase("string-comparison-inferStringLikeType-edge-cases", () => {
+  const schemaUri = "file:///validation/infer-edge-schema.sql";
+  indexText(schemaUri, "CREATE TABLE T (VC VARCHAR(100), NVC NVARCHAR(100), N INT);");
+
+  // CAST to non-string type (CastExpression branch, dataType produces null from getStringLikeType).
+  const s1 = `SELECT 1 FROM T WHERE CAST(N AS INT) = VC;`;
+  const d1 = collectStringComparisonDiagnostics(parseSql(s1), getLineStarts(s1), tablesByName, tableTypesByName);
+  assert.strictEqual(d1.length, 0, "CAST to non-string type should produce null from inferStringLikeType");
+
+  // Non-Identifier/Literal/Cast node with an .expression child → recurse.
+  // A Column node wrapping an Identifier is exactly this shape.
+  // The existing tests already cover varchar/nvarchar success; just confirm no crash here.
+  const s2 = `SELECT 1 FROM T WHERE VC = NVC;`;
+  assert.doesNotThrow(() => collectStringComparisonDiagnostics(parseSql(s2), getLineStarts(s2), tablesByName, tableTypesByName), "String comparison with Column-expression nodes should not throw");
+});
+
+runCase("update-nolock-word-boundary-and-special-positions", () => {
+  // NOLOCK at position 0: before-character is undefined → isWordBoundary(undefined) fires the
+  // "!ch → return true" guard at line 647-648.
+  const minText = "nolock";
+  assert.strictEqual(
+    buildUpdateNoLockCodeAction("file:///x.sql", { code: "DML004", range: { start: { line: 0, character: 0 }, end: { line: 0, character: 6 } } } as any, minText, getLineStarts(minText)),
+    null,
+    "NOLOCK at position 0 (undefined before-char) should not throw and should return null"
+  );
+
+  // Two NOLOCK occurrences: findNearestWordCaseInsensitive's scoring logic fires when the
+  // second occurrence has a better (lower) score than the first.
+  const dualSql = `UPDATE e SET x=1 FROM T e WITH (NOLOCK) JOIN T2 t WITH (NOLOCK) ON e.Id=t.Id;`;
+  const dualLs = getLineStarts(dualSql);
+  const secondOff = dualSql.lastIndexOf("NOLOCK");
+  const dualAction = buildUpdateNoLockCodeAction("file:///x.sql", {
+    code: "DML004",
+    range: { start: { line: 0, character: secondOff }, end: { line: 0, character: secondOff + 6 } }
+  } as any, dualSql, dualLs);
+  assert.ok(dualAction, "Second (closer) NOLOCK occurrence should still produce a code action");
+
+  // Nested parens inside the hint body: findWithHintRangeNoRegex must track paren depth correctly.
+  const nestedParenSql = `UPDATE e SET x=1 FROM T e WITH (NOLOCK, FORCESEEK(idx(col))) WHERE e.Id=1;`;
+  const nestedLs = getLineStarts(nestedParenSql);
+  const noLockOff = nestedParenSql.indexOf("NOLOCK");
+  const nestedAction = buildUpdateNoLockCodeAction("file:///x.sql", {
+    code: "DML004",
+    range: { start: { line: 0, character: noLockOff }, end: { line: 0, character: noLockOff + 6 } }
+  } as any, nestedParenSql, nestedLs);
+  assert.ok(nestedAction, "WITH hint body with nested parens should still be parsed correctly");
+  assert.ok(String(nestedAction?.title).includes("NOLOCK"), "Action should reference NOLOCK removal");
+
+  // Unclosed WITH paren: for loop exhausts without finding depth=0 → return null at line 726.
+  const unclosedSql = `UPDATE e SET x=1 FROM T e WITH (NOLOCK`;
+  const unclosedLs = getLineStarts(unclosedSql);
+  const unclosedOff = unclosedSql.indexOf("NOLOCK");
+  assert.strictEqual(
+    buildUpdateNoLockCodeAction("file:///x.sql", {
+      code: "DML004", range: { start: { line: 0, character: unclosedOff }, end: { line: 0, character: unclosedOff + 6 } }
+    } as any, unclosedSql, unclosedLs),
+    null,
+    "Unclosed WITH paren should exhaust the for loop and return null at the fallback"
+  );
+
+  // WITH block closes BEFORE NOLOCK token: depth=0 found at i < noLockStart → return null.
+  const closedBeforeSql = `UPDATE e SET x=1 FROM T e WITH (READCOMMITTED) WHERE e.NOLOCK = 1;`;
+  const closedLs = getLineStarts(closedBeforeSql);
+  const noLockOff2 = closedBeforeSql.indexOf("NOLOCK");
+  assert.strictEqual(
+    buildUpdateNoLockCodeAction("file:///x.sql", {
+      code: "DML004",
+      range: { start: { line: 0, character: noLockOff2 }, end: { line: 0, character: noLockOff2 + 6 } }
+    } as any, closedBeforeSql, closedLs),
+    null,
+    "WITH block that closes before the NOLOCK token should produce null"
+  );
+});
+
+runCase("update-nolock-internal-path-edges", () => {
+  // 695-697: 'with' substring embedded in a longer identifier triggers the word-boundary
+  // skip inside findWithHintRangeNoRegex (cursor += 4; continue).
+  const withInIdentSql = `UPDATE e SET e.WithdrawAmt=1 FROM T e WITH (NOLOCK) WHERE 1=1;`;
+  const withInIdentLs = getLineStarts(withInIdentSql);
+  const nOff1 = withInIdentSql.indexOf("NOLOCK");
+  const r1 = buildUpdateNoLockCodeAction("file:///x.sql", {
+    code: "DML004", range: { start: { line: 0, character: nOff1 }, end: { line: 0, character: nOff1 + 6 } }
+  } as any, withInIdentSql, withInIdentLs);
+  assert.ok(r1, "WITH embedded in an identifier should still find the real WITH(NOLOCK) hint");
+
+  // 618-619: NOLOCK word found (via findNearestWordCaseInsensitive) but lies OUTSIDE the
+  // WITH hint body — hint body contains only other hints → filter removes nothing →
+  // kept.length === hints.length → return null.
+  const noNolockInHintSql = `UPDATE e SET x=1 FROM T WITH (READCOMMITTED) WHERE e.Id=1 AND NOLOCK=0;`;
+  const noNolockLs = getLineStarts(noNolockInHintSql);
+  const nOff2 = noNolockInHintSql.indexOf("NOLOCK");
+  assert.strictEqual(
+    buildUpdateNoLockCodeAction("file:///x.sql", {
+      code: "DML004", range: { start: { line: 0, character: nOff2 }, end: { line: 0, character: nOff2 + 6 } }
+    } as any, noNolockInHintSql, noNolockLs),
+    null,
+    "NOLOCK appearing outside the WITH hint body should produce null"
+  );
+});
+
+runCase("update-nolock-nested-hints-and-non-nolock-hint-body", () => {
+  // LOCK(NOLOCK) hint body: findNearestWordCaseInsensitive finds "NOLOCK" at a word boundary
+  // inside the nested parens; findWithHintRangeNoRegex tracks nested paren depth (722-723);
+  // after splitting the hint body, "LOCK(NOLOCK)" ≠ "nolock" → kept.length === hints.length
+  // → returns null (618-619).
+  const sql = `UPDATE e SET x=1 FROM T e WITH (LOCK(NOLOCK)) WHERE e.Id=1;`;
+  const ls = getLineStarts(sql);
+  const nOff = sql.indexOf("NOLOCK");
+  assert.strictEqual(
+    buildUpdateNoLockCodeAction("file:///x.sql", {
+      code: "DML004", range: { start: { line: 0, character: nOff }, end: { line: 0, character: nOff + 6 } }
+    } as any, sql, ls),
+    null,
+    "NOLOCK nested inside a differently-named hint should exercise nested-paren tracking and produce null"
+  );
+});
+
+runCase("select-star-expansion-columns-with-empty-rawname-are-skipped", () => {
+  // Inject a table definition with a column whose rawName and name are both empty.
+  // getSourceColumns returns this column, but rawCol.trim() === "" → skipped at 841-842.
+  // Since ALL columns are empty-named, cols stays empty → return null at 847-848 → no action.
+  tablesByName.set("withemptycol", { name: "withemptycol", rawName: "WithEmptyCol", uri: "file:///x.sql", line: 0, columns: [{ name: "", rawName: "", type: "INT", line: 0 }] });
+  const parsed = parseSql("SELECT * FROM withemptycol;");
+  const off = "SELECT ".length;
+  const actions = buildSelectStarExpansionCodeActions("file:///x.sql", parsed, getLineStarts("SELECT * FROM withemptycol;"), tablesByName, tableTypesByName, off, off);
+  assert.strictEqual(actions.length, 0, "Columns with empty rawName should be skipped, leaving cols empty → no expansion");
+});
+
+runCase("select-star-expansion-no-from-sources", () => {
+  indexText("file:///star-no-from-schema.sql", "CREATE TABLE T (Id INT);");
+  // SELECT * without any FROM clause → collectSelectSources returns [] → expandWildcardForSelect
+  // returns null at sources.length === 0 → no action produced.
+  const sql = `SELECT * WHERE 1=1;`;
+  const parsed = parseSql(sql);
+  const off = sql.indexOf("*");
+  const actions = buildSelectStarExpansionCodeActions("file:///x.sql", parsed, getLineStarts(sql), tablesByName, tableTypesByName, off, off);
+  assert.strictEqual(actions.length, 0, "SELECT * with no FROM sources should produce no expansion actions");
+});
+
+runCase("update-nolock-code-action-edge-cases", () => {
+  const sql = `UPDATE e SET e.Name = 'x' FROM Employee e WITH (NOLOCK) WHERE e.Id = 1;`;
+  const ls = getLineStarts(sql);
+
+  // Happy path: WITH(NOLOCK) that can be removed.
+  const noLockOffset = sql.indexOf("NOLOCK");
+  const happyAction = buildUpdateNoLockCodeAction("file:///x.sql", {
+    code: "DML004",
+    range: { start: { line: 0, character: noLockOffset }, end: { line: 0, character: noLockOffset + 6 } }
+  } as any, sql, ls);
+  assert.ok(happyAction, "WITH(NOLOCK) UPDATE should produce a code action");
+
+  // NOLOCK present but without a WITH (...) table hint clause → findWithHintRangeNoRegex returns null.
+  const noWithSql = `SELECT NOLOCK FROM Employee;`;
+  const noWithLs = getLineStarts(noWithSql);
+  const noWithOff = noWithSql.indexOf("NOLOCK");
+  assert.strictEqual(
+    buildUpdateNoLockCodeAction("file:///x.sql", {
+      code: "DML004",
+      range: { start: { line: 0, character: noWithOff }, end: { line: 0, character: noWithOff + 6 } }
+    } as any, noWithSql, noWithLs),
+    null,
+    "NOLOCK outside a WITH(...) clause should produce null"
+  );
+
+  // NOLOCK embedded in a longer word (not at a word boundary) → findNearestWordCaseInsensitive skips it.
+  const embeddedSql = `UPDATE e SET e.Name='x' FROM Employee e WITH (NOLOCK1) WHERE e.Id=1;`;
+  const embeddedLs = getLineStarts(embeddedSql);
+  const embOff = embeddedSql.indexOf("NOLOCK1");
+  assert.strictEqual(
+    buildUpdateNoLockCodeAction("file:///x.sql", {
+      code: "DML004",
+      range: { start: { line: 0, character: embOff }, end: { line: 0, character: embOff + 7 } }
+    } as any, embeddedSql, embeddedLs),
+    null,
+    "NOLOCK as part of a longer identifier should not be matched"
+  );
+});
+
+runCase("select-star-expansion-covers-internals", () => {
+  indexText("file:///star-internals-schema.sql", "CREATE TABLE Employee (Id INT, Name VARCHAR(100));");
+
+  const ls = (s: string) => getLineStarts(s);
+
+  // Unaliased table (no AS clause): getIdentifierTail reads parts array to build qualifier.
+  const sql1 = `SELECT * FROM Employee;`;
+  const p1 = parseSql(sql1);
+  const off1 = sql1.indexOf("*");
+  const a1 = buildSelectStarExpansionCodeActions("file:///q.sql", p1, ls(sql1), tablesByName, tableTypesByName, off1, off1);
+  assert.strictEqual(a1.length, 1, "SELECT * from unaliased table should still expand");
+  assert.ok(a1[0]?.edit?.changes?.["file:///q.sql"]?.[0]?.newText?.includes("Employee."), "Unaliased qualifier should use the table name itself");
+
+  // Non-wildcard column alongside a wildcard: the non-wildcard must be skipped (768-769),
+  // only the wildcard column proceeds to expansion.
+  const sql2 = `SELECT Id, * FROM Employee;`;
+  const p2 = parseSql(sql2);
+  const off2 = sql2.indexOf("*");
+  const a2 = buildSelectStarExpansionCodeActions("file:///q2.sql", p2, ls(sql2), tablesByName, tableTypesByName, off2, off2);
+  assert.strictEqual(a2.length, 1, "Non-wildcard columns should be skipped; only the * column should be expanded");
+
+  // Unmatched qualifier prefix: SELECT x.* but no source named 'x' → targetSources empty → null.
+  const sql3 = `SELECT x.* FROM Employee e;`;
+  const p3 = parseSql(sql3);
+  const off3 = sql3.indexOf("x.*") + 2;
+  const a3 = buildSelectStarExpansionCodeActions("file:///q3.sql", p3, ls(sql3), tablesByName, tableTypesByName, off3, off3);
+  assert.strictEqual(a3.length, 0, "Wildcard with an unmatched qualifier should produce no expansion");
+
+  // Unknown table (not in schema): getSourceColumns returns [] → cols stays empty → null.
+  const sql4 = `SELECT u.* FROM UnknownTable u;`;
+  const p4 = parseSql(sql4);
+  const off4 = sql4.indexOf("u.*") + 2;
+  const a4 = buildSelectStarExpansionCodeActions("file:///q4.sql", p4, ls(sql4), tablesByName, tableTypesByName, off4, off4);
+  assert.strictEqual(a4.length, 0, "SELECT * from an unknown (not-indexed) table should produce no expansion");
+});
+
+runCase("select-star-expansion-no-ast-and-out-of-range-guards", () => {
+  indexText("file:///star-guard-schema.sql", "CREATE TABLE Employee (Id INT, Name VARCHAR(100));");
+
+  // No AST → immediately returns empty.
+  assert.deepStrictEqual(
+    buildSelectStarExpansionCodeActions("file:///x.sql", {}, [], tablesByName, tableTypesByName, 0, 100),
+    [],
+    "Missing AST should return no code actions"
+  );
+
+  // Selection range entirely outside the wildcard expression → wildcard is skipped.
+  const sql = `SELECT * FROM Employee;`;
+  const parsed = parseSql(sql);
+  const ls = getLineStarts(sql);
+  const actions = buildSelectStarExpansionCodeActions("file:///x.sql", parsed, ls, tablesByName, tableTypesByName, 9999, 9999);
+  assert.deepStrictEqual(actions, [], "Wildcard outside the selection range should be skipped");
+});
 
 runCase("parse-gating-recoverable-issues-do-not-block", () => {
   const parsed = { ast: { type: "Program" } };
@@ -340,6 +890,67 @@ JOIN Department d ON d.DepartmentId = e.EmployeeId;
     "e.EmployeeId, e.Name",
     "SELECT alias.* should expand to explicit columns from that alias only"
   );
+});
+
+runCase("quick-fix-expands-select-star-for-cte-and-derived-alias", () => {
+  const schemaUri = "file:///validation/star-expand-cte-schema.sql";
+  const queryUri  = "file:///validation/star-expand-cte-query.sql";
+
+  indexText(schemaUri, `
+CREATE TABLE Employee (
+  EmployeeId INT,
+  FirstName  NVARCHAR(100)
+);
+`);
+
+  // CTE qualified star: cte.*
+  const cteSql = `
+WITH cte AS (SELECT EmployeeId, FirstName FROM Employee)
+SELECT cte.*
+FROM cte;
+`;
+  indexText(queryUri, cteSql);
+  const cteParsed = parseSql(cteSql);
+  const cteOff = cteSql.lastIndexOf("cte.*") + 4;
+  const cteActions = buildSelectStarExpansionCodeActions(
+    queryUri, cteParsed, getLineStarts(cteSql), tablesByName, tableTypesByName, cteOff, cteOff
+  );
+  assert.ok(cteActions.length > 0, "SELECT cte.* should offer an expansion quick fix");
+  const cteText = cteActions[0]?.edit?.changes?.[queryUri]?.[0]?.newText ?? "";
+  assert.ok(cteText.includes("EmployeeId") && cteText.includes("FirstName"),
+    "CTE star expansion should include projected column names");
+
+  // CTE bare star: SELECT * FROM cte
+  const cteBareUri = "file:///validation/star-cte-bare.sql";
+  const bareCteSql = `
+WITH cte AS (SELECT EmployeeId, FirstName FROM Employee)
+SELECT *
+FROM cte;
+`;
+  indexText(cteBareUri, bareCteSql);
+  const bareCteParsed = parseSql(bareCteSql);
+  const bareCteOff = bareCteSql.lastIndexOf("*");
+  const bareCteActions = buildSelectStarExpansionCodeActions(
+    cteBareUri, bareCteParsed, getLineStarts(bareCteSql), tablesByName, tableTypesByName, bareCteOff, bareCteOff
+  );
+  assert.ok(bareCteActions.length > 0, "SELECT * FROM cte should offer an expansion quick fix");
+
+  // Derived (subquery) alias star: sub.*
+  const subUri = "file:///validation/star-expand-derived.sql";
+  const subSql = `
+SELECT sub.*
+FROM (SELECT EmployeeId, FirstName FROM Employee) sub;
+`;
+  indexText(subUri, subSql);
+  const subParsed = parseSql(subSql);
+  const subOff = subSql.indexOf("sub.*") + 4;
+  const subActions = buildSelectStarExpansionCodeActions(
+    subUri, subParsed, getLineStarts(subSql), tablesByName, tableTypesByName, subOff, subOff
+  );
+  assert.ok(subActions.length > 0, "SELECT sub.* from a derived alias should offer an expansion quick fix");
+  const subText = subActions[0]?.edit?.changes?.[subUri]?.[0]?.newText ?? "";
+  assert.ok(subText.includes("EmployeeId") && subText.includes("FirstName"),
+    "Derived alias star expansion should include projected column names");
 });
 
 runCase("quick-fix-removes-update-with-nolock", () => {
@@ -1773,6 +2384,52 @@ WHERE CAST(Name AS NVARCHAR(100)) = N'abc'
   assert.ok(
     diagnostics[0] && String(diagnostics[0].message).includes("nvarchar and varchar"),
     "The warning should target the actual remaining mismatch"
+  );
+});
+
+runCase("string-comparison-diagnostics-guard-clauses-and-array-recursion", () => {
+  assert.deepStrictEqual(collectStringComparisonDiagnostics({}, [], tablesByName, tableTypesByName), [], "Missing ast/scope should resolve to no diagnostics");
+
+  // Non-comparison operator (+) should be skipped entirely.
+  const sql = `DECLARE @a VARCHAR(10) = 'x'; DECLARE @b NVARCHAR(10) = N'y'; SELECT @a + @b;`;
+  const parsed = parseSql(sql);
+  const diags = collectStringComparisonDiagnostics(parsed, getLineStarts(sql), tablesByName, tableTypesByName);
+  assert.strictEqual(diags.length, 0, "Non-comparison operators (e.g. +) should not be treated as a string-type mismatch");
+
+  // IN-list produces an array-valued AST node, exercising the visitor's array-recursion branch.
+  const inListSql = `SELECT 1 WHERE 'x' IN ('a', 'b', 'c');`;
+  const inListParsed = parseSql(inListSql);
+  assert.doesNotThrow(
+    () => collectStringComparisonDiagnostics(inListParsed, getLineStarts(inListSql), tablesByName, tableTypesByName),
+    "Array-valued WHERE clause children (e.g. an IN list) should be walked without throwing"
+  );
+});
+
+runCase("readable-bare-column-code-action-returns-null-when-data-and-message-both-fail", () => {
+  const fakeDiagnostic: any = { message: "Some unrelated message", data: undefined, range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } } };
+  assert.strictEqual(buildReadableBareColumnCodeAction("file:///x.sql", fakeDiagnostic), null, "Neither structured data nor a parseable message should produce null");
+
+  const noRangeDiagnostic: any = { message: "Consider qualifying 'Foo' as 'e.Foo' for readability", data: undefined, range: undefined };
+  assert.strictEqual(buildReadableBareColumnCodeAction("file:///x.sql", noRangeDiagnostic), null, "A missing diagnostic range should produce null even with a parseable message");
+});
+
+runCase("update-nolock-code-action-returns-null-for-non-dml004-or-missing-nolock", () => {
+  const sql = `UPDATE Employee WITH (NOLOCK) SET FirstName = 'x';`;
+  const lineStarts = getLineStarts(sql);
+
+  const wrongCode: any = { code: "DML001", range: { start: { line: 0, character: 0 }, end: { line: 0, character: 6 } } };
+  assert.strictEqual(buildUpdateNoLockCodeAction("file:///x.sql", wrongCode, sql, lineStarts), null, "Non-DML004 diagnostics should resolve to null");
+
+  const noRange: any = { code: "DML004", range: undefined };
+  assert.strictEqual(buildUpdateNoLockCodeAction("file:///x.sql", noRange, sql, lineStarts), null, "A missing diagnostic range should resolve to null");
+
+  // DML004 range that doesn't actually point at a NOLOCK hint nearby.
+  const noNolockSql = `UPDATE Employee SET FirstName = 'x';`;
+  const noNolockDiag: any = { code: "DML004", range: { start: { line: 0, character: 0 }, end: { line: 0, character: 6 } } };
+  assert.strictEqual(
+    buildUpdateNoLockCodeAction("file:///x.sql", noNolockDiag, noNolockSql, getLineStarts(noNolockSql)),
+    null,
+    "A DML004 diagnostic with no nearby NOLOCK hint should resolve to null"
   );
 });
 

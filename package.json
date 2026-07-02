@@ -402,6 +402,7 @@
     "test:regression": "npm run compile-tests && node out/server/src/tests/regression-index.js",
     "test:validation": "npm run compile-tests && node out/server/src/tests/validation-layer.js",
     "test:all-local": "npm run test:regression && npm run test:validation",
+    "coverage": "npm run compile-tests && node --experimental-test-coverage --test out/server/src/tests/all.js",
     "check-types": "tsc --noEmit",
     "lint": "eslint src --ext ts",
     "test": "vscode-test"

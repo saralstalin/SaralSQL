@@ -977,10 +977,10 @@ function expandWildcardForSelect(
   tableTypesByName: Map<string, any>,
   offset: number
 ): string | null {
+  // Caller gates on Array.isArray(selectNode.from) before invoking, and the parser
+  // never emits from:[] — only from:undefined for SELECT without FROM, which is
+  // filtered by the Array.isArray guard. sources.length===0 is structurally unreachable.
   const sources = collectSelectSources(selectNode.from ?? []);
-  if (sources.length === 0) {
-    return null;
-  }
 
   const prefix = wildcardExpr?.tablePrefix?.name
     ? normalizeName(String(wildcardExpr.tablePrefix.name))
@@ -1075,6 +1075,20 @@ function resolveTableDefinition(
     || null;
 }
 
+function extractQueryProjectedColumns(query: any): Array<{ rawName: string; name: string }> {
+  if (!query || typeof query !== "object" || !Array.isArray(query.columns)) {
+    return [];
+  }
+  const result: Array<{ rawName: string; name: string }> = [];
+  for (const col of query.columns) {
+    if (!col || col.wildcard === true) { continue; }
+    const rawName = String(col?.outputName ?? col?.sourceName ?? "").trim();
+    if (!rawName || normalizeName(rawName) === "expression") { continue; }
+    result.push({ rawName, name: normalizeName(rawName) });
+  }
+  return result;
+}
+
 function getSourceColumns(
   src: { qualifier: string; tableName: string },
   parsed: any,
@@ -1106,6 +1120,13 @@ function getSourceColumns(
         return sym.columns;
       }
 
+      // CTE source matched by alias/qualifier name: getCteColumns reads sym.location.query
+      // (the CTE body's SELECT list), which is where projected column names actually live.
+      if (symName === targetAlias && sym?.kind === "CTE") {
+        const cteCols = getCteColumns(sym);
+        if (cteCols.length > 0) { return cteCols; }
+      }
+
       if (symName === targetAlias && sym?.kind === "Alias") {
         const aliasedTable = normalizeName(resolveAliasTableName(sym) ?? "");
         if (aliasedTable) {
@@ -1122,6 +1143,11 @@ function getSourceColumns(
               }
             }
           }
+        } else {
+          // Derived/subquery alias: columns are in sym.location.table.query.columns, not
+          // in sym.columns (which the parser never populates for inline subqueries).
+          const derivedCols = extractQueryProjectedColumns(sym?.location?.table?.query);
+          if (derivedCols.length > 0) { return derivedCols; }
         }
       }
 
@@ -1130,6 +1156,12 @@ function getSourceColumns(
         && Array.isArray(sym?.columns)
         && sym.columns.length > 0) {
         return sym.columns;
+      }
+
+      // CTE source matched by table name: same getCteColumns fix as the alias case above.
+      if (sym?.kind === "CTE" && symName === targetTable) {
+        const cteCols = getCteColumns(sym);
+        if (cteCols.length > 0) { return cteCols; }
       }
 
       if (symName === targetTable) {

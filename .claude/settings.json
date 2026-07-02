@@ -2,7 +2,18 @@
   "permissions": {
     "allow": [
       "Bash(node esbuild.js)",
-      "Bash(node -e ' *)"
+      "Bash(node -e ' *)",
+      "Bash(git show *)",
+      "Read(//tmp/**)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(npm install *)",
+      "Bash(cat .npmrc)",
+      "Bash(npm config *)",
+      "Bash(npm -v)",
+      "Bash(node --experimental-test-coverage --test out/server/src/tests/all.js)",
+      "Bash(node out/server/src/tests/all.js)",
+      "Bash(sed -i 's/  const queryUri  = \"file:\\\\/\\\\/\\\\/validation\\\\/string-col-compare-query.sql\";//' server/src/tests/validation-layer.ts)",
+      "Bash(sed -i 's/  const queryUri  = \"file:\\\\/\\\\/\\\\/validation\\\\/readable-no-alias-query.sql\";//' server/src/tests/validation-layer.ts)"
     ]
   }
 }

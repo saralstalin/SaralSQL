@@ -2,9 +2,10 @@ import * as assert from "assert";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { SqlCmdPreprocessor } from "@saralsql/tsql-parser";
 import { parseSql } from "../sql-parser";
-import { getCteColumns, getDisplaySymbolName, resolveAliasFromAst, resolveColumnFromAst } from "../ast-utils";
-import { getLineStarts, normalizeName, offsetAt } from "../text-utils";
+import { getCteColumns, getDisplaySymbolName, resolveAliasFromAst, resolveColumnFromAst, walkAst, normalizeAstTableName, extractColumnName, extractQualifiedName, resolveAliasTableName, resolveSymbolCaseInsensitive } from "../ast-utils";
+import { getLineStarts, normalizeName, offsetAt, getWordRangeAtPosition, isSqlKeyword } from "../text-utils";
 import { collectAmbiguousColumnDiagnostics } from "../diagnostic-helpers";
+import { collectNearestScopeColumnOwners } from "../scope-column-resolver";
 import {
   indexText,
   getRefs,
@@ -17,7 +18,14 @@ import {
   tablesByName,
   tableTypesByName,
   tempTablesByUri,
-  deleteFileFromIndex
+  deleteFileFromIndex,
+  setIndexReady,
+  setIndexNotReady,
+  getIndexReady,
+  findColumnInTable,
+  parseColumnsFromCreateView,
+  findTableOrColumn,
+  setRefsForFile
 } from "../definitions";
 
 function resetIndexState(): void {
@@ -655,8 +663,325 @@ WHERE EXISTS (
 );
 `;
   const parsed = parseSql(sql);
-  const resolved = resolveColumnFromAst(parsed?.ast, "DepartmentId");
+  // resolveColumnFromAst expects an array of statement nodes (or a single statement),
+  // not the Program wrapper -- pass ast.body so the SelectStatement branch actually runs.
+  const resolved = resolveColumnFromAst(parsed?.ast?.body, "DepartmentId");
   assert.strictEqual(resolved, null, "Nested SELECT columns should not leak into outer statement resolution");
+});
+
+runCase("resolve-column-from-ast-covers-all-statement-shapes", () => {
+  assert.strictEqual(resolveColumnFromAst(null, "X"), null, "Null ast should resolve to null");
+
+  // The real parser represents both qualified and unqualified columns as Identifier
+  // nodes (with .parts), never MemberExpression -- so resolveSelectStatement's
+  // MemberExpression-specific matching (both in the select list and WHERE) is only
+  // reachable via that exact node shape. Exercise it with synthetic AST nodes that
+  // match the function's documented contract.
+  const singleSourceSql = `SELECT FirstName FROM Employee;`;
+  const singleSourceParsed = parseSql(singleSourceSql);
+  assert.strictEqual(
+    resolveColumnFromAst(singleSourceParsed?.ast?.body, "FirstName"),
+    "employee",
+    "Unqualified column with exactly one FROM source should resolve to that source"
+  );
+  assert.strictEqual(
+    resolveColumnFromAst(singleSourceParsed?.ast?.body, "NoSuchColumn"),
+    null,
+    "Column absent from select list and WHERE clause should resolve to null"
+  );
+
+  const syntheticSelect = {
+    type: "SelectStatement",
+    columns: [{ type: "Column", expression: { type: "MemberExpression", object: { type: "Identifier", name: "e" }, property: "FirstName" } }],
+    from: [
+      { table: { type: "Identifier", name: "Employee" }, alias: "e", joins: [] },
+      { table: { type: "Identifier", name: "Department" }, alias: "d", joins: [] }
+    ]
+  };
+  assert.strictEqual(
+    resolveColumnFromAst([syntheticSelect], "FirstName"),
+    "employee",
+    "MemberExpression-shaped select-list column should resolve via the alias map"
+  );
+
+  const syntheticWhere = {
+    type: "SelectStatement",
+    columns: [],
+    from: [
+      { table: { type: "Identifier", name: "Employee" }, alias: "e", joins: [] },
+      { table: { type: "Identifier", name: "Department" }, alias: "d", joins: [] }
+    ],
+    where: { type: "MemberExpression", object: { type: "Identifier", name: "e" }, property: "DepartmentId" }
+  };
+  assert.strictEqual(
+    resolveColumnFromAst([syntheticWhere], "DepartmentId"),
+    "employee",
+    "MemberExpression-shaped WHERE-clause column should resolve via the alias map"
+  );
+  assert.strictEqual(
+    resolveColumnFromAst([syntheticWhere], "SomeOtherColumn"),
+    null,
+    "MemberExpression WHERE node whose property doesn't match the searched column should be skipped"
+  );
+
+  // IN-list WHERE clauses surface an array-valued AST property ("list"), exercising
+  // walkExpressionOnly's array-recursion branch on the way to a (legitimately null) result.
+  const inListSql = `UPDATE Employee SET FirstName = 'x' WHERE DepartmentId IN (1, 2, 3);`;
+  const inListParsed = parseSql(inListSql);
+  assert.strictEqual(
+    resolveColumnFromAst(inListParsed?.ast?.body, "NoSuchColumn"),
+    null,
+    "Array-valued WHERE clause children (e.g. an IN list) should be walked without throwing"
+  );
+
+  // A JOIN populates the alias map via the joins-array loop (distinct from the FROM-source loop).
+  const joinSql = `SELECT LastName FROM Employee e JOIN Department d ON d.DepartmentId = e.DepartmentId;`;
+  const joinParsed = parseSql(joinSql);
+  assert.strictEqual(
+    resolveColumnFromAst(joinParsed?.ast?.body, "LastName"),
+    null,
+    "With multiple sources in scope (FROM + JOIN), an unqualified column with no alias hint resolves to null"
+  );
+
+  assert.strictEqual(resolveColumnFromAst([null], "X"), null, "Array containing a non-object root should resolve to null");
+  assert.strictEqual(resolveColumnFromAst([{ type: "UpdateStatement", target: null }], "X"), null, "UpdateStatement with no resolvable target should resolve to null");
+  assert.strictEqual(resolveColumnFromAst([{ type: "InsertStatement", table: null }], "X"), null, "InsertStatement with no resolvable target should resolve to null");
+  assert.strictEqual(resolveColumnFromAst([{ type: "DeleteStatement", target: null }], "X"), null, "DeleteStatement with no resolvable target should resolve to null");
+
+  const insertFallbackSql = `INSERT INTO Employee (FirstName) SELECT LastName FROM Staging;`;
+  const insertFallbackParsed = parseSql(insertFallbackSql);
+  assert.strictEqual(
+    resolveColumnFromAst(insertFallbackParsed?.ast?.body, "LastName"),
+    "staging",
+    "Column absent from the INSERT column list should fall through to the nested SELECT source"
+  );
+
+  const directAliasSql = `SELECT FirstName FROM Employee e;`;
+  const directAliasParsed = parseSql(directAliasSql);
+  assert.strictEqual(
+    resolveAliasFromAst("e", directAliasParsed?.ast ?? null),
+    "employee",
+    "A direct (non-join) alias on the FROM source should resolve via resolveAliasInNode's first match"
+  );
+
+  assert.strictEqual(
+    getCteColumns({ location: { query: null, columns: undefined } }).length,
+    0,
+    "A non-object query (e.g. null) should yield no projection columns and an empty CTE column list"
+  );
+
+  const setOpSym = {
+    location: {
+      query: {
+        type: "SetOperator",
+        left: { columns: [] },
+        right: { columns: [{ outputName: "Id" }] }
+      }
+    }
+  };
+  assert.ok(
+    getCteColumns(setOpSym).some(c => c.name === "id"),
+    "SetOperator with an empty left side should fall through to the right side's projection columns"
+  );
+
+  const updateSql = `UPDATE Employee SET FirstName = 'x' WHERE DepartmentId = 1;`;
+  const updateParsed = parseSql(updateSql);
+  assert.strictEqual(
+    resolveColumnFromAst(updateParsed?.ast?.body, "FirstName"),
+    "employee",
+    "UPDATE assignment column should resolve to the mutation target"
+  );
+  assert.strictEqual(
+    resolveColumnFromAst(updateParsed?.ast?.body, "DepartmentId"),
+    "employee",
+    "UPDATE WHERE-clause column should resolve to the mutation target"
+  );
+  assert.strictEqual(
+    resolveColumnFromAst(updateParsed?.ast?.body, "NoSuchColumn"),
+    null,
+    "UPDATE statement with no matching column should resolve to null"
+  );
+
+  const insertSql = `INSERT INTO Employee (FirstName) VALUES ('x');`;
+  const insertParsed = parseSql(insertSql);
+  assert.strictEqual(
+    resolveColumnFromAst(insertParsed?.ast?.body, "FirstName"),
+    "employee",
+    "INSERT column list entry should resolve to the insert target"
+  );
+  assert.strictEqual(
+    resolveColumnFromAst(insertParsed?.ast?.body, "NoSuchColumn"),
+    null,
+    "INSERT statement with no matching column should resolve to null"
+  );
+
+  const insertSelectSql = `INSERT INTO Employee (FirstName) SELECT FirstName FROM Staging;`;
+  const insertSelectParsed = parseSql(insertSelectSql);
+  assert.strictEqual(
+    resolveColumnFromAst(insertSelectParsed?.ast?.body, "FirstName"),
+    "employee",
+    "INSERT column list should take precedence over the nested SELECT source"
+  );
+
+  const deleteSql = `DELETE FROM Employee WHERE DepartmentId = 1;`;
+  const deleteParsed = parseSql(deleteSql);
+  assert.strictEqual(
+    resolveColumnFromAst(deleteParsed?.ast?.body, "DepartmentId"),
+    "employee",
+    "DELETE WHERE-clause column should resolve to the delete target"
+  );
+  assert.strictEqual(
+    resolveColumnFromAst(deleteParsed?.ast?.body, "NoSuchColumn"),
+    null,
+    "DELETE statement with no matching column should resolve to null"
+  );
+
+  // A statement type resolveColumnFromAst doesn't handle (e.g. a bare DECLARE) falls through to null.
+  const declareSql = `DECLARE @x INT;`;
+  const declareParsed = parseSql(declareSql);
+  assert.strictEqual(resolveColumnFromAst(declareParsed?.ast?.body, "x"), null, "Unhandled statement types should resolve to null");
+});
+
+runCase("walk-ast-ignores-null-and-non-object-nodes", () => {
+  let calls = 0;
+  walkAst(null, () => { calls++; });
+  walkAst(undefined, () => { calls++; });
+  walkAst("not-an-object", () => { calls++; });
+  assert.strictEqual(calls, 0, "walkAst should not invoke the callback for null/non-object nodes");
+
+  walkAst({ a: 1, child: { b: 2 } }, () => { calls++; });
+  assert.strictEqual(calls, 2, "walkAst should still visit valid object nodes and their object children");
+});
+
+runCase("normalize-ast-table-name-covers-all-node-shapes", () => {
+  assert.strictEqual(normalizeAstTableName(null), null, "Falsy input should resolve to null");
+  assert.strictEqual(normalizeAstTableName(""), null, "Empty string should resolve to null");
+  assert.strictEqual(normalizeAstTableName("dbo.Employee"), "employee", "String table names should be normalized");
+  assert.strictEqual(normalizeAstTableName({ type: "Identifier", name: "[Employee]" }), "employee", "Identifier nodes should be normalized");
+  assert.strictEqual(
+    normalizeAstTableName({ type: "MemberExpression", property: "Employee" }),
+    "employee",
+    "MemberExpression nodes should resolve via their property"
+  );
+  assert.strictEqual(
+    normalizeAstTableName({ expr: { type: "Identifier", name: "Employee" } }),
+    "employee",
+    "Nested expr wrappers should recurse into the inner node"
+  );
+  assert.strictEqual(
+    normalizeAstTableName({ parts: ["dbo", "Employee"] }),
+    "employee",
+    "Identifier parts arrays should resolve to the last segment"
+  );
+  assert.strictEqual(
+    normalizeAstTableName({ type: "Unknown" }),
+    null,
+    "Unrecognized node shapes with no fallback data should resolve to null"
+  );
+});
+
+runCase("extract-column-name-covers-all-node-shapes", () => {
+  assert.strictEqual(extractColumnName(null), null, "Null input should resolve to null");
+  assert.strictEqual(extractColumnName(0), null, "Zero is falsy but explicitly allowed through the guard, and still resolves to null");
+  assert.strictEqual(extractColumnName("[FirstName]"), "firstname", "String column names should be normalized and unbracketed");
+  assert.strictEqual(extractColumnName({ type: "Identifier", name: "FirstName" }), "firstname", "Identifier nodes should resolve via name");
+  assert.strictEqual(
+    extractColumnName({ type: "MemberExpression", property: "FirstName" }),
+    "firstname",
+    "MemberExpression nodes should resolve via property"
+  );
+  assert.strictEqual(
+    extractColumnName({ type: "Column", expression: { type: "Identifier", name: "FirstName" } }),
+    "firstname",
+    "Column nodes should recurse into their expression"
+  );
+  assert.strictEqual(
+    extractColumnName({ expr: { type: "Identifier", name: "FirstName" } }),
+    "firstname",
+    "Nested expr wrappers should recurse into the inner node"
+  );
+  assert.strictEqual(extractColumnName({ type: "Unknown" }), null, "Unrecognized node shapes should resolve to null");
+});
+
+runCase("extract-qualified-name-covers-all-node-shapes", () => {
+  assert.deepStrictEqual(extractQualifiedName(null), {}, "Falsy expression should resolve to an empty object");
+  assert.deepStrictEqual(
+    extractQualifiedName({ type: "MemberExpression", object: { type: "Identifier", name: "e" }, property: "FirstName" }),
+    { table: "e", column: "FirstName" },
+    "MemberExpression should split into table/column via extractColumnName(object) and the raw property"
+  );
+  assert.deepStrictEqual(
+    extractQualifiedName({ type: "Identifier", parts: ["dbo", "Employee", "FirstName"] }),
+    { table: "employee", column: "firstname" },
+    "Multi-part identifiers should use the last two segments as table/column"
+  );
+  assert.deepStrictEqual(
+    extractQualifiedName({ type: "Identifier", name: "FirstName" }),
+    { column: "FirstName" },
+    "Single-part identifiers should resolve to a bare column with no table"
+  );
+  assert.deepStrictEqual(extractQualifiedName({ type: "Unknown" }), {}, "Unrecognized node shapes should resolve to an empty object");
+});
+
+runCase("resolve-alias-from-ast-covers-falsy-and-negative-paths", () => {
+  assert.strictEqual(resolveAliasFromAst("", null), null, "Empty alias should resolve to null");
+  assert.strictEqual(resolveAliasFromAst("e", null), null, "Null ast should resolve to null");
+
+  const sql = `SELECT e.FirstName FROM Employee e JOIN Department d ON d.DepartmentId = e.DepartmentId;`;
+  const parsed = parseSql(sql);
+  assert.strictEqual(resolveAliasFromAst("d", parsed?.ast ?? null), "department", "JOIN alias should resolve via the joins array");
+  assert.strictEqual(resolveAliasFromAst("nope", parsed?.ast ?? null), null, "Alias absent from the statement should resolve to null");
+
+  const noAliasSql = `SELECT FirstName FROM Employee;`;
+  const noAliasParsed = parseSql(noAliasSql);
+  assert.strictEqual(
+    resolveAliasFromAst("employee", noAliasParsed?.ast ?? null),
+    "employee",
+    "An unaliased table referenced by its own name should resolve to itself"
+  );
+});
+
+runCase("resolve-alias-table-name-covers-metadata-and-location-shapes", () => {
+  assert.strictEqual(resolveAliasTableName({}), undefined, "Symbol with no metadata or location should resolve to undefined");
+  assert.strictEqual(
+    resolveAliasTableName({ metadata: { tableName: "Employee" } }),
+    "Employee",
+    "metadata.tableName should take precedence"
+  );
+  assert.strictEqual(
+    resolveAliasTableName({ location: { table: "Employee" } }),
+    "Employee",
+    "A string location.table should be returned directly"
+  );
+  assert.strictEqual(
+    resolveAliasTableName({ location: { table: { name: "Employee" } } }),
+    "Employee",
+    "An object location.table should resolve via its name property"
+  );
+});
+
+runCase("get-cte-columns-falls-back-to-location-columns-when-query-has-none", () => {
+  const sym = { location: { query: {}, columns: ["Id", "Name", ""] } };
+  const cols = getCteColumns(sym);
+  assert.strictEqual(cols.length, 2, "Empty/blank fallback column names should be skipped");
+  assert.ok(cols.some(c => c.name === "id"), "Fallback path should still normalize column names");
+});
+
+runCase("resolve-symbol-case-insensitive-covers-resolve-and-fallback-paths", () => {
+  assert.strictEqual(resolveSymbolCaseInsensitive(null, "x"), null, "Null scope should resolve to null");
+  assert.strictEqual(resolveSymbolCaseInsensitive({}, ""), null, "Empty name should resolve to null");
+
+  const directHit = { name: "found-via-resolve" };
+  const scopeWithResolve = { resolve: (name: string) => (name === "Target" ? directHit : null) };
+  assert.strictEqual(
+    resolveSymbolCaseInsensitive(scopeWithResolve, "Target"),
+    directHit,
+    "A scope with a resolve() method should be used directly when it finds a match"
+  );
+
+  const scopeWithSymbolsObject = { symbols: { e: { name: "E" } } };
+  const found = resolveSymbolCaseInsensitive(scopeWithSymbolsObject, "E");
+  assert.ok(found, "Fallback should search Object.values(scope.symbols) case-insensitively when getVisibleSymbols is absent");
 });
 
 runCase("cross-apply-correlated-alias-column-resolution", () => {
@@ -1044,6 +1369,343 @@ WHERE Employee.EmployeeId = 12345;
   const refs = getReferencesForUri(queryUri).filter(r => r.kind === "table" && r.context === "shadowed-by-alias");
   assert.strictEqual(refs.length, 1, "Bare table name used after the table was aliased should be indexed as shadowed-by-alias");
   assert.strictEqual(normalizeName(refs[0].name), "employee", "Shadowed ref should carry the literal table name");
+});
+
+runCase("get-word-range-at-position-covers-token-boundaries", () => {
+  const text = "SELECT e.EmployeeId, a . b\n\nFROM Employee e";
+  const doc = TextDocument.create("file:///regression/word-range.sql", "sql", 1, text);
+
+  // Happy path: cursor inside "EmployeeId" (the "." is itself a token char, so the
+  // qualifier is included in the range -- this is by design, see hover/definition providers).
+  const inWord = getWordRangeAtPosition(doc, { line: 0, character: 12 });
+  assert.ok(inWord, "Cursor inside a word should produce a range");
+  assert.strictEqual(doc.getText(inWord!), "e.EmployeeId", "Range should cover the full qualified token under the cursor");
+
+  // Cursor on the comma immediately after "EmployeeId" (non-token char preceded by a
+  // token char) should snap back onto the token instead of returning no range.
+  const commaOffset = text.indexOf(",");
+  const justPast = getWordRangeAtPosition(doc, { line: 0, character: commaOffset });
+  assert.ok(justPast, "Cursor just past a token should still resolve to that token");
+
+  // Cursor exactly on a lone "." surrounded by spaces: dot-stripping collapses start>=end -> null
+  const loneDotOffset = text.indexOf("a . b") + 2;
+  const lonePos = doc.positionAt(loneDotOffset);
+  const loneDot = getWordRangeAtPosition(doc, lonePos);
+  assert.strictEqual(loneDot, null, "A lone '.' with no adjoining token chars should resolve to no range");
+
+  // Empty line should short-circuit to null
+  const emptyLine = getWordRangeAtPosition(doc, { line: 1, character: 0 });
+  assert.strictEqual(emptyLine, null, "Empty line should produce no word range");
+
+  // Negative character clamps to a no-range result
+  const negative = getWordRangeAtPosition(doc, { line: 0, character: -1 });
+  assert.strictEqual(negative, null, "Negative character position should produce no word range");
+
+  // Cursor past the end of the line clamps to the last character
+  const pastEnd = getWordRangeAtPosition(doc, { line: 2, character: 9999 });
+  assert.ok(pastEnd, "Cursor past end of line should clamp onto the last token");
+
+  // Cursor surrounded by non-token chars on both sides (no token char to snap back onto)
+  const doubleSpaceDoc = TextDocument.create("file:///regression/word-range-blank.sql", "sql", 1, "  ");
+  const blank = getWordRangeAtPosition(doubleSpaceDoc, { line: 0, character: 1 });
+  assert.strictEqual(blank, null, "Cursor with no adjoining token char in either direction should resolve to no range");
+
+  // Token with a trailing dot that still leaves a non-empty token after stripping
+  const trailingDotDoc = TextDocument.create("file:///regression/word-range-trailing-dot.sql", "sql", 1, "ab.");
+  const trailingDot = getWordRangeAtPosition(trailingDotDoc, { line: 0, character: 1 });
+  assert.ok(trailingDot, "Token with a stripped trailing dot should still resolve when characters remain");
+  assert.strictEqual(trailingDotDoc.getText(trailingDot!), "ab", "Trailing dot should be stripped from the resolved range");
+});
+
+runCase("offset-at-falls-back-to-manual-calculation-without-native-offsetAt", () => {
+  const fakeDoc = { getText: () => "SELECT 1\nFROM Employee\nWHERE 1 = 1" } as any;
+  const offset = offsetAt(fakeDoc, { line: 1, character: 3 });
+  assert.strictEqual(offset, "SELECT 1\n".length + 3, "Fallback path should manually sum line lengths when doc.offsetAt is unavailable");
+});
+
+runCase("is-sql-keyword-is-case-insensitive", () => {
+  assert.strictEqual(isSqlKeyword("SELECT"), true, "Keyword check should be case-insensitive");
+  assert.strictEqual(isSqlKeyword("NotAKeyword"), false, "Non-keyword identifiers should return false");
+});
+
+runCase("collect-nearest-scope-column-owners-covers-symbol-shapes", () => {
+  // A null entry in the symbols list must not crash the resolver.
+  let scope: any = { getOwnSymbols: () => [null, { kind: "Table", name: "Employee" }], parent: null, name: "test" };
+  assert.deepStrictEqual(collectNearestScopeColumnOwners(scope, "x", new Map(), new Map()), [], "Null symbol entries should be skipped without throwing");
+
+  // CTE symbol present but the searched column isn't among its projected columns.
+  scope = { getOwnSymbols: () => [{ kind: "CTE", name: "cte1", location: { query: { columns: [{ outputName: "Id" }] } } }], parent: null, name: "test" };
+  assert.deepStrictEqual(collectNearestScopeColumnOwners(scope, "doesnotexist", new Map(), new Map()), [], "CTE column miss should resolve to no owners");
+
+  // Any symbol (including a derived alias) carrying an inline .columns array is matched by
+  // resolveSymbolColumns's generic top-of-function check before kind-specific dispatch runs.
+  // This means the Alias-block's own isDerivedAlias/projected-column success branch can never
+  // independently fire -- the generic check always wins first when sym.columns has the match.
+  scope = {
+    getOwnSymbols: () => [{ kind: "Alias", name: "sub", location: { table: { query: {} } }, columns: [{ name: "projcol", rawName: "ProjCol" }] }],
+    parent: null, name: "test"
+  };
+  const derived = collectNearestScopeColumnOwners(scope, "projcol", new Map(), new Map());
+  assert.strictEqual(derived.length, 1, "Derived alias should expose its own projected column via the generic columns-array check");
+  assert.strictEqual(derived[0].kindLabel, "derived table");
+
+  // Alias whose target resolves to ANOTHER in-scope symbol (a CTE), found via recursion.
+  // resolveSymbolCaseInsensitive looks up the target via getVisibleSymbols(), not
+  // getOwnSymbols() -- both must be provided for the recursive lookup to succeed.
+  const aliasAndCteSymbols = [
+    { kind: "Alias", name: "c", location: { table: { name: "cte1" } } },
+    { kind: "CTE", name: "cte1", location: { query: { columns: [{ outputName: "Id" }] } } }
+  ];
+  scope = { getOwnSymbols: () => aliasAndCteSymbols, getVisibleSymbols: () => aliasAndCteSymbols, parent: null, name: "test" };
+  const viaAlias = collectNearestScopeColumnOwners(scope, "id", new Map(), new Map());
+  // Both the alias (resolved recursively through its target) and the CTE symbol itself
+  // (present directly in scope) independently produce a match.
+  assert.strictEqual(viaAlias.length, 2, "Alias-via-CTE and the direct CTE symbol should both resolve");
+  assert.ok(viaAlias.every(o => o.kindLabel === "CTE"), "Both owners should report the CTE kind label");
+  assert.ok(viaAlias.some(o => o.alias === "c"), "The alias-resolved owner should carry the alias name");
+  assert.ok(viaAlias.some(o => !("alias" in o)), "The direct CTE symbol owner should not carry an alias name");
+
+  // Table/TempTable symbol with a falsy name must not crash.
+  scope = { getOwnSymbols: () => [{ kind: "Table", name: "" }], parent: null, name: "test" };
+  assert.deepStrictEqual(collectNearestScopeColumnOwners(scope, "x", new Map(), new Map()), [], "Table symbol with empty name should resolve to no owners");
+
+  // Table symbol resolved against the workspace schema map (tablesByName).
+  const tablesByName = new Map([["employee", { rawName: "Employee", columns: [{ name: "id", rawName: "Id" }] }]]);
+  scope = { getOwnSymbols: () => [{ kind: "Table", name: "employee" }], parent: null, name: "test" };
+  const tableMatch = collectNearestScopeColumnOwners(scope, "id", tablesByName, new Map());
+  assert.strictEqual(tableMatch.length, 1, "Table symbol should resolve its column via tablesByName");
+  assert.strictEqual(tableMatch[0].ownerName, "Employee");
+
+  // A symbol of an unrecognized kind that still carries an inline .columns array is not
+  // caught by hasPotentialLocalSourceSymbol's kind check, but hasColumnBearingLocalSource's
+  // kind-agnostic columns-array check still short-circuits the walk-up to the parent scope.
+  scope = { getOwnSymbols: () => [{ kind: "Unrecognized", columns: [{ name: "X" }] }], parent: null, name: "test" };
+  assert.deepStrictEqual(
+    collectNearestScopeColumnOwners(scope, "doesnotexist", new Map(), new Map()),
+    [],
+    "An unrecognized-kind symbol with an inline columns array should still block walk-up via hasColumnBearingLocalSource"
+  );
+});
+
+runCase("parseSql-returns-null-for-falsy-input", () => {
+  assert.strictEqual(parseSql(""), null, "Empty string should short-circuit to null without calling analyze()");
+});
+
+runCase("parseSql-catches-analyzer-throw-and-returns-parse-error-issue", () => {
+  // analyze() expects a string; passing a non-string forces it to throw internally
+  // (e.g. "text.includes is not a function"), exercising the wrapper's catch path.
+  const result = parseSql({} as unknown as string);
+  assert.ok(result, "parseSql should not propagate the analyzer's throw");
+  assert.strictEqual(result?.ast, null, "Caught error should produce a null ast");
+  assert.strictEqual(result?.issues?.[0]?.code, "PARSE_ERROR", "Caught error should be reported as PARSE_ERROR");
+  assert.strictEqual(result?.diagnostics?.[0]?.code, "PARSE_ERROR", "Caught error should also appear in diagnostics");
+});
+
+runCase("index-ready-lifecycle-setters-work-correctly", () => {
+  setIndexNotReady();
+  assert.strictEqual(getIndexReady(), false, "setIndexNotReady should clear the index-ready flag");
+  setIndexReady();
+  assert.strictEqual(getIndexReady(), true, "setIndexReady should set the index-ready flag");
+});
+
+runCase("find-column-in-table-returns-location-for-known-columns", () => {
+  const schemaUri = "file:///regression/find-col-schema.sql";
+  indexText(schemaUri, "CREATE TABLE dbo.Employee (EmployeeId INT, FirstName NVARCHAR(100));");
+
+  const locs = findColumnInTable("employee", "employeeid");
+  assert.ok(locs.length > 0, "findColumnInTable should return a location for an indexed column");
+  assert.ok(locs[0].uri.includes("find-col-schema"), "Location should point to the schema file");
+
+  const notFound = findColumnInTable("employee", "nonexistentcol");
+  assert.deepStrictEqual(notFound, [], "findColumnInTable should return [] for an unknown column");
+});
+
+runCase("find-table-or-column-returns-locations", () => {
+  const schemaUri = "file:///regression/find-toc-schema.sql";
+  indexText(schemaUri, "CREATE TABLE Customer (CustomerId INT);");
+
+  const locs = findTableOrColumn("customer");
+  assert.ok(locs.length > 0, "findTableOrColumn should find a table by normalized name");
+  assert.strictEqual(findTableOrColumn("nonexistenttable").length, 0, "findTableOrColumn should return [] for unknown name");
+});
+
+runCase("parse-columns-from-create-view-extracts-projected-columns", () => {
+  const viewSql = "CREATE VIEW SomeView AS SELECT Id, Name AS DisplayName FROM T;";
+  const cols = parseColumnsFromCreateView(viewSql);
+  assert.ok(cols.some(c => c.name === "id"), "parseColumnsFromCreateView should extract unaliased columns");
+  assert.ok(cols.some(c => c.name === "displayname"), "parseColumnsFromCreateView should extract aliased columns");
+  assert.deepStrictEqual(parseColumnsFromCreateView("not valid sql"), [], "Unparseable input should return empty");
+});
+
+runCase("setRefsForFile-called-twice-exercises-removeRefsFromUriIndex-body", () => {
+  // The removeRefsFromUriIndex body (lines 153-172) only fires when setRefsForFile is called
+  // a SECOND TIME for the same (name, uri) pair — clearing old referencesByUri entries by
+  // position, not just the whole-URI delete that deleteRefsForFile does.
+  const uri = "file:///regression/remove-refs-body.sql";
+  const ref1 = { name: "widget", uri, line: 0, start: 0, end: 6, kind: "table" as const };
+  const ref2 = { name: "widget", uri, line: 0, start: 10, end: 16, kind: "table" as const };
+
+  setRefsForFile("widget", uri, [ref1]);
+  assert.strictEqual(getRefs("widget").length, 1, "First setRefsForFile should produce one ref");
+
+  // Second call: removeRefsFromUriIndex body runs because existing refs are found.
+  setRefsForFile("widget", uri, [ref2]);
+  const afterSecond = getRefs("widget");
+  assert.strictEqual(afterSecond.length, 1, "Second setRefsForFile should replace the previous ref");
+  assert.strictEqual(afterSecond[0].start, 10, "Replacement ref should have the new start position");
+});
+
+runCase("re-indexing-same-file-clears-and-rebuilds-refs", () => {
+  const schemaUri = "file:///regression/reindex-schema.sql";
+  const sql1 = "CREATE TABLE Widget (WidgetId INT, Name VARCHAR(100));";
+  const sql2 = "CREATE TABLE Widget (WidgetId INT, Name VARCHAR(100), Price DECIMAL(10,2));";
+
+  indexText(schemaUri, sql1);
+  const colsBefore = columnsByTable.get("widget");
+  assert.ok(colsBefore?.has("price") === false, "Price column should not exist after first index");
+
+  // Re-index the same URI with updated content — exercises removeRefsFromUriIndex body
+  indexText(schemaUri, sql2);
+  const colsAfter = columnsByTable.get("widget");
+  assert.ok(colsAfter?.has("price"), "Price column should appear after re-indexing with the updated schema");
+});
+
+runCase("delete-file-from-index-removes-all-state", () => {
+  const schemaUri = "file:///regression/delete-file-schema.sql";
+  indexText(schemaUri, "CREATE TABLE ToDelete (Id INT);");
+  assert.ok(tablesByName.has("todelete"), "Table should be in index before deletion");
+  assert.ok(getRefs("todelete").length > 0, "Table should have refs before deletion");
+
+  deleteFileFromIndex(schemaUri);
+  assert.strictEqual(tablesByName.has("todelete"), false, "Table should be removed after deleteFileFromIndex");
+  assert.deepStrictEqual(getRefs("todelete"), [], "Refs should be cleared after deleteFileFromIndex");
+});
+
+runCase("normalizeIndexUri-handles-edge-cases", () => {
+  // These exercise the normalizeIndexUri paths in definitions.ts (path-to-file-url conversion
+  // and the lowercase drive-letter normalization for Windows paths on file:// URIs).
+  // indexText calls normalizeIndexUri internally; testing via round-trip.
+  const uri = "file:///regression/normalize-uri-test.sql";
+  indexText(uri, "CREATE TABLE NormTest (Id INT);");
+  const found = findColumnInTable("normtest", "id");
+  assert.ok(found.length > 0, "File indexed via a file:// URI should be findable after normalizeIndexUri");
+});
+
+runCase("parserViewColumnDefinition-with-various-column-shapes", () => {
+  // Exercises parserViewColumnDefinition edge cases (rawName extraction from outputName/sourceName).
+  const viewSql = `CREATE VIEW MultiProjection AS
+SELECT e.FirstName AS FirstName, e.DepartmentId
+FROM Employee e;`;
+  const cols = parseColumnsFromCreateView(viewSql);
+  assert.ok(cols.some(c => c.name === "firstname"), "Aliased view column should be extracted");
+  assert.ok(cols.some(c => c.name === "departmentid"), "Non-aliased view column should be extracted");
+});
+
+runCase("index-text-create-index-is-not-indexed-as-table-definition", () => {
+  const uri = "file:///regression/create-index.sql";
+  indexText(uri, `
+CREATE TABLE Employee (DepartmentId INT);
+CREATE INDEX IX_Employee ON Employee (DepartmentId);
+`);
+  // CREATE INDEX is not TABLE/VIEW/TYPE/PROCEDURE/FUNCTION → skipped by the CreateStatement filter.
+  // The table DOES get indexed; only the index itself is skipped.
+  assert.ok(tablesByName.has("employee"), "CREATE TABLE should still be indexed alongside a CREATE INDEX");
+  assert.ok(!tablesByName.has("ix_employee"), "CREATE INDEX should not produce a table entry");
+});
+
+runCase("index-text-update-with-from-join-resolves-target-via-from-sources", () => {
+  // UPDATE target is an alias ('t') resolved via the FROM clause's JOIN.
+  // resolveUpdateTargetTable needs to walk updateNode.from and match aliases.
+  const uri = "file:///regression/update-from-join.sql";
+  indexText(uri, "UPDATE t SET t.Name='x' FROM T1 t JOIN T2 s ON t.Id = s.Id;");
+  const refs = getReferencesForUri(uri).filter(r => r.kind === "column");
+  assert.ok(refs.some(r => r.name.includes(".name")), "UPDATE SET column should be indexed against the resolved FROM-alias target");
+  assert.ok(refs.some(r => r.name.includes(".id")), "JOIN ON columns should be indexed");
+});
+
+runCase("index-text-variables-are-indexed-from-scope", () => {
+  const uri = "file:///regression/variables.sql";
+  indexText(uri, `
+DECLARE @count INT;
+DECLARE @name NVARCHAR(100);
+SET @count = 1;
+SELECT @count, @name;
+`);
+  const refs = getReferencesForUri(uri).filter(r => r.kind === "parameter");
+  assert.ok(refs.some(r => r.name === "@count"), "@count parameter should be indexed");
+  assert.ok(refs.some(r => r.name === "@name"), "@name parameter should be indexed");
+});
+
+runCase("index-text-insert-column-list-is-indexed", () => {
+  const schemaUri = "file:///regression/insert-col-schema.sql";
+  const queryUri = "file:///regression/insert-col-query.sql";
+  indexText(schemaUri, "CREATE TABLE Employee (Id INT, Name NVARCHAR(100));");
+  indexText(queryUri, "INSERT INTO Employee (Id, Name) VALUES (1, 'Test');");
+  const refs = getReferencesForUri(queryUri).filter(r => r.kind === "column");
+  assert.ok(refs.some(r => r.name === "employee.id"), "INSERT column list Id should be indexed against Employee");
+  assert.ok(refs.some(r => r.name === "employee.name"), "INSERT column list Name should be indexed against Employee");
+});
+
+runCase("index-text-select-into-temp-table-is-captured", () => {
+  const uri = "file:///regression/select-into.sql";
+  indexText(uri, "SELECT Id, FirstName INTO #Results FROM Employee;");
+  // indexSelectIntoTempTablesFromAst should record #results in tempTablesByUri
+  const tmp = tempTablesByUri.get(uri);
+  assert.ok(tmp, "tempTablesByUri should have an entry after SELECT INTO");
+  const tmpEntry = tmp?.get("#results");
+  assert.ok(tmpEntry, "#results should be in tempTablesByUri for this URI");
+});
+
+runCase("index-text-sql-keyword-column-name-is-skipped", () => {
+  // isSqlKeyword('key') === true → 'key' is filtered out as a column ref candidate.
+  // Using bare 'key' without brackets so extractReferences returns name:"KEY" (no dot),
+  // which then hits the isSqlKeyword check at 453-454.
+  const uri = "file:///regression/keyword-col.sql";
+  indexText(uri, "SELECT key FROM T;");
+  // 'key' is filtered by isSqlKeyword; indexing should complete without crash.
+  const refs = getReferencesForUri(uri);
+  assert.ok(Array.isArray(refs), "indexText should complete without error even with SQL-keyword column names");
+  assert.ok(!refs.some(r => r.name === "key"), "'key' (a SQL keyword) should not appear as a bare column ref");
+});
+
+runCase("index-text-bare-update-set-column-is-indexed-against-target", () => {
+  const schemaUri = "file:///regression/bare-update-schema.sql";
+  const queryUri = "file:///regression/bare-update-query.sql";
+  indexText(schemaUri, "CREATE TABLE Employee (Name NVARCHAR(100), Id INT);");
+  indexText(queryUri, "UPDATE Employee SET Name = 'x' WHERE Id = 1;");
+  const refs = getReferencesForUri(queryUri).filter(r => r.kind === "column");
+  assert.ok(refs.some(r => r.name === "employee.name"), "Bare UPDATE SET column should be indexed against the UPDATE target");
+  assert.ok(refs.some(r => r.name === "employee.id"), "Bare UPDATE WHERE column should be indexed against the UPDATE target");
+});
+
+runCase("index-text-variable-data-type-reference-is-indexed", () => {
+  // When a parameter's dataType is a non-built-in type (like a table type),
+  // indexVariableDataTypeReferencesFromScope should create a table ref for that type name.
+  const schemaUri = "file:///regression/vartype-schema.sql";
+  const procUri = "file:///regression/vartype-proc.sql";
+  indexText(schemaUri, `
+CREATE TYPE dbo.MyTableType AS TABLE (Id INT);
+`);
+  indexText(procUri, `
+CREATE PROCEDURE TestProc
+  @myParam dbo.MyTableType READONLY
+AS
+SELECT @myParam.Id;
+`);
+  const refs = getReferencesForUri(procUri).filter(r => r.kind === "table" && r.name === "mytabletype");
+  assert.ok(refs.length > 0, "Parameter with a table-type dataType should generate a table ref for that type name");
+});
+
+runCase("index-text-handles-max-file-size-and-deploy-path-exclusions", () => {
+  // Files containing "deploy" in path are excluded from indexing.
+  const deployUri = "file:///regression/deploy/DeployScript.sql";
+  indexText(deployUri, "CREATE TABLE DeployTable (Id INT);");
+  assert.strictEqual(tablesByName.has("deploytable"), false, "Files in 'deploy' path should not be indexed");
+
+  // Non-.sql files should also be excluded.
+  const nonSqlUri = "file:///regression/script.ps1";
+  indexText(nonSqlUri as any, "CREATE TABLE NonSqlTable (Id INT);");
+  assert.strictEqual(tablesByName.has("nonsqltable"), false, "Non-.sql files should not be indexed");
 });
 
 process.stdout.write("All regression index tests passed.\n");
