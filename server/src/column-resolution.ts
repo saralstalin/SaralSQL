@@ -68,9 +68,16 @@ export function resolveBareColumnAtOffset(params: ResolveParams): BareColumnReso
     return { status: "resolved", owner: mutationTargetOwner, owners: [mutationTargetOwner], matchedResolution, ambiguityCandidates, decisionReason };
   }
 
-  // Local scope single-owner truth wins over broad parser ambiguity candidates.
+  // When the scope walk finds exactly one owner that is a CTE, the parser's more specific
+  // attribution (the underlying table inside the CTE body) is more useful for navigation
+  // and hover. If the parser provides a concrete table owner via matchedResolution and the
+  // sole scope owner is a CTE, prefer the parser's attribution.
   if (owners.length === 1) {
-    return { status: "resolved", owner: owners[0], owners, matchedResolution, ambiguityCandidates, decisionReason };
+    const soleScopeOwner = owners[0];
+    if (normalizeName(String(soleScopeOwner?.kindLabel ?? "")) === "cte" && parserOwner) {
+      return { status: "resolved", owner: parserOwner, owners: [parserOwner], matchedResolution, ambiguityCandidates, decisionReason };
+    }
+    return { status: "resolved", owner: soleScopeOwner, owners, matchedResolution, ambiguityCandidates, decisionReason };
   }
 
   const narrowedOwner = resolveNarrowedAmbiguityOwner(params, ambiguityCandidates, colNorm);
@@ -92,6 +99,9 @@ function narrowOwnersByReadScope(params: ResolveParams, owners: ScopeColumnOwner
     return owners;
   }
 
+  // Parser v0.4.4+ populates lineage.readScopes for all statement types, so
+  // readScopes.length === 0 is now only possible for edge-case queries with no
+  // trackable scope (e.g. pure expression SELECTs). Still guarded defensively.
   const readScopes = Array.isArray(params.parsed?.lineage?.readScopes) ? params.parsed.lineage.readScopes : [];
   if (readScopes.length === 0) {
     return owners;
@@ -511,7 +521,9 @@ function resolveAliasMutationTargetOwner(
   params: ResolveParams,
   colNorm: string
 ): ScopeColumnOwner | null {
-  if (!scopeAtPos || !targetName) {
+  // Caller guarantees !targetName is always false (it does `if (!targetName) continue`
+  // before the call), so only the scopeAtPos guard is meaningful.
+  if (!scopeAtPos) {
     return null;
   }
 
@@ -573,7 +585,9 @@ function findEquivalentScopeOwner(owner: ScopeColumnOwner, owners: ScopeColumnOw
 
 
 function resolveLocalScopeOwnerByName(scopeAtPos: any, targetName: string, colNorm: string): ScopeColumnOwner | null {
-  if (!scopeAtPos || !targetName) {
+  // Caller guarantees !targetName is always false (it does `if (!targetName) continue`
+  // before the call), so only the scopeAtPos guard is meaningful.
+  if (!scopeAtPos) {
     return null;
   }
 

@@ -9,68 +9,13 @@ export type ScopeColumnOwner = {
   displayAlias?: string;
 };
 
-function hasColumnBearingLocalSource(
-  symbols: any[],
-  scope: any,
-  tablesByName: Map<string, any>,
-  tableTypesByName: Map<string, any>,
-  localDefsByName?: Map<string, any>
-): boolean {
-  for (const sym of symbols) {
-    if (!sym) {
-      continue;
-    }
-
-    if (Array.isArray(sym.columns) && sym.columns.length > 0) {
-      return true;
-    }
-
-    if (sym.kind === "CTE" && getCteColumns(sym).length > 0) {
-      return true;
-    }
-
-    if (sym.kind === "Alias") {
-      const targetName = normalizeName(resolveAliasTableName(sym) ?? "");
-      if (!targetName) {
-        continue;
-      }
-      const targetSym = resolveSymbolCaseInsensitive(scope, targetName);
-      if (targetSym && targetSym !== sym) {
-        if (Array.isArray(targetSym.columns) && targetSym.columns.length > 0) {
-          return true;
-        }
-        if (targetSym.kind === "CTE" && getCteColumns(targetSym).length > 0) {
-          return true;
-        }
-      }
-      const tableDef = resolveDefColumns(targetName, tablesByName, tableTypesByName, localDefsByName);
-      if (Array.isArray(tableDef?.columns) && tableDef.columns.length > 0) {
-        return true;
-      }
-      continue;
-    }
-
-    if (sym.kind === "Table" || sym.kind === "TempTable") {
-      const tableName = normalizeName(String(sym.name ?? ""));
-      if (!tableName) {
-        continue;
-      }
-      const tableDef = resolveDefColumns(tableName, tablesByName, tableTypesByName, localDefsByName);
-      if (Array.isArray(tableDef?.columns) && tableDef.columns.length > 0) {
-        return true;
-      }
-      continue;
-    }
-
-    if ((sym.kind === "Variable" || sym.kind === "Parameter") && sym.dataType) {
-      const typeKey = normalizeName(String(sym.dataType));
-      const typeDef = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
-      if (Array.isArray(typeDef?.columns) && typeDef.columns.length > 0) {
-        return true;
-      }
-    }
-  }
-  return false;
+// hasPotentialLocalSourceSymbol (the guard that runs before this function) already
+// returns true for any symbol with kind Alias/Table/TempTable/CTE/Variable/Parameter,
+// so this function is only reached when ALL symbols have OTHER kinds. The only remaining
+// meaningful check is whether any such unrecognised symbol carries an inline .columns
+// array — that alone is enough to treat the scope level as column-bearing.
+function hasColumnBearingLocalSource(symbols: any[]): boolean {
+  return symbols.some(sym => sym && Array.isArray(sym.columns) && sym.columns.length > 0);
 }
 
 function hasPotentialLocalSourceSymbol(symbols: any[]): boolean {
@@ -252,7 +197,7 @@ export function collectNearestScopeColumnOwners(
     if (hasPotentialLocalSourceSymbol(symbols)) {
       return [];
     }
-    if (hasColumnBearingLocalSource(symbols, scope, tablesByName, tableTypesByName, localDefsByName)) {
+    if (hasColumnBearingLocalSource(symbols)) {
       return [];
     }
     if (String(scope.name ?? "").toLowerCase() === "subquery") {

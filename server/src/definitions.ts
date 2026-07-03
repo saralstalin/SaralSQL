@@ -513,15 +513,11 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                     }
 
                     if (!explicitQualifiedTarget) {
-                        const fileAliases = aliasesByUri.get(normUri);
-                        const matchedTable = fileAliases?.get(qualifierNorm);
-                        if (matchedTable && matchedTable.toLowerCase() !== "__subquery__") {
-                            explicitQualifiedTarget = normalizeName(matchedTable);
-                        } else if (matchedTable && matchedTable.toLowerCase() === "__subquery__") {
-                            explicitQualifiedTarget = qualifierNorm;
-                        } else {
-                            explicitQualifiedTarget = qualifierNorm;
-                        }
+                        // aliasesByUri for normUri is always cleared by deleteFileFromIndex at
+                        // the start of indexText and only repopulated at the very end, so
+                        // aliasesByUri.get(normUri) is always undefined during this loop.
+                        // The qualifier defaults to its own normalized form.
+                        explicitQualifiedTarget = qualifierNorm;
                     }
                 }
             }
@@ -583,18 +579,6 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                         }
                     }
 
-                    let resolvedFromFileAlias = false;
-                    if (!resolvedTable) {
-                        const fileAliases = aliasesByUri.get(normUri);
-                        const matchedTable = fileAliases?.get(aliasOrTableNorm);
-                        if (matchedTable && matchedTable.toLowerCase() !== "__subquery__") {
-                            resolvedTable = matchedTable;
-                            resolvedFromFileAlias = !hasSchemaDefinitionForName(matchedTable, defs);
-                        } else if (matchedTable && matchedTable.toLowerCase() === "__subquery__") {
-                            resolvedTable = aliasOrTableNorm;
-                        }
-                    }
-
                     if (resolvedTable) {
                         const resolvedTableNorm = normalizeName(resolvedTable);
                         localRefs.push({
@@ -606,7 +590,7 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                             kind: "column",
                             validateSchema: (
                                 hasSchemaDefinitionForName(resolvedTable, defs)
-                                || (!resolvedFromFileAlias && !resolvedTableNorm.startsWith("#") && !functionCallNames.has(resolvedTableNorm))
+                                || (!resolvedTableNorm.startsWith("#") && !functionCallNames.has(resolvedTableNorm))
                             )
                         });
                     } else {

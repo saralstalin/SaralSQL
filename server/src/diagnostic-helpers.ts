@@ -283,10 +283,9 @@ export function collectAmbiguousColumnDiagnostics(
 }
 
 function isBareColumnInMutationStatementAtOffset(ast: any, offset: number): boolean {
-  if (!ast || typeof offset !== "number") {
-    return false;
-  }
-
+  // Caller (collectAmbiguousColumnDiagnostics) already validates !parsed?.ast and
+  // typeof ref.location.start === "number" before invoking this function, so both
+  // the !ast and typeof offset guards are unreachable from that path.
   const body = Array.isArray(ast?.body) ? ast.body : [];
   for (const stmt of body) {
     const start = Number(stmt?.start);
@@ -1116,15 +1115,18 @@ function getSourceColumns(
 
     for (const sym of symbols) {
       const symName = normalizeName(String(sym?.name ?? ""));
-      if (symName === targetAlias && Array.isArray(sym?.columns) && sym.columns.length > 0) {
-        return sym.columns;
-      }
 
-      // CTE source matched by alias/qualifier name: getCteColumns reads sym.location.query
-      // (the CTE body's SELECT list), which is where projected column names actually live.
+      // CTE columns must go through getCteColumns() — the parser stores them as plain
+      // string identifiers in sym.columns (e.g. ["EmployeeId","Name"]), not as the
+      // {rawName, name} column-objects that the expansion code expects. getCteColumns()
+      // reads from sym.location.query and always returns proper column objects.
       if (symName === targetAlias && sym?.kind === "CTE") {
         const cteCols = getCteColumns(sym);
         if (cteCols.length > 0) { return cteCols; }
+      }
+
+      if (symName === targetAlias && Array.isArray(sym?.columns) && sym.columns.length > 0) {
+        return sym.columns;
       }
 
       if (symName === targetAlias && sym?.kind === "Alias") {
@@ -1151,17 +1153,17 @@ function getSourceColumns(
         }
       }
 
-      if ((sym?.kind === "Table" || sym?.kind === "TempTable" || sym?.kind === "CTE")
+      // Same CTE guard for targetTable lookup.
+      if (sym?.kind === "CTE" && symName === targetTable) {
+        const cteCols = getCteColumns(sym);
+        if (cteCols.length > 0) { return cteCols; }
+      }
+
+      if ((sym?.kind === "Table" || sym?.kind === "TempTable")
         && symName === targetTable
         && Array.isArray(sym?.columns)
         && sym.columns.length > 0) {
         return sym.columns;
-      }
-
-      // CTE source matched by table name: same getCteColumns fix as the alias case above.
-      if (sym?.kind === "CTE" && symName === targetTable) {
-        const cteCols = getCteColumns(sym);
-        if (cteCols.length > 0) { return cteCols; }
       }
 
       if (symName === targetTable) {

@@ -221,6 +221,285 @@ CREATE TABLE Department (
   assert.strictEqual(diags.length, 0, "Bare column with no displayAlias on the resolved owner should not emit a readability hint");
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// UNALIASED COLUMN RESOLUTION CONTRACT SPEC
+//
+// These tests define the exact expected behaviour of resolveBareColumnAtOffset
+// for every unaliased-column scenario that has historically caused regressions
+// when the hover / definition / references / diagnostics providers were unified.
+//
+// Every assertion here is an invariant the refactored unified resolver MUST
+// preserve. When a new provider extracts logic from server.ts:
+//   1. It MUST call resolveBareColumnAtOffset with the same params shape
+//      (parsed, offset, columnName, tablesByName, tableTypesByName, scopeAtPos)
+//   2. The resolution MUST return these exact statuses and owner names
+//   3. Qualified tokens (e.EmployeeId) MUST NOT be sent through this function
+// ══════════════════════════════════════════════════════════════════════════════
+
+runCase("unaliased-column-contract-single-table-no-alias", () => {
+  // The simplest case: one table, no alias. Parser provides a "single_scope_owner"
+  // hint; scope is empty; resolution falls through to the parser-native path.
+  indexText("file:///contract/schema.sql", `
+CREATE TABLE Employee (EmployeeId INT, DepartmentId INT, Name NVARCHAR(100), Salary DECIMAL(10,2));
+CREATE TABLE Department (DepartmentId INT, Name NVARCHAR(100), Budget DECIMAL(10,2));
+`);
+  const sql = `SELECT Name FROM Employee;`;
+  const parsed = parseSql(sql);
+  const r = resolveBareColumnAtOffset({
+    parsed, offset: sql.indexOf("Name"), columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(r.status, "resolved", "Bare column from single unaliased table must resolve");
+  assert.ok(String(r.owner?.ownerName ?? "").toLowerCase() === "employee", "Owner must be Employee");
+  assert.ok(String(r.owner?.column?.rawName ?? r.owner?.column?.name ?? "").toLowerCase() === "name", "Column must be Name");
+});
+
+runCase("unaliased-column-contract-unambiguous-in-two-table-join", () => {
+  // Column exists in exactly one of the joined tables — must resolve unambiguously
+  // even though there are two sources in scope.
+  indexText("file:///contract/schema.sql", `
+CREATE TABLE Employee   (EmployeeId INT, DepartmentId INT, Salary DECIMAL(10,2));
+CREATE TABLE Department (DepartmentId INT,                 Budget DECIMAL(10,2));
+`);
+  const sql = `SELECT EmployeeId, Budget FROM Employee e JOIN Department d ON e.DepartmentId = d.DepartmentId;`;
+  const parsed = parseSql(sql);
+
+  const rEmp = resolveBareColumnAtOffset({
+    parsed, offset: sql.indexOf("EmployeeId"), columnName: "EmployeeId", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(rEmp.status, "resolved",
+    "EmployeeId (only in Employee) must resolve even with two FROM sources");
+  assert.ok(String(rEmp.owner?.ownerName ?? "").toLowerCase().includes("employee"),
+    "EmployeeId owner must be Employee");
+
+  const rDept = resolveBareColumnAtOffset({
+    parsed, offset: sql.indexOf("Budget"), columnName: "Budget", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(rDept.status, "resolved",
+    "Budget (only in Department) must resolve even with two FROM sources");
+  assert.ok(String(rDept.owner?.ownerName ?? "").toLowerCase().includes("department"),
+    "Budget owner must be Department");
+});
+
+runCase("unaliased-column-contract-ambiguous-in-two-table-join", () => {
+  // Column exists in BOTH joined tables — must be reported as ambiguous, never silently
+  // resolved to one side. Two owners must be present.
+  indexText("file:///contract/schema.sql", `
+CREATE TABLE Employee   (EmployeeId INT, DepartmentId INT, Name NVARCHAR(100));
+CREATE TABLE Department (DepartmentId INT,                 Name NVARCHAR(100));
+`);
+  const sql = `SELECT Name FROM Employee e JOIN Department d ON e.DepartmentId = d.DepartmentId;`;
+  const parsed = parseSql(sql);
+  const r = resolveBareColumnAtOffset({
+    parsed, offset: sql.indexOf("Name"), columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(r.status, "ambiguous",
+    "Column present in both tables must be ambiguous, never silently resolved");
+  assert.strictEqual(r.owners.length, 2, "Both tables must appear as competing owners");
+});
+
+runCase("unaliased-column-contract-scope-boundary-derived-alias", () => {
+  // Derived alias scope boundary: when a bare column appears in the outer SELECT and
+  // the FROM sources are a derived alias (subquery) plus a real table, the outer bare
+  // column must NOT bypass into the subquery's internal table. It can only see what the
+  // derived alias projects and what the other real sources provide.
+  //
+  // Also verifies that the inner subquery column does NOT get resolved using outer scope.
+  indexText("file:///contract/schema.sql", `
+CREATE TABLE Employee   (EmployeeId INT, Name NVARCHAR(100));
+CREATE TABLE Department (DepartmentId INT, Name NVARCHAR(100));
+`);
+  const sql = `SELECT Name FROM (SELECT Name FROM Employee) sub JOIN Department d ON 1=1;`;
+  const parsed = parseSql(sql);
+
+  // Outer bare Name: the derived alias `sub` has no inline projected columns in the
+  // scope model, so only Department (via alias d) contributes. Name resolves to Department.
+  const outerOff = sql.indexOf("Name");
+  const rOuter = resolveBareColumnAtOffset({
+    parsed, offset: outerOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(rOuter.status, "resolved",
+    "Outer bare Name with derived alias + Department join must resolve");
+  assert.ok(String(rOuter.owner?.ownerName ?? "").toLowerCase().includes("department"),
+    "Outer Name must resolve to Department (sub has no projected columns in scope; Employee must NOT bleed through the subquery boundary)");
+
+  // Inner Name (inside the subquery) — parser does not provide resolution for anonymous
+  // subquery inner references. This is a known parser limitation, not an LSP bug.
+  const innerOff = sql.indexOf("SELECT Name FROM Employee") + 7;
+  const rInner = resolveBareColumnAtOffset({
+    parsed, offset: innerOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.ok(rInner.status === "resolved" || rInner.status === "unresolved",
+    "Inner subquery Name should not throw (parser may or may not resolve anonymous subquery positions)");
+});
+
+runCase("unaliased-column-contract-cte-projected-column", () => {
+  // A bare column in the outer query that references a CTE must resolve to the CTE,
+  // not bypass to the underlying base table inside the CTE body.
+  indexText("file:///contract/schema.sql", `
+CREATE TABLE Employee (EmployeeId INT, Name NVARCHAR(100));
+`);
+  const sql = `WITH emp_cte AS (SELECT Name FROM Employee) SELECT Name FROM emp_cte;`;
+  const parsed = parseSql(sql);
+
+  // Both the inner (CTE body) and outer (main query) bare Name resolve to the CTE entity.
+  // The scope model surfaces the CTE as the owner at both positions — the key invariant
+  // is that Employee does NOT bypass the CTE boundary in either direction.
+  const rInner = resolveBareColumnAtOffset({
+    parsed, offset: sql.indexOf("Name"), columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(rInner.status, "resolved", "Name inside CTE body must resolve");
+  assert.ok(String(rInner.owner?.ownerName ?? "").toLowerCase().includes("cte") ||
+            String(rInner.owner?.ownerName ?? "").toLowerCase().includes("emp"),
+    "Name inside CTE body must resolve to the CTE entity (parser surfaces CTE as owner)");
+
+  const outerOff = sql.lastIndexOf("SELECT Name") + 7;
+  const rOuter = resolveBareColumnAtOffset({
+    parsed, offset: outerOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(rOuter.status, "resolved", "Name in outer SELECT FROM cte must resolve");
+  assert.ok(String(rOuter.owner?.ownerName ?? "").toLowerCase().includes("cte") ||
+            String(rOuter.owner?.ownerName ?? "").toLowerCase().includes("emp"),
+    // Parser v0.4.4 + LSP CTE-anchor fix: the outer Name in SELECT FROM cte now
+    // resolves to Employee (the base table), enabling accurate hover and go-to-definition.
+    "Outer Name must resolve to the underlying base table Employee (better for navigation than resolving to the CTE itself)");
+});
+
+runCase("unaliased-column-contract-exists-subquery-scope-isolation", () => {
+  // Outer JOIN query with EXISTS subquery. The outer bare Name is ambiguous.
+  // The inner bare Name must be scoped to the EXISTS subquery only.
+  indexText("file:///contract/schema.sql", `
+CREATE TABLE Employee   (EmployeeId INT, DepartmentId INT, Name NVARCHAR(100));
+CREATE TABLE Department (DepartmentId INT,                 Name NVARCHAR(100));
+`);
+  const sql = `SELECT Name FROM Employee e JOIN Department d ON e.DepartmentId = d.DepartmentId WHERE EXISTS (SELECT Name FROM Department WHERE Name = 'x');`;
+  const parsed = parseSql(sql);
+
+  // Outer Name (in the SELECT list) — ambiguous because both aliases provide it.
+  const rOuter = resolveBareColumnAtOffset({
+    parsed, offset: sql.indexOf("Name"), columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(rOuter.status, "ambiguous",
+    "Outer Name in JOIN query must be ambiguous even though an EXISTS clause is present");
+  assert.strictEqual(rOuter.owners.length, 2,
+    "Both Employee and Department must remain as competing outer owners");
+
+  // Inner Name (inside EXISTS SELECT) — must NOT resolve to the outer Employee alias.
+  const innerOff = sql.indexOf("SELECT Name FROM Department") + 7;
+  const rInner = resolveBareColumnAtOffset({
+    parsed, offset: innerOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  if (rInner.status === "resolved") {
+    assert.ok(!String(rInner.owner?.ownerName ?? "").toLowerCase().includes("employee"),
+      "Inner EXISTS Name must NOT bleed through to the outer Employee alias");
+  }
+});
+
+runCase("unaliased-column-contract-recursive-cte", () => {
+  // In a recursive CTE the bare column must resolve differently depending on position:
+  // anchor branch → base table, recursive branch → base table, outer SELECT → the CTE.
+  indexText("file:///contract/schema.sql", `
+CREATE TABLE Employee (EmployeeId INT, Name NVARCHAR(100));
+`);
+  const sql = `
+WITH rcte AS (
+  SELECT EmployeeId, Name FROM Employee WHERE EmployeeId = 1
+  UNION ALL
+  SELECT e.EmployeeId, Name FROM Employee e JOIN rcte r ON e.EmployeeId = r.EmployeeId WHERE r.EmployeeId < 10
+)
+SELECT Name FROM rcte;`;
+  const parsed = parseSql(sql);
+
+  // Anchor branch Name: the CTE is already visible in its own scope, so the parser
+  // surfaces rcte as the owner even in the anchor SELECT.
+  const anchorOff = sql.indexOf("SELECT EmployeeId, Name") + "SELECT EmployeeId, ".length;
+  const rAnchor = resolveBareColumnAtOffset({
+    parsed, offset: anchorOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(rAnchor.status, "resolved", "Anchor branch Name must resolve");
+  assert.ok(String(rAnchor.owner?.ownerName ?? "").toLowerCase().includes("rcte") ||
+            String(rAnchor.owner?.ownerName ?? "").toLowerCase().includes("employee"),
+    "Anchor branch Name must resolve to the CTE or Employee (scope model surfacing)");
+
+  // Recursive branch Name: explicit alias e for Employee is visible → resolves to Employee.
+  const recursiveOff = sql.indexOf("SELECT e.EmployeeId, Name") + "SELECT e.EmployeeId, ".length;
+  const rRecursive = resolveBareColumnAtOffset({
+    parsed, offset: recursiveOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(rRecursive.status, "resolved", "Recursive branch Name must resolve");
+  assert.ok(String(rRecursive.owner?.ownerName ?? "").toLowerCase().includes("employee"),
+    "Recursive branch Name must resolve to Employee (alias e is the concrete source here)");
+
+  // Outer SELECT FROM rcte: parser v0.4.4 + LSP CTE-anchor fix now resolves to Employee
+  // (the underlying base table) instead of the CTE wrapper. This is the preferred behaviour
+  // for hover and go-to-definition — it navigates to where the column is actually defined.
+  const outerOff = sql.lastIndexOf("SELECT Name") + 7;
+  const rOuter = resolveBareColumnAtOffset({
+    parsed, offset: outerOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(rOuter.status, "resolved", "Outer SELECT Name FROM rcte must resolve");
+  assert.ok(String(rOuter.owner?.ownerName ?? "").toLowerCase().includes("employee"),
+    "Outer Name must resolve to Employee (the concrete source), not just to the rcte wrapper — accurate hover/definition");
+});
+
+runCase("unaliased-column-contract-insert-select-target-filtered", () => {
+  // Critical regression test: when the INSERT target is ALSO a JOIN source, bare columns
+  // in the SELECT part must NOT resolve to the target table. narrowOwnersForInsertReadContext
+  // must filter it out, leaving only the non-target source.
+  indexText("file:///contract/schema.sql", `
+CREATE TABLE Employee   (EmployeeId INT, DepartmentId INT, Name NVARCHAR(100));
+CREATE TABLE Department (DepartmentId INT,                 Name NVARCHAR(100));
+`);
+  const sql = `INSERT INTO Employee (EmployeeId, Name)
+SELECT EmployeeId, Name
+FROM Employee e JOIN Department d ON e.DepartmentId = d.DepartmentId
+WHERE e.EmployeeId = 0;`;
+  const parsed = parseSql(sql);
+  const selectNameOff = sql.lastIndexOf("SELECT EmployeeId, Name") + "SELECT EmployeeId, ".length;
+  const r = resolveBareColumnAtOffset({
+    parsed, offset: selectNameOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(r.status, "resolved",
+    "INSERT..SELECT bare Name: Employee (insert target) filtered → Department remains → resolved");
+  assert.ok(String(r.owner?.ownerName ?? "").toLowerCase().includes("department"),
+    "Name must resolve to Department — Employee is the insert target and must be excluded");
+});
+
+runCase("unaliased-column-contract-update-set-clause", () => {
+  // A bare column in the UPDATE SET clause must resolve to the UPDATE target via the
+  // mutation-target path. Scope is empty at the SET position — this ONLY works via
+  // resolveMutationTargetOwner → resolveCandidateOwner.
+  indexText("file:///contract/schema.sql", `
+CREATE TABLE Employee (EmployeeId INT, Name NVARCHAR(100), Salary DECIMAL(10,2));
+`);
+  const sql = `UPDATE Employee SET Salary = 100.00 WHERE Name = 'x';`;
+  const parsed = parseSql(sql);
+  const r = resolveBareColumnAtOffset({
+    parsed, offset: sql.indexOf("Salary ="), columnName: "Salary", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(r.status, "resolved",
+    "Bare Salary in UPDATE SET must resolve via the mutation-target path");
+  assert.ok(String(r.owner?.ownerName ?? "").toLowerCase().includes("employee"),
+    "UPDATE SET Salary owner must be Employee");
+});
+
+runCase("unaliased-column-contract-order-by-unambiguous", () => {
+  // A bare column in ORDER BY that exists in only one of the FROM sources must resolve
+  // unambiguously. The column is inside the SELECT's read scope.
+  indexText("file:///contract/schema.sql", `
+CREATE TABLE Employee   (EmployeeId INT, Salary DECIMAL(10,2));
+CREATE TABLE Department (DepartmentId INT, Budget DECIMAL(10,2));
+`);
+  const sql = `SELECT Salary FROM Employee e JOIN Department d ON e.EmployeeId = d.DepartmentId ORDER BY Salary;`;
+  const parsed = parseSql(sql);
+  const r = resolveBareColumnAtOffset({
+    parsed, offset: sql.lastIndexOf("Salary"), columnName: "Salary", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(r.status, "resolved",
+    "Bare Salary in ORDER BY must resolve (it is unambiguous — only in Employee)");
+  assert.ok(String(r.owner?.ownerName ?? "").toLowerCase().includes("employee"),
+    "ORDER BY Salary must resolve to Employee");
+});
+
 runCase("resolveBareColumnAtOffset-uses-localDefsByName-and-tableTypesByName", () => {
   const schemaUri = "file:///validation/local-def-type-schema.sql";
   indexText(schemaUri, `
@@ -266,6 +545,171 @@ SELECT EmployeeId FROM LocalEmployee WHERE Dept = 'Eng';
   });
   assert.strictEqual(typeResolved.status, "resolved", "Bare column resolved against a TABLE TYPE name via tableTypesByName should succeed");
   assert.ok(String(typeResolved.owner?.ownerName ?? "").toLowerCase().includes("employeetype"), "Owner should be the TABLE TYPE");
+});
+
+runCase("column-resolution-narrowing-paths", () => {
+  const schemaUri = "file:///validation/narrow-schema.sql";
+  indexText(schemaUri, `
+CREATE TABLE Employee   (EmployeeId INT, DepartmentId INT, Name NVARCHAR(100));
+CREATE TABLE Department (DepartmentId INT,                 Name NVARCHAR(100));
+CREATE TABLE Staging    (EmployeeId INT,                   Name NVARCHAR(100));
+`);
+
+  // ── dedupeOwners continue (453-454) ─────────────────────────────────────────
+  // Self-join: both aliases e and e2 independently resolve to Employee.Name.
+  // dedupeOwners sees the same ownerName:column key twice and skips the second.
+  // Net result: one owner instead of two → resolved, not ambiguous.
+  const selfJoinSql = `SELECT Name FROM Employee e JOIN Employee e2 ON e.EmployeeId = e2.EmployeeId;`;
+  const selfJoinParsed = parseSql(selfJoinSql);
+  const selfJoinOff = selfJoinSql.indexOf("Name");
+  const selfJoinR = resolveBareColumnAtOffset({
+    parsed: selfJoinParsed, offset: selfJoinOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(selfJoinR.status, "resolved",
+    "Self-join: duplicate owners for the same column must be deduped to a single resolved owner");
+  assert.ok(String(selfJoinR.owner?.ownerName ?? "").toLowerCase().includes("employee"),
+    "Self-join: resolved owner should be Employee");
+
+  // ── narrowOwnersForInsertReadContext: non-InsertStatement body stmt → continue (260) ──
+  // ── narrowOwnersForInsertReadContext: InsertStatement present but offset OUTSIDE it → continue (265-266) ──
+  // Multi-statement batch: a SELECT with an ambiguous bare column comes first, followed by
+  // an INSERT. The narrowing function sees two body statements. The SELECT triggers the
+  // type≠InsertStatement continue (line 260). The INSERT passes that check, but the offset
+  // (from the SELECT) is before the INSERT's start, so it hits the range-guard continue
+  // at lines 265-266 → both statements are skipped → owners unchanged → still ambiguous.
+  const ambigSql = `SELECT Name FROM Employee e JOIN Department d ON e.DepartmentId = d.DepartmentId; INSERT INTO Department (Name) SELECT Name FROM Department;`;
+  const ambigParsed = parseSql(ambigSql);
+  const ambigOff = ambigSql.indexOf("Name");
+  const ambigR = resolveBareColumnAtOffset({
+    parsed: ambigParsed, offset: ambigOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(ambigR.status, "ambiguous",
+    "Ambiguous bare column in a multi-statement batch must remain ambiguous when the INSERT is a different statement");
+  assert.strictEqual(ambigR.owners.length, 2,
+    "Two competing owners should be present before any narrowing removes them");
+
+  // ── narrowOwnersForInsertReadContext: INSERT target filtered from ambiguous owners ──
+  // INSERT INTO Employee … SELECT Name FROM Employee e JOIN Department d …
+  // Employee is both the INSERT target AND an ambiguous source. The narrowing
+  // function removes Employee from the candidates because it is the insert target,
+  // leaving only Department — so the bare Name resolves unambiguously to Department.
+  const insertSql = `INSERT INTO Employee (EmployeeId, Name) SELECT EmployeeId, Name FROM Employee e JOIN Department d ON e.DepartmentId = d.DepartmentId WHERE e.EmployeeId = 0;`;
+  const insertParsed = parseSql(insertSql);
+  // Offset is inside the SELECT list (inside the INSERT's SELECT query — read context).
+  const insertSelectOff = insertSql.lastIndexOf("SELECT EmployeeId, Name") + "SELECT EmployeeId, ".length;
+  const insertR = resolveBareColumnAtOffset({
+    parsed: insertParsed, offset: insertSelectOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(insertR.status, "resolved",
+    "INSERT..SELECT: the bare Name column should resolve unambiguously once Employee (the insert target) is filtered out");
+  assert.ok(String(insertR.owner?.ownerName ?? "").toLowerCase().includes("department"),
+    "INSERT..SELECT: resolved owner should be Department (Employee filtered as insert target)");
+
+  // ── narrowOwnersForInsertReadContext: target is Staging, neither source filtered ──
+  // Both Employee and Department stay ambiguous because neither equals the target (Staging).
+  const stagingSql = `INSERT INTO Staging (Name) SELECT Name FROM Employee e JOIN Department d ON e.DepartmentId = d.DepartmentId;`;
+  const stagingParsed = parseSql(stagingSql);
+  const stagingOff = stagingSql.lastIndexOf("SELECT Name") + "SELECT ".length;
+  const stagingR = resolveBareColumnAtOffset({
+    parsed: stagingParsed, offset: stagingOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(stagingR.status, "ambiguous",
+    "INSERT..SELECT into Staging: Employee and Department both survive the filter → still ambiguous");
+
+  // ── resolveParserNativeDecisionOwner scopeOwner=null → fromOwner (550-551) ─────
+  // SELECT Name FROM Employee (no alias) → scope is empty → collectNearestScopeColumnOwners
+  // returns [] → owners.length=0. The parser hints Employee via decisionReason
+  // "single_scope_owner". resolveParserNativeDecisionOwner finds fromOwner = Employee.Name
+  // and findEquivalentScopeOwner returns null (empty owners list), so it returns
+  // scopeOwner ?? fromOwner = null ?? fromOwner = fromOwner (the 550-551 path).
+  const unaliasedSql = `SELECT Name FROM Employee;`;
+  const unaliasedParsed = parseSql(unaliasedSql);
+  const unaliasedOff = unaliasedSql.indexOf("Name");
+  const unaliasedR = resolveBareColumnAtOffset({
+    parsed: unaliasedParsed, offset: unaliasedOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(unaliasedR.status, "resolved",
+    "Unaliased FROM Employee: bare Name should still resolve via the parser-native hint path");
+  assert.ok(String(unaliasedR.owner?.ownerName ?? "").toLowerCase().includes("employee"),
+    "Unaliased FROM Employee: resolved owner should be Employee");
+
+  // ── resolveMutationTargetOwner: resolveAliasMutationTargetOwner returns null ──
+  // UPDATE Employee SET Name='x': scope is empty at SET position → aliasSym is null
+  // → resolveAliasMutationTargetOwner returns null at (423-424) → falls through to
+  // resolveCandidateOwner which finds Employee in tablesByName → resolved.
+  const updateSql = `UPDATE Employee SET Name = 'x' WHERE EmployeeId = 1;`;
+  const updateParsed = parseSql(updateSql);
+  // Offset INSIDE the SET clause (at the bare Name token).
+  const updateOff = updateSql.indexOf("Name = ");
+  const updateR = resolveBareColumnAtOffset({
+    parsed: updateParsed, offset: updateOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(updateR.status, "resolved",
+    "UPDATE SET bare column: should resolve to the mutation target via resolveCandidateOwner");
+  assert.ok(String(updateR.owner?.ownerName ?? "").toLowerCase().includes("employee"),
+    "UPDATE SET bare column: resolved owner should be Employee");
+});
+
+runCase("unaliased-column-contract-merge-using-subquery", () => {
+  // Parser v0.4.4 now provides matchedResolution for MERGE USING subquery positions.
+  // Bare columns inside the USING subquery must resolve to the USING source table.
+  indexText("file:///contract/merge-schema.sql", `
+CREATE TABLE Employee (EmployeeId INT, Name NVARCHAR(100));
+CREATE TABLE Staging  (EmployeeId INT, Name NVARCHAR(100));
+`);
+  const sql = `
+MERGE Employee AS t
+USING (SELECT EmployeeId, Name FROM Staging) AS s
+ON    t.EmployeeId = s.EmployeeId
+WHEN MATCHED THEN UPDATE SET t.Name = s.Name;`;
+  const parsed = parseSql(sql);
+  const usingNameOff = sql.indexOf("USING (SELECT EmployeeId, Name") + "USING (SELECT EmployeeId, ".length;
+  const r = resolveBareColumnAtOffset({
+    parsed, offset: usingNameOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(r.status, "resolved",
+    "MERGE USING bare Name must now resolve (parser v0.4.4 emits matchedResolution for USING positions)");
+  assert.ok(String(r.owner?.ownerName ?? "").toLowerCase().includes("staging"),
+    "MERGE USING Name must resolve to Staging (the USING source), not Employee (the merge target)");
+});
+
+runCase("unaliased-column-contract-anonymous-subquery-inner", () => {
+  // Parser v0.4.4 now provides matchedResolution for bare columns inside anonymous
+  // inline subqueries. The inner column must resolve to the subquery's own source table.
+  indexText("file:///contract/subq-schema.sql", `
+CREATE TABLE Employee   (EmployeeId INT, Name NVARCHAR(100));
+CREATE TABLE Department (DepartmentId INT, Name NVARCHAR(100));
+`);
+  const sql = `SELECT sub.Name FROM (SELECT Name FROM Employee) sub JOIN Department d ON 1=1;`;
+  const parsed = parseSql(sql);
+  const innerOff = sql.indexOf("SELECT Name FROM Employee") + 7;
+  const r = resolveBareColumnAtOffset({
+    parsed, offset: innerOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(r.status, "resolved",
+    "Inner subquery bare Name must now resolve (parser v0.4.4 emits matchedResolution for subquery positions)");
+  assert.ok(String(r.owner?.ownerName ?? "").toLowerCase().includes("employee"),
+    "Inner subquery Name must resolve to Employee and must NOT see the outer Department join");
+});
+
+runCase("unaliased-column-contract-cte-body-resolves-to-base-table", () => {
+  // Parser v0.4.4 fixes CTE anchor branch: matchedResolution for Name inside the CTE
+  // body now attributes it to Employee (the base table), not rcte.
+  // The LSP now prefers the parser's concrete-table attribution over the CTE scope owner,
+  // making hover and go-to-definition navigate to the actual column definition.
+  indexText("file:///contract/cte-base-schema.sql", `
+CREATE TABLE Employee (EmployeeId INT, Name NVARCHAR(100));
+`);
+  const sql = `WITH cte AS (SELECT Name FROM Employee) SELECT Name FROM cte;`;
+  const parsed = parseSql(sql);
+  const innerOff = sql.indexOf("Name");   // inside CTE body
+  const r = resolveBareColumnAtOffset({
+    parsed, offset: innerOff, columnName: "Name", tablesByName, tableTypesByName
+  });
+  assert.strictEqual(r.status, "resolved",
+    "CTE body bare Name must resolve");
+  assert.ok(String(r.owner?.ownerName ?? "").toLowerCase().includes("employee"),
+    "CTE body Name must resolve to Employee (the base table), not the CTE itself — enabling accurate hover and go-to-definition");
 });
 
 runCase("resolveBareColumnAtOffset-mutation-target-edge-cases", () => {

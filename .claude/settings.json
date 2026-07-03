@@ -13,7 +13,25 @@
       "Bash(node --experimental-test-coverage --test out/server/src/tests/all.js)",
       "Bash(node out/server/src/tests/all.js)",
       "Bash(sed -i 's/  const queryUri  = \"file:\\\\/\\\\/\\\\/validation\\\\/string-col-compare-query.sql\";//' server/src/tests/validation-layer.ts)",
-      "Bash(sed -i 's/  const queryUri  = \"file:\\\\/\\\\/\\\\/validation\\\\/readable-no-alias-query.sql\";//' server/src/tests/validation-layer.ts)"
+      "Bash(sed -i 's/  const queryUri  = \"file:\\\\/\\\\/\\\\/validation\\\\/readable-no-alias-query.sql\";//' server/src/tests/validation-layer.ts)",
+      "Bash(grep -v \"^.*import\\\\|^.*//\\\\|^.*assert\")",
+      "Bash(node out/server/src/tests/validation-layer.js)",
+      "Bash(npm show *)",
+      "Bash(node -e \"console.log\\(require\\('@saralsql/tsql-parser/package.json'\\).version\\)\")",
+      "Bash(node -e \"const d=require\\('fs'\\).readFileSync\\('/dev/stdin','utf8'\\); const p=JSON.parse\\(d\\); console.log\\('version:', p.version\\);\")",
+      "Bash(powershell -c \"Get-Content 'node_modules/@saralsql/tsql-parser/package.json' | Select-String '\\\\\"version\\\\\"'\")",
+      "Bash(node -e \"const p=require\\('fs'\\).readFileSync\\('node_modules/@saralsql/tsql-parser/package.json','utf8'\\); console.log\\('installed:',JSON.parse\\(p\\).version\\);\")",
+      "Bash(grep -v \"^.*//\\\\|^.*assert\\\\|^.*CREATE\\\\|^.*WHEN\\\\|^.*MATCHED\")",
+      "Bash(awk -F: '$2~/^}$/ && $1>1545')",
+      "Bash(awk -F: '$1>1545')",
+      "Bash(node out/server/src/tests/hover-provider.js)",
+      "Bash(node out/server/src/tests/definition-provider.js)",
+      "Bash(node out/server/src/tests/references-provider.js)",
+      "Bash(awk -F: '$1>1027')",
+      "Bash(python3)",
+      "Bash(grep -v \"^.*function \\\\|^.*//\\\\|^.*import\")",
+      "Bash(node out/server/src/tests/completion-provider.js)",
+      "Bash(node out/server/src/tests/schema-validator.js)"
     ]
   }
 }
