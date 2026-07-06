@@ -136,4 +136,21 @@ The `getSymbolColumns` helper (which reads `sym.localColumns` or falls back to `
 
 ---
 
-*(Log continues as more findings are discovered during the remaining coverage pass.)*
+---
+
+## 7. `schema-validator.ts` — `visitScope` `withColumns` alias-candidate path is structurally dead
+
+**File:** `server/src/schema-validator.ts`, `visitScope` inner block (lines 527–565 in compiled output)
+**Kind:** Structural dead code given current indexing behavior
+
+The `withColumns` alias-candidate block is only reached when `aliasCandidates.length > 0`, which requires the column ref's table part to match an alias **name** in scope (e.g., `sub` in `sub.badcol`). This only occurs for derived alias (subquery) refs.
+
+However, `indexText` always indexes derived-alias column refs with `validateSchema: false` — because `matchedResolution.inputs[0].source` is the subquery alias name, which is never in the workspace schema, so `hasSchemaDefinitionForName(source, defs) = false`. The schema validator's `visitScope` skips all refs with `validateSchema === false` before reaching the `aliasCandidates` check.
+
+**Impact:** LSP002 for unknown columns on derived aliases IS emitted correctly via a different path (the parser's own COL001 diagnostic or the `scopedSym?.kind === "Alias"` fallback further down in visitScope). The `withColumns` path is dead redundant code.
+
+**Remediation:** Either remove the `withColumns` block, or change `indexText` to index derived-alias column refs with `validateSchema: true` so they reach the withColumns validation.
+
+---
+
+*(Log complete.)*

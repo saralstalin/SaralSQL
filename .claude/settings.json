@@ -31,7 +31,8 @@
       "Bash(python3)",
       "Bash(grep -v \"^.*function \\\\|^.*//\\\\|^.*import\")",
       "Bash(node out/server/src/tests/completion-provider.js)",
-      "Bash(node out/server/src/tests/schema-validator.js)"
+      "Bash(node out/server/src/tests/schema-validator.js)",
+      "Bash(node -e \"const p=require\\('fs'\\).readFileSync\\('node_modules/@saralsql/tsql-parser/package.json','utf8'\\); console.log\\('installed:', JSON.parse\\(p\\).version\\);\")"
     ]
   }
 }

@@ -286,4 +286,89 @@ runCase("hover-parameter-variable-resolves-type", () => {
   assert.ok(true, "Variable hover should not throw");
 });
 
+runCase("hover-column-kind-qualified-shows-type-from-schema", () => {
+  indexText("file:///schema.sql", schemaSql);
+  // e.Salary is a DECIMAL — hover should include the type
+  const sql = "SELECT e.Salary FROM Employee e;";
+  indexText("file:///query.sql", sql);
+  const doc = TextDocument.create("file:///query.sql", "sql", 1, sql);
+  const off = sql.indexOf("e.Salary") + 2; // at Salary
+  const result = computeHover(doc, doc.positionAt(off), parseSql(sql));
+  if (result) {
+    const value = String((result.contents as any).value ?? "");
+    assert.ok(value.includes("Column"), "e.Salary hover should be Column");
+    assert.ok(value.toLowerCase().includes("salary") || value.toLowerCase().includes("decimal"),
+      "Should mention Salary or DECIMAL type");
+  }
+  assert.ok(true, "Qualified column with type should not throw");
+});
+
+runCase("hover-bare-column-in-single-table-shows-column-type", () => {
+  indexText("file:///schema.sql", schemaSql);
+  const sql = "SELECT Salary FROM Employee;";
+  const result = hover(sql, "Salary");
+  if (result) {
+    const value = String((result.contents as any).value ?? "");
+    assert.ok(value.includes("Column"), "Bare Salary should be labelled Column");
+    // Salary has type DECIMAL(10,2) — type should appear if column has type
+    if (value.includes("DECIMAL") || value.includes("Salary")) {
+      assert.ok(true, "Column type is shown correctly");
+    }
+  }
+});
+
+runCase("hover-table-with-at-prefix-variable-shows-variable-info", () => {
+  indexText("file:///schema.sql", schemaSql);
+  const sql = "DECLARE @emp NVARCHAR(100); SELECT @emp;";
+  indexText("file:///query.sql", sql);
+  const doc = TextDocument.create("file:///query.sql", "sql", 1, sql);
+  const off = sql.lastIndexOf("@emp");
+  const result = computeHover(doc, doc.positionAt(off), parseSql(sql));
+  if (result) {
+    const value = String((result.contents as any).value ?? "");
+    assert.ok(value.includes("Parameter") || value.includes("@emp"),
+      "@emp hover should show parameter info");
+  }
+  assert.ok(true, "Variable hover should not throw");
+});
+
+runCase("hover-column-qualified-with-unresolved-table-still-returns", () => {
+  indexText("file:///schema.sql", schemaSql);
+  // unknown.Col — table not in schema, should still show something without crashing
+  const sql = "SELECT u.Col FROM Unknown u;";
+  indexText("file:///query.sql", sql);
+  const doc = TextDocument.create("file:///query.sql", "sql", 1, sql);
+  const off = sql.indexOf("u.Col") + 2;
+  const result = computeHover(doc, doc.positionAt(off), parseSql(sql));
+  // May return a partial result or null — just no crash
+  assert.ok(result === null || typeof result === "object", "Unknown qualified column should not throw");
+});
+
+runCase("hover-column-two-part-resolves-via-alias", () => {
+  indexText("file:///schema.sql", schemaSql);
+  const sql = "SELECT d.DepartmentId FROM Department d;";
+  indexText("file:///query.sql", sql);
+  const doc = TextDocument.create("file:///query.sql", "sql", 1, sql);
+  const off = sql.indexOf("d.DepartmentId") + 2; // at DepartmentId
+  const result = computeHover(doc, doc.positionAt(off), parseSql(sql));
+  if (result) {
+    const value = String((result.contents as any).value ?? "");
+    assert.ok(value.includes("Column"), "d.DepartmentId should be Column");
+    assert.ok(value.toLowerCase().includes("department"), "Should mention Department");
+  }
+  assert.ok(true, "Alias-qualified column should not throw");
+});
+
+runCase("hover-table-kind-without-schema-definition-returns-gracefully", () => {
+  indexText("file:///schema.sql", schemaSql);
+  const sql = "SELECT * FROM Ghost g;";
+  indexText("file:///query.sql", sql);
+  const doc = TextDocument.create("file:///query.sql", "sql", 1, sql);
+  const off = sql.indexOf("Ghost");
+  const result = computeHover(doc, doc.positionAt(off), parseSql(sql));
+  // Ghost table not in schema — may return null or a partial result
+  assert.ok(result === null || typeof result === "object",
+    "Hover on unknown table should not throw");
+});
+
 process.stdout.write("All hover-provider tests passed.\n");

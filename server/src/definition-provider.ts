@@ -10,7 +10,7 @@ import {
   findReferenceAtPosition, findColumnInTable
 } from "./definitions";
 import type { ParseResult } from "./sql-parser";
-import { getCteColumns, resolveSymbolCaseInsensitive } from "./ast-utils";
+import { getCteColumns, resolveSymbolCaseInsensitive, resolveAliasTableName } from "./ast-utils";
 import {
   toNormUri, getResolutionSourceColumns, findDerivedAliasProjectedColumnRange,
   findStatementLocalColumnOwner, computeCurrentStatement,
@@ -106,9 +106,22 @@ export function computeDefinition(
     }
     if (parsed?.scope?.root) {
       const scopeAtPos = parsed.scope.root.findInnermost(offset);
-      const cteSym = resolveSymbolCaseInsensitive(scopeAtPos, norm);
-      if (cteSym?.kind === "CTE" && typeof cteSym.location?.start === "number" && typeof cteSym.location?.end === "number") {
-        return [{ uri: doc.uri, range: { start: doc.positionAt(cteSym.location.start), end: doc.positionAt(cteSym.location.end) } }];
+      const scopeSym = resolveSymbolCaseInsensitive(scopeAtPos, norm);
+
+      if (scopeSym?.kind === "CTE" && typeof scopeSym.location?.start === "number" && typeof scopeSym.location?.end === "number") {
+        return [{ uri: doc.uri, range: { start: doc.positionAt(scopeSym.location.start), end: doc.positionAt(scopeSym.location.end) } }];
+      }
+
+      // Alias token used as a table reference (e.g. UPDATE t … FROM Employee t)
+      // Navigate to the underlying table's definition.
+      if (scopeSym?.kind === "Alias") {
+        const aliasTarget = normalizeName(resolveAliasTableName(scopeSym) ?? "");
+        const aliasStripped = aliasTarget.replace(/^dbo\./, "");
+        const aliasDef = tablesByName.get(aliasTarget) || tablesByName.get(aliasStripped)
+          || tableTypesByName.get(aliasTarget) || tableTypesByName.get(aliasStripped);
+        if (aliasDef) {
+          return [{ uri: aliasDef.uri, range: { start: { line: aliasDef.line, character: 0 }, end: { line: aliasDef.line, character: 200 } } }];
+        }
       }
     }
   }
@@ -136,11 +149,21 @@ export function computeDefinition(
 
       if (parsed?.scope?.root) {
         const scopeAtPos = parsed.scope.root.findInnermost(offset);
-        const cteSym = resolveSymbolCaseInsensitive(scopeAtPos, tableName);
-        if (cteSym?.kind === "CTE") {
-          const cteCol = getCteColumns(cteSym).find(c => c.name === normalizeName(colName));
+        const sym = resolveSymbolCaseInsensitive(scopeAtPos, tableName);
+
+        if (sym?.kind === "CTE") {
+          const cteCol = getCteColumns(sym).find(c => c.name === normalizeName(colName));
           if (cteCol?.start !== undefined && cteCol?.end !== undefined) {
             return [{ uri: doc.uri, range: { start: doc.positionAt(cteCol.start), end: doc.positionAt(cteCol.end) } }];
+          }
+        }
+
+        // Alias (e.g. UPDATE t … FROM Employee t  →  t.Name  →  navigate to Employee.Name)
+        if (sym?.kind === "Alias") {
+          const aliasTarget = normalizeName(resolveAliasTableName(sym) ?? "");
+          if (aliasTarget) {
+            const locs = findColumnInTable(aliasTarget, colName);
+            if (locs.length > 0) { return locs; }
           }
         }
       }
