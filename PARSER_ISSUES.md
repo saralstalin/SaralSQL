@@ -222,3 +222,53 @@ This is a legitimate T-SQL error — SQL Server would reject this query ("The mu
 ---
 
 *Verified against @saralsql/tsql-parser v0.4.3*
+
+---
+
+## Issue 9 — COL001 false positives for CTEs with explicit column alias lists
+
+**Verified against:** v0.4.5
+
+**Description:**  
+When a CTE is declared with an explicit column alias list in the header — `WITH cteTally(N) AS (...)` — the parser does not recognise that `N` is a valid column name for that CTE. Any reference to the CTE column via an alias (e.g. `t.N` where `t` aliases `cteTally`) produces a COL001 "Unknown column" diagnostic.
+
+**Repro:**
+```sql
+CREATE FUNCTION [dbo].[FastSplitter](@List NVARCHAR(MAX), @Delimiter NVARCHAR(255))
+RETURNS TABLE WITH SCHEMABINDING AS
+RETURN
+  WITH E1(N) AS (SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1),
+       cteTally(N) AS (
+           SELECT 0 UNION ALL
+           SELECT TOP (DATALENGTH(ISNULL(@List,1)))
+               ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM E1
+       ),
+       cteStart(N1) AS (
+           SELECT t.N+1 FROM cteTally t
+           WHERE SUBSTRING(@List, t.N, 1) = @Delimiter OR t.N = 0
+       )
+  SELECT SUBSTRING(@List, s.N1, ISNULL(NULLIF(CHARINDEX(@Delimiter,@List,s.N1),0)-s.N1,8000))
+  FROM cteStart s;
+```
+
+**Observed:**
+```
+COL001: Unknown column 'N' on 't'   (t.N in WHERE clause — t aliases cteTally)
+COL001: Unknown column 'N1' on 's'  (s.N1 in SELECT — s aliases cteStart)
+```
+
+**Expected:**  
+No COL001 diagnostics. The CTE header `cteTally(N)` explicitly declares that the CTE has a column named `N`. References to `t.N` (where `t` aliases `cteTally`) and `s.N1` (where `s` aliases `cteStart`) are valid.
+
+**Root cause:**  
+The parser validates CTE column access against the CTE body's SELECT list, ignoring the column names declared in the CTE header. For `cteTally(N)`, the body is `SELECT 0 UNION ALL SELECT ROW_NUMBER()...` — neither expression carries the name `N` in the SELECT list; the name is assigned only by the header alias. The parser does not propagate header aliases into the CTE's column schema.
+
+**Why it matters:**  
+Recursive CTEs and tally/numbers CTEs commonly use this header-alias form. Every `WITH cte(col1, col2) AS (...)` pattern in production SQL produces false-positive COL001 errors. This is one of the most common T-SQL patterns for set-based iterative operations.
+
+**Fix:**  
+When building the column schema for a CTE symbol, check whether the CTE was declared with an explicit column alias list (the `(N)` in `cteTally(N)`). If so, use those header names as the authoritative column list instead of (or in addition to) inferring names from the SELECT list.
+
+---
+
+*Verified against @saralsql/tsql-parser v0.4.5*

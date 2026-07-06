@@ -386,4 +386,40 @@ runCase("schema-validator-alias-candidate-unknown-column-fires-addWrongColumn", 
     "LSP002 should name the unknown column");
 });
 
+runCase("schema-validator-merge-using-values-multiple-batches-no-false-LSP002", () => {
+  // Regression: when two MERGE statements in the same file both use 'source' as the
+  // USING alias name, the second MERGE's columns were being checked against the first
+  // MERGE's column list (from lineage.sources which only captured the first batch).
+  // Fix: getDerivedAliasProjectedColumns now uses aliasSym.columns directly when
+  // the parser populates it (v0.4.4+), bypassing the unreliable lineage lookup.
+  indexText("file:///schema.sql", `
+CREATE TABLE HolidayType (HolidayTypeId INT, HolidayTypeName VARCHAR(50), HolidayTypeDescription VARCHAR(200));
+CREATE TABLE Role (Id INT, RoleName VARCHAR(50));
+`);
+  const sql = `MERGE INTO dbo.HolidayType AS target
+USING (VALUES (1,'Payment','Payment Holiday'),(2,'Vessel','Vessel Holiday'))
+    AS source (HolidayTypeId, HolidayTypeName, HolidayTypeDescription)
+ON target.HolidayTypeId = source.HolidayTypeId
+WHEN NOT MATCHED THEN
+    INSERT (HolidayTypeId, HolidayTypeName, HolidayTypeDescription)
+    VALUES (source.HolidayTypeId, source.HolidayTypeName, source.HolidayTypeDescription);
+
+GO
+
+MERGE INTO dbo.Role AS target
+USING (VALUES (3,'Planner'),(4,'Viewer'))
+    AS source (Id, RoleName)
+ON target.RoleName = source.RoleName
+WHEN NOT MATCHED THEN
+    INSERT (Id, RoleName)
+    VALUES (source.Id, source.RoleName);`;
+
+  const doc = TextDocument.create("file:///merge.sql", "sql", 1, sql);
+  indexText("file:///merge.sql", sql);
+  const diags = computeSchemaDiagnostics(doc, sql, getLineStarts(sql), parseSql(sql), "file:///merge.sql", DEFAULT_OPTS);
+  const lsp002 = diags.filter(d => d.code === SARAL_DIAGNOSTIC_CODES.UnknownColumn);
+  assert.strictEqual(lsp002.length, 0,
+    "MERGE USING (VALUES) with two batches sharing the 'source' alias must not produce false LSP002 errors");
+});
+
 process.stdout.write("All schema-validator tests passed.\n");

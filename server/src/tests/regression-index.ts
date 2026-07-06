@@ -1708,4 +1708,53 @@ runCase("index-text-handles-max-file-size-and-deploy-path-exclusions", () => {
   assert.strictEqual(tablesByName.has("nonsqltable"), false, "Non-.sql files should not be indexed");
 });
 
+runCase("cte-header-column-aliases-do-not-produce-col001", () => {
+  // Regression: CTEs with explicit column alias lists in the header
+  // (e.g. WITH cteTally(N) AS (...)) were producing false COL001 "Unknown column 'N' on 't'"
+  // because the parser checks body SELECT-list names instead of header-declared names.
+  // The LSP suppresses these using sym.location.columns.
+  //
+  // We can't directly invoke validateTextDocument here, but we can verify that the parser
+  // DOES emit COL001 for this pattern (confirming the suppression is needed) and that the
+  // CTE scope symbols carry the header column list in location.columns for the suppression
+  // logic to use.
+  const sql = `
+WITH E1(N)       AS (SELECT 1 UNION ALL SELECT 1),
+     cteTally(N) AS (SELECT 0 UNION ALL SELECT TOP (10) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM E1),
+     cteStart(N1) AS (SELECT t.N+1 FROM cteTally t WHERE t.N = 0)
+SELECT s.N1 FROM cteStart s;`;
+
+  const parsed = parseSql(sql);
+
+  // Parser emits COL001 for header-alias columns (this is the parser bug being worked around).
+  const col001 = (parsed as any)?.diagnostics?.filter((d: any) => d.code === "COL001") ?? [];
+  assert.ok(col001.length > 0, "Parser should emit COL001 for CTE header-alias column references (confirming suppression is needed)");
+
+  // The CTE symbols must carry header column names in location.columns so the LSP can suppress.
+  function findCteSyms(scope: any): any[] {
+    const out: any[] = [];
+    for (const sym of scope.getOwnSymbols?.() ?? []) {
+      if (sym.kind === "CTE") { out.push(sym); }
+    }
+    for (const child of scope.getChildren?.() ?? []) {
+      out.push(...findCteSyms(child));
+    }
+    return out;
+  }
+  const ctes = findCteSyms(parsed?.scope?.root);
+  const cteTally = ctes.find((c: any) => normalizeName(c.name) === "ctetally");
+  const cteStart = ctes.find((c: any) => normalizeName(c.name) === "ctestart");
+
+  assert.ok(cteTally, "cteTally CTE symbol should be in scope");
+  assert.ok(cteStart, "cteStart CTE symbol should be in scope");
+  assert.ok(
+    Array.isArray(cteTally.location?.columns) && cteTally.location.columns.includes("N"),
+    "cteTally.location.columns must contain 'N' so the LSP suppression can match it"
+  );
+  assert.ok(
+    Array.isArray(cteStart.location?.columns) && cteStart.location.columns.includes("N1"),
+    "cteStart.location.columns must contain 'N1' so the LSP suppression can match it"
+  );
+});
+
 process.stdout.write("All regression index tests passed.\n");

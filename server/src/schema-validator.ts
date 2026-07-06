@@ -295,6 +295,22 @@ export function computeSchemaDiagnostics(
 
     function getDerivedAliasProjectedColumns(aliasNorm: string, aliasSym?: any): Set<string> {
       const out = new Set<string>();
+
+      // When the alias symbol carries an inline column list (e.g. USING (VALUES…) AS source (col1, col2)
+      // as populated by the parser for VALUES-based MERGE sources), that list is authoritative and
+      // avoids mis-matching against a same-named alias from a different batch/statement.
+      if (Array.isArray(aliasSym?.columns) && aliasSym.columns.length > 0) {
+        for (const c of aliasSym.columns) {
+          const n = normalizeName(String(c?.rawName ?? c?.name ?? c));
+          if (n && n !== "expression" && n !== "*") {
+            out.add(n);
+          }
+        }
+        if (out.size > 0) {
+          return out;
+        }
+      }
+
       const sources = Array.isArray(parsed?.lineage?.sources) ? parsed.lineage.sources : [];
       const isMeaningfulProjectionName = (value: string): boolean => {
         const n = normalizeName(value);

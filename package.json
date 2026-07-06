@@ -14,7 +14,7 @@
     "database development"
   ],
   "license": "MIT",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "engines": {
     "vscode": "^1.103.0"
   },
@@ -421,7 +421,7 @@
     "typescript": "^5.8.3"
   },
   "dependencies": {
-    "@saralsql/tsql-parser": "^0.4.5",
+    "@saralsql/tsql-parser": "^0.4.6",
     "vscode-languageclient": "^9.0.1",
     "vscode-languageserver": "^9.0.1",
     "vscode-languageserver-textdocument": "^1.0.12"

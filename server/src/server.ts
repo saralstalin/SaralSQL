@@ -62,7 +62,7 @@ import {
 } from "./definitions";
 import { parseSql, type ParseResult } from "./sql-parser";
 import { SARAL_DIAGNOSTIC_CODES, buildDiagnosticSeverityOverrides, buildDisabledDiagnosticCodes, buildReadableBareColumnCodeAction, buildSelectStarExpansionCodeActions, buildUpdateNoLockCodeAction, collectAmbiguousColumnDiagnostics, collectReadableBareColumnDiagnostics, collectStringComparisonDiagnostics, hasBlockingParseIssues, normalizeSaralSqlSettings, resolveDiagnosticSeverity, shouldSuppressDiagnosticCode } from "./diagnostic-helpers";
-import { getCteColumns, resolveAliasTableName, resolveSymbolCaseInsensitive, resolveAliasFromAst, getDisplaySymbolName } from "./ast-utils";
+import { resolveAliasTableName, resolveSymbolCaseInsensitive } from "./ast-utils";
 import { collectNearestScopeColumnOwners } from "./scope-column-resolver";
 import { resolveBareColumnAtOffset } from "./column-resolution";
 import { LruCache } from "./lru-cache";
@@ -985,6 +985,33 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
           continue;
         }
       }
+      // COL001: "Unknown column 'N' on 't'" — suppress when the alias 't' points to a CTE
+      // whose header declares that column explicitly (e.g. WITH cteTally(N) AS (...)).
+      // The parser validates CTE column references against the SELECT-list body, ignoring
+      // the column names declared in the CTE header (location.columns).
+      if (diagCode === "COL001" && typeof (diag as any).start === "number" && parsed?.scope?.root) {
+        const msg = String((diag as any).message ?? "");
+        const match = /Unknown column '([^']+)' on '([^']+)'/i.exec(msg);
+        if (match) {
+          const colName = normalizeName(match[1]);
+          const aliasName = normalizeName(match[2]);
+          const scopeAtDiag = parsed.scope.root.findInnermost?.((diag as any).start) ?? parsed.scope.root;
+          const aliasSym = resolveSymbolCaseInsensitive(scopeAtDiag, aliasName);
+          if (aliasSym?.kind === "Alias") {
+            const targetName = normalizeName(resolveAliasTableName(aliasSym) ?? "");
+            const cteSym = targetName ? resolveSymbolCaseInsensitive(scopeAtDiag, targetName) : null;
+            if (cteSym?.kind === "CTE") {
+              const headerCols: string[] = Array.isArray(cteSym.location?.columns)
+                ? (cteSym.location.columns as any[]).map((c: any) => normalizeName(String(c ?? "")))
+                : [];
+              if (headerCols.length > 0 && headerCols.includes(colName)) {
+                continue; // column is declared in the CTE header — suppress false positive
+              }
+            }
+          }
+        }
+      }
+
       const diagnostic = toDiagnostic(diag, "SaralSQL Parser");
       if (diagnostic && !shouldSuppressDiagnosticCode(String((diag as any).code ?? diagnostic.code ?? ""), disabledDiagnosticCodes)) {
           if ((diagnostic.code === SARAL_DIAGNOSTIC_CODES.UnknownColumn || diagnostic.code === SARAL_DIAGNOSTIC_CODES.AmbiguousColumn) && typeof diag.start === "number") {
@@ -993,7 +1020,7 @@ export async function validateTextDocument(doc: TextDocument): Promise<void> {
               continue;
             }
         }
-        
+
         diagnostics.push(diagnostic);
       }
     }
