@@ -603,7 +603,23 @@ export function indexText(uri: string, text: string, options?: { includeInWorksp
                             && normalizeName(String(sym.name ?? "")) !== aliasOrTableNorm
                             && normalizeName(resolveAliasTableName(sym) ?? "") === aliasOrTableNorm
                         );
-                        if (shadowingAlias) {
+                        // Don't flag if the same table also appears un-aliased in the same statement.
+                        // e.g. FROM table1 JOIN table1 t2 — table1.Col refers to the un-aliased
+                        // instance and is a valid, unambiguous reference.
+                        // Must be statement-scoped: lineage.sources is file-global, so we find
+                        // the enclosing statement in ast.body and filter sources by location.
+                        const enclosingStmt = (Array.isArray(parsed?.ast?.body) ? parsed.ast.body as any[] : [])
+                            .find((s: any) => typeof s.start === "number" && typeof s.end === "number"
+                                && s.start <= ref.location.start && ref.location.start <= s.end) ?? null;
+                        const hasUnaliasedOccurrence = Array.isArray(parsed?.lineage?.sources)
+                            && (parsed.lineage.sources as any[]).some((src: any) => {
+                                if (src.alias || normalizeName(String(src.name ?? "")) !== aliasOrTableNorm) { return false; }
+                                if (!enclosingStmt) { return true; }
+                                const srcStart = src.location?.start;
+                                return typeof srcStart === "number"
+                                    && srcStart >= enclosingStmt.start && srcStart <= enclosingStmt.end;
+                            });
+                        if (shadowingAlias && !hasUnaliasedOccurrence) {
                             localRefs.push({
                                 name: aliasOrTableNorm,
                                 uri: normUri,
@@ -1196,6 +1212,9 @@ function indexUpdateAssignmentColumnsFromAst(
 
         const targetNorm = normalizeName(targetTable);
         for (const assignment of node.assignments) {
+            if (assignment?.targetKind === "variable") {
+                continue;
+            }
             const colNode = assignment?.columnNode;
             if (!colNode || typeof colNode.start !== "number") {
                 continue;

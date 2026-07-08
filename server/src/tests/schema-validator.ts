@@ -422,4 +422,36 @@ WHEN NOT MATCHED THEN
     "MERGE USING (VALUES) with two batches sharing the 'source' alias must not produce false LSP002 errors");
 });
 
+runCase("schema-validator-update-set-variable-assignment-no-false-LSP002", () => {
+  // Regression: @variable on the LEFT side of an UPDATE SET assignment (e.g. SET @Id = s.value)
+  // was being indexed as a column of the UPDATE target and flagged as LSP002.
+  // Variables in SET assignments are valid T-SQL and must not be validated as column refs.
+  indexText("file:///schema.sql", `
+CREATE TABLE target (Id INT, Name NVARCHAR(100));
+CREATE TABLE source (Id INT, Name NVARCHAR(100), value INT);
+`);
+
+  // With FROM clause
+  const sqlWithFrom = "UPDATE t SET t.Id = s.value, @Id = s.value FROM target t JOIN source s ON t.Name = s.Name;";
+  const docFrom = TextDocument.create("file:///q1.sql", "sql", 1, sqlWithFrom);
+  indexText("file:///q1.sql", sqlWithFrom);
+  const diagsFrom = computeSchemaDiagnostics(docFrom, sqlWithFrom, getLineStarts(sqlWithFrom), parseSql(sqlWithFrom), "file:///q1.sql", DEFAULT_OPTS);
+  assert.strictEqual(
+    diagsFrom.filter(d => d.code === SARAL_DIAGNOSTIC_CODES.UnknownColumn).length,
+    0,
+    "UPDATE SET @var with FROM clause must not produce LSP002"
+  );
+
+  // Without FROM clause
+  const sqlNoFrom = "DECLARE @Id INT; UPDATE target SET Id = 1, @Id = Id;";
+  const docNoFrom = TextDocument.create("file:///q2.sql", "sql", 1, sqlNoFrom);
+  indexText("file:///q2.sql", sqlNoFrom);
+  const diagsNoFrom = computeSchemaDiagnostics(docNoFrom, sqlNoFrom, getLineStarts(sqlNoFrom), parseSql(sqlNoFrom), "file:///q2.sql", DEFAULT_OPTS);
+  assert.strictEqual(
+    diagsNoFrom.filter(d => d.code === SARAL_DIAGNOSTIC_CODES.UnknownColumn).length,
+    0,
+    "UPDATE SET @var without FROM clause must not produce LSP002"
+  );
+});
+
 process.stdout.write("All schema-validator tests passed.\n");

@@ -1371,6 +1371,21 @@ WHERE Employee.EmployeeId = 12345;
   assert.strictEqual(normalizeName(refs[0].name), "employee", "Shadowed ref should carry the literal table name");
 });
 
+runCase("self-join-unaliased-table-qualifier-does-not-produce-false-lsp001", () => {
+  // Regression: FROM table1 JOIN table1 t2 — using table1.Column1 as qualifier refers to the
+  // un-aliased instance and is valid. Was incorrectly flagged as shadowed-by-alias LSP001.
+  const schemaUri = "file:///regression/self-join-schema.sql";
+  const queryUri = "file:///regression/self-join-query.sql";
+
+  indexText(schemaUri, "CREATE TABLE table1(Column1 INT, Column2 NVARCHAR(100));");
+  const querySql = "SELECT table1.Column1 FROM table1 JOIN table1 t2 ON table1.Column1 = t2.Column1;";
+  indexText(queryUri, querySql);
+
+  const shadowed = getReferencesForUri(queryUri).filter(r => r.kind === "table" && r.context === "shadowed-by-alias");
+  assert.strictEqual(shadowed.length, 0,
+    "table1.Column1 where table1 appears un-aliased in FROM must not be flagged as shadowed-by-alias");
+});
+
 runCase("get-word-range-at-position-covers-token-boundaries", () => {
   const text = "SELECT e.EmployeeId, a . b\n\nFROM Employee e";
   const doc = TextDocument.create("file:///regression/word-range.sql", "sql", 1, text);
