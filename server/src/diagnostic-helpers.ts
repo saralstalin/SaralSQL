@@ -1,6 +1,6 @@
 import { CodeAction, CodeActionKind, Diagnostic, DiagnosticSeverity, TextEdit } from "vscode-languageserver/node";
 import { isSqlKeyword, normalizeName, offsetToPosition } from "./text-utils";
-import { getCteColumns, getDisplaySymbolName, normalizeAstTableName, resolveAliasTableName, resolveSymbolCaseInsensitive } from "./ast-utils";
+import { getCteColumns, getDisplaySymbolName, normalizeAstTableName, resolveAliasTableName, resolveSymbolCaseInsensitive, walkAst } from "./ast-utils";
 import { extractReferences } from "@saralsql/tsql-parser";
 import { resolveBareColumnAtOffset } from "./column-resolution";
 
@@ -548,6 +548,15 @@ export function collectReadableBareColumnDiagnostics(
   const qualifiedIdentifierStarts = collectQualifiedIdentifierStarts(parsed.ast);
   const outputPseudoColumnStarts = collectOutputPseudoColumnStarts(parsed.ast);
 
+  // Collect ranges of UPDATE statements that have no FROM clause.
+  // Bare columns inside these are standard T-SQL — qualifying them is not idiomatic.
+  const updateNoFromRanges: Array<{ start: number; end: number }> = [];
+  walkAst(parsed.ast, (node: any) => {
+    if (node?.type === "UpdateStatement" && !node.from && typeof node.start === "number" && typeof node.end === "number") {
+      updateNoFromRanges.push({ start: node.start, end: node.end });
+    }
+  });
+
   for (const ref of refs) {
     if (!ref || (ref.kind !== "column" && ref.kind !== "unknown")) {
       continue;
@@ -596,6 +605,13 @@ export function collectReadableBareColumnDiagnostics(
       continue;
     }
     seen.add(key);
+
+    // Skip the qualify-column hint for bare columns inside UPDATE without FROM —
+    // single-table UPDATE SET Column = value is idiomatic T-SQL; qualification adds no clarity.
+    const refStart = ref.location.start;
+    if (updateNoFromRanges.some(r => refStart >= r.start && refStart <= r.end)) {
+      continue;
+    }
 
     const match = matches[0];
     const replacement = `${match.displayAlias}.${name}`;

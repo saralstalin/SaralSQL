@@ -55,6 +55,12 @@ export function computeSchemaDiagnostics(
     for (const def of localDefs) {
       localDefsByName.set(normalizeName(def.name), def);
     }
+
+    // When no schema has been indexed at all (no CREATE TABLE/VIEW in workspace),
+    // suppress table/column existence checks — they would fire on every reference.
+    // Readability (LSP004) and ambiguity (LSP003) diagnostics are scope-based and
+    // remain active regardless of schema availability.
+    const hasIndexedSchema = tablesByName.size > 0 || tableTypesByName.size > 0 || localDefsByName.size > 0;
     const cteNames = new Set<string>();
     const seenTables = new Set<string>();
     const reportedMissingTables = new Set<string>();
@@ -94,6 +100,7 @@ export function computeSchemaDiagnostics(
 
     function addUnknownTableAt(name: string, startLine: number, startChar: number, endLine: number, endChar: number, isFallback = false) {
       if (!name) {return;}
+      if (!hasIndexedSchema) {return;}
       if (shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.UnknownTable, disabledDiagnosticCodes)) {return;}
 
       const clean = normalizeName(name);
@@ -166,6 +173,7 @@ export function computeSchemaDiagnostics(
       end: number,
       tableDisplay?: string
     ) {
+      if (!hasIndexedSchema) {return;}
       if (shouldSuppressDiagnosticCode(SARAL_DIAGNOSTIC_CODES.UnknownColumn, disabledDiagnosticCodes)) {return;}
 
       const key = `${column}:${line}:${start}:${end}`;

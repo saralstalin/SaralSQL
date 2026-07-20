@@ -219,4 +219,50 @@ runCase("completion-empty-fallback-shows-keywords-and-tables", () => {
   assert.ok(labels.some(l => l === "Employee" || l === "Department"), "Should include table names");
 });
 
+runCase("completion-insert-col-list-excludes-already-listed-columns", () => {
+  indexText("file:///schema.sql", schemaSql);
+  // EmployeeId is already in the column list — it must not appear in suggestions
+  const sql = "INSERT INTO Employee (EmployeeId, ) VALUES (1, 'x');";
+  const off = sql.indexOf(", )") + 2; // cursor after trailing comma, inside the column list
+  const items = complete(sql, off);
+  const labels = items.map(i => i.label);
+  assert.ok(labels.length > 0, "Should still suggest remaining columns");
+  assert.ok(!labels.includes("EmployeeId"), "Already-listed EmployeeId must be excluded");
+  assert.ok(labels.some(l => l === "Name" || l === "DepartmentId" || l === "Salary"),
+    "Remaining Employee columns should be suggested");
+  // Cross-table bleed: Department columns must NOT appear
+  assert.ok(!labels.includes("Budget"), "Department columns must not bleed into INSERT Employee completions");
+});
+
+runCase("completion-insert-col-list-after-trailing-comma-stays-scoped", () => {
+  indexText("file:///schema.sql", schemaSql);
+  // Cursor is AFTER the last listed column (trailing comma), before closing paren.
+  // This is the canonical "add another column" position and was the broken case.
+  const sql = "INSERT INTO Employee (EmployeeId, Name,) VALUES (1, 'x', 0);";
+  const off = sql.indexOf(",)"); // position of the trailing comma
+  const items = complete(sql, off + 1); // cursor right after trailing comma
+  const labels = items.map(i => i.label);
+  // Only Employee columns should appear — Department columns must not bleed in
+  assert.ok(!labels.includes("Budget"), "Department.Budget must not appear in INSERT Employee completions");
+  assert.ok(!labels.includes("EmployeeId"), "Already-listed EmployeeId must be excluded");
+  assert.ok(!labels.includes("Name"), "Already-listed Name must be excluded");
+  assert.ok(labels.some(l => l === "DepartmentId" || l === "Salary"),
+    "Remaining Employee columns should be present after trailing comma");
+});
+
+runCase("completion-update-set-excludes-already-assigned-columns", () => {
+  indexText("file:///schema.sql", schemaSql);
+  // Name is already in the SET list — it must not appear in suggestions for the second assignment
+  const sql = "UPDATE Employee SET Name = 'x',  WHERE EmployeeId = 1;";
+  const off = sql.indexOf(",  WHERE") + 2;
+  const items = complete(sql, off);
+  const labels = items.map(i => i.label);
+  assert.ok(labels.length > 0, "Should still suggest remaining columns");
+  assert.ok(!labels.includes("Name"), "Already-assigned Name must be excluded");
+  assert.ok(labels.some(l => l === "EmployeeId" || l === "DepartmentId" || l === "Salary"),
+    "Remaining Employee columns should be suggested");
+  // Cross-table bleed: Department columns must NOT appear
+  assert.ok(!labels.includes("Budget"), "Department columns must not bleed into UPDATE Employee completions");
+});
+
 process.stdout.write("All completion-provider tests passed.\n");

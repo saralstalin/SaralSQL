@@ -454,4 +454,34 @@ CREATE TABLE source (Id INT, Name NVARCHAR(100), value INT);
   );
 });
 
+runCase("schema-validator-simple-update-no-from-does-not-fire-LSP004", () => {
+  // Regression: bare columns inside a simple UPDATE (no FROM clause) were triggering the
+  // LSP004 qualify-column readability hint. Single-table UPDATE is idiomatic T-SQL;
+  // only UPDATE with a FROM clause (multiple source tables) warrants the hint.
+  indexText("file:///schema.sql", `
+CREATE TABLE Employee (EmployeeId INT, Name NVARCHAR(100), DepartmentId INT);
+`);
+
+  // Simple UPDATE without FROM — must not fire LSP004
+  const sqlNoFrom = "UPDATE Employee SET Name = 'Alice' WHERE EmployeeId = 1;";
+  const docNoFrom = TextDocument.create("file:///upd1.sql", "sql", 1, sqlNoFrom);
+  indexText("file:///upd1.sql", sqlNoFrom);
+  const diagsNoFrom = computeSchemaDiagnostics(docNoFrom, sqlNoFrom, getLineStarts(sqlNoFrom), parseSql(sqlNoFrom), "file:///upd1.sql", DEFAULT_OPTS);
+  const lsp004NoFrom = diagsNoFrom.filter(d => d.code === SARAL_DIAGNOSTIC_CODES.ReadabilityQualifyColumn);
+  assert.strictEqual(lsp004NoFrom.length, 0,
+    "Simple UPDATE without FROM must not produce LSP004 readability hints");
+
+  // UPDATE with FROM and alias — LSP004 may fire for unqualified bare columns
+  indexText("file:///schema.sql", `
+CREATE TABLE Employee (EmployeeId INT, Name NVARCHAR(100), DepartmentId INT);
+CREATE TABLE Department (DepartmentId INT, DeptName NVARCHAR(100));
+`);
+  const sqlWithFrom = "UPDATE e SET Name = 'Alice' FROM Employee e JOIN Department d ON e.DepartmentId = d.DepartmentId WHERE e.EmployeeId = 1;";
+  const docWithFrom = TextDocument.create("file:///upd2.sql", "sql", 1, sqlWithFrom);
+  indexText("file:///upd2.sql", sqlWithFrom);
+  const diagsWithFrom = computeSchemaDiagnostics(docWithFrom, sqlWithFrom, getLineStarts(sqlWithFrom), parseSql(sqlWithFrom), "file:///upd2.sql", DEFAULT_OPTS);
+  // We just confirm it does not throw; LSP004 may or may not fire depending on resolution
+  assert.ok(Array.isArray(diagsWithFrom), "UPDATE with FROM diagnostic run should return an array");
+});
+
 process.stdout.write("All schema-validator tests passed.\n");

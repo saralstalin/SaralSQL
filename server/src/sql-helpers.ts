@@ -12,7 +12,7 @@ import {
 import type { ParseResult } from "./sql-parser";
 import {
   getCteColumns, resolveAliasTableName, resolveSymbolCaseInsensitive,
-  getDisplaySymbolName, resolveAliasFromAst
+  getDisplaySymbolName, resolveAliasFromAst, extractColumnName
 } from "./ast-utils";
 import { collectNearestScopeColumnOwners } from "./scope-column-resolver";
 import { resolveBareColumnAtOffset } from "./column-resolution";
@@ -294,18 +294,71 @@ export function getStatementTableCandidatesFromAst(parsed: any, offset: number):
   return stmt ? collectTablesFromAstNode(stmt) : [];
 }
 
-export function getUpdateSetTargetTable(parsed: ParseResult | null, offset: number): string | undefined {
+// Finds the InsertStatement node whose column list contains `offset`.
+// Uses the closing `)` of the column list (found via `text`) to correctly handle
+// cursor positions after a trailing comma (e.g. `(Col1, |)`).
+function findInsertColumnListNode(parsed: any, offset: number, text?: string): any {
   const ast = parsed?.ast;
-  if (!ast) { return undefined; }
+  if (!ast) { return null; }
+  let match: any = null;
+  const visit = (node: any) => {
+    if (!node || typeof node !== "object" || match) { return; }
+    if (node.type === "InsertStatement" && Array.isArray(node.columnNodes) && node.columnNodes.length > 0) {
+      const first = node.columnNodes[0];
+      const last = node.columnNodes[node.columnNodes.length - 1];
+      if (typeof first?.start === "number" && typeof last?.end === "number" && offset >= first.start) {
+        // Upper bound: the closing ')' of the column list, so cursor after a trailing
+        // comma is still detected as inside the list.
+        let upperBound = last.end;
+        if (typeof node.selectQuery?.start === "number") {
+          upperBound = node.selectQuery.start - 1;
+        } else if (text) {
+          const closeParen = text.indexOf(')', last.end);
+          upperBound = closeParen !== -1 ? closeParen : last.end + 500;
+        } else {
+          upperBound = last.end + 500;
+        }
+        if (offset <= upperBound) { match = node; return; }
+      }
+    }
+    if (Array.isArray(node)) { for (const item of node) { visit(item); } return; }
+    for (const value of Object.values(node)) { if (value && typeof value === "object") { visit(value); } }
+  };
+  visit(ast);
+  return match;
+}
+
+// Finds the UpdateStatement node whose SET list contains `offset`.
+// Handles cursor positions in the gap after the last assignment (before WHERE/FROM)
+// by scanning forward in `text` for the next WHERE or FROM keyword.
+function findUpdateSetNode(parsed: any, offset: number, text?: string): any {
+  const ast = parsed?.ast;
+  if (!ast) { return null; }
   let match: any = null;
   const visit = (node: any) => {
     if (!node || typeof node !== "object" || match) { return; }
     if (node.type === "UpdateStatement" && Array.isArray(node.assignments) && node.assignments.length > 0) {
       const first = node.assignments[0];
       const last = node.assignments[node.assignments.length - 1];
-      const inSetList = typeof first?.start === "number" && typeof last?.end === "number"
-        && offset >= first.start && offset <= last.end;
-      if (inSetList) {
+      if (typeof first?.start !== "number" || typeof last?.end !== "number") { return; }
+
+      // Determine whether offset falls in the SET region.
+      // Primary range: first column start → last assignment end (original check).
+      // Extended range: gap after last assignment, before WHERE/FROM.
+      let inRange = offset >= first.start && offset <= last.end;
+      if (!inRange && offset > last.end) {
+        // Cursor is after the last assignment — accept only if it's before WHERE/FROM.
+        if (text) {
+          const afterLast = text.slice(last.end, last.end + 300);
+          const boundIdx = afterLast.search(/\b(?:WHERE|FROM)\b/i);
+          inRange = boundIdx === -1 ? offset <= last.end + 300 : (last.end + boundIdx) > offset;
+        } else {
+          // No text: use a small safety buffer (just covers ", " whitespace)
+          inRange = offset <= last.end + 10;
+        }
+      }
+
+      if (inRange) {
         let insideRhs = false;
         for (const assignment of node.assignments) {
           const expr = assignment.expression ?? assignment.value ?? assignment.right;
@@ -319,6 +372,11 @@ export function getUpdateSetTargetTable(parsed: ParseResult | null, offset: numb
     for (const value of Object.values(node)) { if (value && typeof value === "object") { visit(value); } }
   };
   visit(ast);
+  return match;
+}
+
+export function getUpdateSetTargetTable(parsed: ParseResult | null, offset: number, text?: string): string | undefined {
+  const match = findUpdateSetNode(parsed, offset, text);
   if (!match) { return undefined; }
   const targetName = String(match?.target?.name ?? "").trim();
   if (!targetName) { return undefined; }
@@ -330,24 +388,32 @@ export function getUpdateSetTargetTable(parsed: ParseResult | null, offset: numb
   return targetName;
 }
 
-export function getInsertColumnTargetTable(parsed: any, offset: number): string | undefined {
-  const ast = parsed?.ast;
-  if (!ast) { return undefined; }
-  let match: any = null;
-  const visit = (node: any) => {
-    if (!node || typeof node !== "object" || match) { return; }
-    if (node.type === "InsertStatement" && Array.isArray(node.columnNodes) && node.columnNodes.length > 0) {
-      const first = node.columnNodes[0];
-      const last = node.columnNodes[node.columnNodes.length - 1];
-      if (typeof first?.start === "number" && typeof last?.end === "number"
-        && offset >= first.start && offset <= last.end) { match = node; return; }
-    }
-    if (Array.isArray(node)) { for (const item of node) { visit(item); } return; }
-    for (const value of Object.values(node)) { if (value && typeof value === "object") { visit(value); } }
-  };
-  visit(ast);
+export function getInsertColumnTargetTable(parsed: any, offset: number, text?: string): string | undefined {
+  const match = findInsertColumnListNode(parsed, offset, text);
   if (!match) { return undefined; }
   return (typeof match.table?.name === "string" && match.table.name.trim().length > 0) ? match.table.name : undefined;
+}
+
+export function getInsertUsedColumnNames(parsed: any, offset: number, text?: string): Set<string> {
+  const match = findInsertColumnListNode(parsed, offset, text);
+  if (!match) { return new Set(); }
+  const used = new Set<string>();
+  for (const colNode of (match.columnNodes as any[])) {
+    const name = extractColumnName(colNode);
+    if (name) { used.add(name); }
+  }
+  return used;
+}
+
+export function getUpdateSetUsedColumnNames(parsed: any, offset: number, text?: string): Set<string> {
+  const match = findUpdateSetNode(parsed, offset, text);
+  if (!match) { return new Set(); }
+  const used = new Set<string>();
+  for (const assignment of (match.assignments as any[])) {
+    const name = extractColumnName(assignment?.column ?? assignment);
+    if (name) { used.add(name); }
+  }
+  return used;
 }
 
 export function isFunctionCallInAst(ast: any, functionNameNorm: string): { isFunc: boolean; rawName: string } {

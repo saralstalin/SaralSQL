@@ -10,6 +10,7 @@ import { parseSql, type ParseResult } from "./sql-parser";
 import { getCteColumns, resolveAliasTableName, resolveSymbolCaseInsensitive } from "./ast-utils";
 import {
   getVariableCompletionItems, getUpdateSetTargetTable, getInsertColumnTargetTable,
+  getInsertUsedColumnNames, getUpdateSetUsedColumnNames,
   getAliasBeforeDot, endsWithDotToken, isFromJoinTableContext, isInSelectProjectionContext,
   getStatementTableCandidatesFromAst, getParserAliasColumnNames, resolveAliasTableFromStatementAst
 } from "./sql-helpers";
@@ -51,24 +52,29 @@ export function computeCompletion(
   const variableItems = getVariableCompletionItems(scopeAtPos);
 
   // ── UPDATE SET columns ─────────────────────────────────────────────────────
-  const updateSetTarget = getUpdateSetTargetTable(parsed, offset);
+  const updateSetTarget = getUpdateSetTargetTable(parsed, offset, text);
   if (updateSetTarget && !endsWithDotToken(linePrefix)) {
     const targetNorm = normalizeName(updateSetTarget);
     const def = tablesByName.get(targetNorm) || tableTypesByName.get(targetNorm);
     if (def?.columns?.length) {
-      items.push(...def.columns.map((c: any) => colItem(c, def.rawName)));
+      const usedCols = getUpdateSetUsedColumnNames(parsed, offset, text);
+      const cols = def.columns.filter((c: any) => !usedCols.has(normalizeName(c.rawName)));
+      items.push(...cols.map((c: any) => colItem(c, def.rawName)));
       items.push(...variableItems);
       return items;
     }
   }
 
   // ── INSERT column-list columns ─────────────────────────────────────────────
-  const insertColumnTarget = getInsertColumnTargetTable(parsed, offset);
+  const insertColumnTarget = getInsertColumnTargetTable(parsed, offset, text);
   if (insertColumnTarget) {
     const targetNorm = normalizeName(insertColumnTarget);
     const def = tablesByName.get(targetNorm) || tableTypesByName.get(targetNorm);
     if (def?.columns?.length) {
-      return def.columns.map((c: any) => colItem(c, def.rawName));
+      const usedCols = getInsertUsedColumnNames(parsed, offset, text);
+      return def.columns
+        .filter((c: any) => !usedCols.has(normalizeName(c.rawName)))
+        .map((c: any) => colItem(c, def.rawName));
     }
   }
 

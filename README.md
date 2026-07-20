@@ -1,74 +1,108 @@
 # SaralSQL — SQL IntelliSense & LSP for VS Code
 
-> **Instant Parser-First SQL Diagnostics, Navigation, and IntelliSense — No Database Connection Required.**  
-> Built for teams that keep their entire schema in `.sql` files.  
-> ⚡ **Indexes large projects (2000+ files) within a minute, and stays updated as you type**
+> **Full SQL editor intelligence — no database connection, no server, no config.**  
+> SaralSQL indexes your `.sql` files and gives you the navigation, completions, and diagnostics your team deserves.
 
 ---
 
-## 💡 Why SaralSQL?
+## The problem it solves
 
-- **Offline-friendly** – works entirely from your source code, no live DB needed  
-- **Privacy-friendly** – **no tracking; all code and actions stay in your workspace**  
-- **Lightweight & fast** – advanced TypeScript based T-SQL parser, built for speed and accuracy
-- **Code-centric** – ideal for projects that version-control schema scripts  
-- **Zero-config** – open a folder of `.sql` files and start coding with real-time diagnostics  
-- **Scales to large projects** – indexes **2000+ SQL files in under 1 minute**
+T-SQL developers working in VS Code have had two bad options:
+
+- Connect to a live database and hope SQL Server Extension catches your mistakes
+- Write SQL blind, find errors at execution time
+
+SaralSQL is the third option: **parse and index your `.sql` source files at editor speed**, with all schema context derived from the files already in your workspace.
 
 ---
 
-## ✨ Features
+## Who is it for?
 
-- **Go to Definition**  
-  Jump to the definition of a table, type, or column in your workspace.  
-  Works with both plain names (`Employee`) and aliases (`e.EmployeeId`).  
+- Teams using **SSDT / Database Projects** (`.sqlproj`) and versioning schema in `.sql` files  
+- Developers who write **T-SQL stored procedures, views, and migrations**  
+- Anyone tired of switching to SSMS or a DB connection just to check column names
 
-- **Find All References**  
-  Locate table and column references across SQL files — skips matches in comments and unrelated identifiers.
+---
+
+## Features at a glance
+
+| Feature | What you get |
+|---|---|
+| **Go to Definition** | Jump to any table, view, type, or column definition |
+| **Find All References** | Locate every usage across all `.sql` files in your workspace |
+| **Auto-completion** | Table names, column names, alias-prefixed columns (`e.`) | auto expand `*`
+| **Hover** | See column type and definition context on hover |
+| **Real-time diagnostics** | Unknown tables, unknown columns, unsafe DML, variable issues — as you type |
+| **SSDT / .sqlproj support** | Schema contribution controlled by project membership |
+| **Zero config** | Open a folder of `.sql` files. Done. |
+
+---
+
+## Navigation
+
+**Go to Definition**   
+
+Jump to the definition of a table, type, or column in your workspace.  
+  Works with both plain names (`Employee`) and aliases (`e.EmployeeId`).
+
+**Find All References** scans across files, skipping comments and unrelated identifiers:
 
 ![References](Images/References.png)
 
-- **IntelliSense / Auto-completion**  
-  - Suggests table names and types  
-  - After typing `alias.` or `TableName.`, column suggestions appear  
-  - Schema prefixes handled automatically (`dbo.TableName` ↔ `TableName`)
+---
+
+## Completions
+
+Start typing a table name or type `alias.` and column suggestions appear instantly. Schema prefixes (`dbo.`) are handled automatically.
 
 ![Completions](Images/Completion.png)
 
-- **Hover Information**  
-  Hover over a table, alias, or column to see its definition and context.
+---
+
+## Hover
+
+Hover over any table, alias, or column to see its definition and context — no database query needed.
 
 ![Column Hover](ColumnHover.png)
 
 ![Table Hover](Images/TableHover.png)
 
-- **Diagnostics & Error Checking**  
-  Real-time parser-backed diagnostics using `@saralsql/tsql-parser`.  
-  SaralSQL can highlight schema issues, unsafe statements, and semantic warnings as you type. In VS Code Settings, each diagnostic has a checkbox to enable or disable it and a severity dropdown to choose `error`, `warning`, `information`, or `hint`:
-  - `Unknown table` (`LSP001`)
-  - `Unknown column` (`LSP002`)
-  - `Ambiguous bare column` (`LSP003`)
-  - `Readability hint` for qualifying a bare column when a unique alias is available (`LSP004`)
-  - `String comparison` warnings for direct `varchar` and `nvarchar` comparisons (`LSP005`)
-  - `Unnamed primary key or unique constraint` (`DDL002`)
-  - `Unnamed default constraint` (`DDL003`)
-  - `Undeclared variable` (`VAR001`)
-  - `Unused variable` (`VAR002`)
-  - `Unused parameter` (`VAR003`)
-  - `Variable used before set` (`VAR004`)
-  - `Self comparison` (`LOG001`)
-  - `UPDATE without WHERE` (`DML001`)
-  - `DELETE without WHERE` (`DML002`)
-  - `INSERT without column list` (`DML003`)
-  - `UPDATE target NOLOCK` (`DML004`)
-  - Parser issues, when enabled from settings
+---
 
-  Diagnostics are enabled by default with `saralsql.showDiagnostics`. Parser issues are hidden by default with `saralsql.showParseIssues`; when parser issues are hidden, SaralSQL only shows other diagnostics after the document parses successfully. Schema diagnostics (unknown table/column and ambiguous bare columns) are opt-in via `saralsql.enableSchemaValidation` (default: off). Each diagnostic has an enable setting such as `saralsql.diagnostics.unknownTable` and a severity setting such as `saralsql.diagnostics.unknownTableSeverity`; an advanced `saralsql.disabledDiagnostics` setting remains available if you want to suppress by code.
+## Diagnostics
 
-  For SSDT projects with `.sqlproj` files, SaralSQL can align workspace schema contribution with project membership:
-  - `saralsql.sqlproj.strictBuildMembership` (default: `true`): only `Build` items contribute to workspace schema.
-  - `saralsql.sqlproj.warnMissingProjectFile` (default: `true`): warns when a SQL file is missing from all `.sqlproj` items.
-  - `saralsql.sqlproj.missingProjectFileSeverity` (default: `warning`): severity for missing-project-file warnings (`SSDT001`).
+Real-time, parser-backed diagnostics across 16 codes. Every diagnostic has an individual enable/disable toggle and a severity dropdown (`error`, `warning`, `information`, `hint`) in VS Code Settings.
+
+**Schema validation** — flags unknown tables and columns against workspace schema (auto-suppressed when no schema files are present):
+
+| Code | Diagnostic |
+|---|---|
+| `LSP001` | Unknown table |
+| `LSP002` | Unknown column |
+| `LSP003` | Ambiguous bare column (resolves to multiple tables) |
+| `LSP004` | Readability hint — qualify a bare column when an alias is in scope |
+| `LSP005` | Direct `varchar` / `nvarchar` comparison |
+
+**Safe coding checks:**
+
+| Code | Diagnostic |
+|---|---|
+| `DML001` | `UPDATE` without `WHERE` |
+| `DML002` | `DELETE` without `WHERE` |
+| `DML003` | `INSERT` without column list |
+| `DML004` | `UPDATE` target uses `WITH (NOLOCK)` |
+| `LOG001` | Self-comparison (`column = column`) |
+| `DDL002` | Unnamed `PRIMARY KEY` or `UNIQUE` constraint |
+| `DDL003` | Unnamed `DEFAULT` constraint |
+
+**Variable tracking:**
+
+| Code | Diagnostic |
+|---|---|
+| `VAR001` | Undeclared variable |
+| `VAR002` | Unused variable |
+| `VAR003` | Unused parameter |
+| `VAR004` | Variable used before being set |
 
 ![Self-comparison diagnostic](Images/DiagnosticsSelfComparison.png)
 
@@ -76,99 +110,71 @@
 
 ![Unused variable diagnostic](Images/DiagnosticsUnusedVariable.png)
 
-- **Workspace Indexing**  
-  - Automatically indexes all `.sql` files in the workspace when workspace is opened in VS code
-  - Updates instantly as you type or save
+### Advanced diagnostic settings
 
-- **Parser-First Engine**  
-  - Advanced T-SQL parser (`@saralsql/tsql-parser`) provides accurate semantic analysis, diagnostics, and complex query handling
-  - Workspace indexing stays fast while semantic features use parser-backed scope and lineage data
+- `saralsql.showDiagnostics` — master on/off switch (default: `true`)  
+- `saralsql.enableSchemaValidation` — schema diagnostics LSP001–LSP004 (default: `true`, auto-suppressed when no schema is indexed)  
+- `saralsql.showParseIssues` — show raw parser errors (default: `false`; when off, SaralSQL only shows diagnostics on clean-parsing documents)  
+- `saralsql.disabledDiagnostics` — suppress specific codes by list, e.g. `["LSP004", "DML001"]`
 
 ---
 
-## 🚀 Getting Started
+## SSDT / .sqlproj support
 
-1. Install the extension from the VS Code Marketplace  
+For SQL Database Projects, SaralSQL respects project membership:
+
+- `saralsql.sqlproj.strictBuildMembership` (default: `true`) — only `Build` items contribute to workspace schema; Pre/Post Deploy files are validated locally only  
+- `saralsql.sqlproj.warnMissingProjectFile` (default: `true`) — flags SQL files missing from all `.sqlproj` items (`SSDT001`)  
+- `saralsql.sqlproj.missingProjectFileSeverity` (default: `warning`) — severity for `SSDT001`
+
+---
+
+## Performance
+
+- Indexes **2000+ SQL files in under 60 seconds** on first open  
+- Live update as you type — no save required  
+- Runs in a dedicated language server process; never blocks the editor UI  
+
+---
+
+## Getting started
+
+1. Install **SaralSQL** from the VS Code Marketplace  
 2. Open a folder or workspace containing `.sql` files  
-3. Start editing — features like definitions, references, completions, and hovers activate automatically  
+3. Features activate automatically — no extension configuration needed
 
-> 💡 Works best when your schema objects (tables, types, procedures) are defined in `.sql` files within your workspace.
-
----
-
-## ⚡ Performance
-
-- Tested on real-world projects
-- Designed to stay responsive even on large codebases
+> Works best when your schema objects (tables, views, types, stored procedures) are defined as `.sql` files inside your workspace.
 
 ---
 
-## ⚠️ Preview Notice
+## Known limitations
 
-This is an **Early-Access Preview**:
-- Optimized for **T-SQL / SQL Server** DDL & DML with advanced `@saralsql/tsql-parser`  
-- Dialects like Postgres or MySQL may partially work but are not officially supported.  
-- Real-time diagnostics now available for syntax and semantic validation, if you enable it from settings
-- Column and reference detection uses parser-backed indexing and analysis
-
-We’re releasing early to gather real-world feedback before expanding the feature set.
+- **Schema prefixes** — `dbo.TableName` and `TableName` resolve to the same object; multiple schemas with the same table name are not yet distinguished  
+- **Dialect** — optimized for **T-SQL / SQL Server**; Postgres, MySQL and others may partially work but are not tested  
+- **Cross-file accuracy** — schema resolution depends on having all schema files present in the open workspace  
 
 ---
 
-## 🛠 Planned Improvements
+## ⚠️ Preview
 
-- **Outline View** for procedures, tables, and columns  
-- **Workspace Symbol Search** (`Ctrl+T`) across SQL objects  
-- **Sharper editor behavior** around complex statement shapes and derived scopes  
-- **Schema-aware resolution** for databases with duplicate table names across schemas  
-- **Incremental indexing** for even faster performance on very large workspaces  
-- **Enhanced dialect support** for Postgres, MySQL, and other SQL variants
+SaralSQL is in **Early Access**. The core feature set is production-ready for T-SQL projects; the preview label reflects areas still being expanded:
 
----
+- Richer schema-prefix and multi-schema support  
+- Outline view for procedures, tables, and columns  
+- Workspace symbol search (`Ctrl+T`) across SQL objects  
+- Enhanced dialect support (Postgres, MySQL)  
+- Incremental indexing for very large workspaces  
 
-## ⚠️ Known Limitations
-
-This extension is intentionally lightweight and does **not** do full SQL semantic analysis.  
-Be aware of these trade-offs:
-
-- **Schemas**  
-  `dbo.TableName` and `TableName` are treated the same.  
-  Multiple schemas with the same table name are not yet distinguished.
-
-- **Cross-File Consistency**  
-  Accuracy depends on having all schema files in your workspace.
+**Feedback shapes the roadmap.** If something doesn't behave as expected, [open an issue](https://github.com/saralstalin/SaralSQL/issues) with the SQL snippet — reports from real projects have directly driven every release.
 
 ---
 
-## 🧑‍💻 Contributing & Feedback
+## Privacy
 
-We welcome feedback and bug reports!  
-- Open issues with sample SQL that doesn’t behave as expected  
-- Pull requests are encouraged — especially for dialect support or smarter parsing  
-- Share ideas for new features or parser improvements
+No telemetry. No network requests. All code and analysis stays in your workspace.
 
 ---
 
-## 📜 License
-MIT License
+## License
 
----
-
-## Regression Requirement
-
-Every functional change must include at least one regression test that fails before the change and passes after.
-
-This rule applies to fixes/features touching:
-- parsing and AST shape
-- scope/reference extraction
-- hover/definition/reference/completion behavior
-- diagnostics behavior
-
-Default required test layer is parser + index unit-style coverage. LSP integration tests are required only when index-level tests cannot reliably prove the behavior.
-
-Each PR must include a short **Regression scenario** note with:
-- input SQL snippet
-- expected behavior
-- test name(s) covering the scenario
-
-If no new test is added, the PR must state why existing tests already cover the change.
+MIT
