@@ -1314,6 +1314,42 @@ function inferStringLikeType(
     return null;
   }
 
+  // @variable.Column — parser emits BinaryExpression(operator:".", left:Variable, right:Identifier)
+  // for TVP parameters and inline table variables. Resolve the column type via the variable's
+  // declared dataType (CREATE TYPE) or its inline columns (DECLARE @t TABLE (...)).
+  if (node.type === "BinaryExpression" && node.operator === "."
+    && node.left?.type === "Variable" && node.right?.type === "Identifier") {
+    const varName = String(node.left.name ?? "").toLowerCase();
+    const colName = normalizeName(String(node.right.name ?? ""));
+    if (varName && colName) {
+      const varOffset = typeof node.left.start === "number" ? node.left.start : undefined;
+      const scopeAtVar = parsed?.scope?.root && typeof varOffset === "number"
+        ? parsed.scope.root.findInnermost(varOffset)
+        : parsed?.scope?.root;
+      const sym = scopeAtVar ? resolveSymbolCaseInsensitive(scopeAtVar, varName) : null;
+      if (sym) {
+        // Inline table variable: DECLARE @t TABLE (Col VARCHAR(100), ...)
+        const inlineCols = getSymbolColumns(sym);
+        const inlineCol = inlineCols.find((c: any) =>
+          normalizeName(c.rawName ?? c.name) === colName || normalizeName(c.name) === colName);
+        if (inlineCol?.type) {
+          return { type: getStringLikeType(String(inlineCol.type)), rawName: String(node.right.name ?? colName) };
+        }
+        // TVP parameter: @t dbo.MyType READONLY — look up the type definition
+        if (sym.dataType) {
+          const typeKey = normalizeName(String(sym.dataType));
+          const typeDef = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
+          const typeCol = typeDef?.columns?.find((c: any) =>
+            normalizeName(c.rawName ?? c.name) === colName || normalizeName(c.name) === colName);
+          if (typeCol?.type) {
+            return { type: getStringLikeType(String(typeCol.type)), rawName: String(node.right.name ?? colName) };
+          }
+        }
+      }
+    }
+    return null;
+  }
+
   if (node.type !== "Identifier") {
     if (node.expression) {
       return inferStringLikeType(node.expression, parsed, tablesByName, tableTypesByName);
@@ -1379,9 +1415,26 @@ function resolveTableForQualifier(
 
     for (const sym of visibleSymbols) {
       if (sym.kind === "Alias" && normalizeName(sym.name) === qualifier) {
-        const tableName = normalizeName(resolveAliasTableName(sym) ?? "");
+        const rawTarget = resolveAliasTableName(sym) ?? "";
+        const tableName = normalizeName(rawTarget);
         if (tableName) {
-          return tablesByName.get(tableName) || tableTypesByName.get(tableName);
+          const direct = tablesByName.get(tableName) || tableTypesByName.get(tableName);
+          if (direct) { return direct; }
+
+          // Alias targets a @variable (TVP parameter or inline table variable).
+          // Resolve via the variable's dataType (CREATE TYPE) or its inline columns.
+          if (rawTarget.startsWith("@")) {
+            const varSym = resolveSymbolCaseInsensitive(scopeAtPos, normalizeName(rawTarget));
+            if (varSym) {
+              const inlineCols = getSymbolColumns(varSym);
+              if (inlineCols.length > 0) { return { columns: inlineCols }; }
+              if (varSym.dataType) {
+                const typeKey = normalizeName(String(varSym.dataType));
+                const typeDef = tableTypesByName.get(typeKey) || tablesByName.get(typeKey);
+                if (typeDef) { return typeDef; }
+              }
+            }
+          }
         }
         const localCols = getSymbolColumns(sym);
         if (localCols.length > 0) {

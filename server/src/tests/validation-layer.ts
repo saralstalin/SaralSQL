@@ -783,6 +783,77 @@ SELECT 1 FROM cte WHERE VarName = NVarName;`;
   );
 });
 
+runCase("string-comparison-tvp-parameter-aliased-column-vs-table-column-fires-LSP005", () => {
+  // Regression: when a TVP alias is used (JOIN @employees emp ON emp.Name = e.Name),
+  // resolveTableForQualifier found the Alias symbol but couldn't resolve @employees to
+  // its CREATE TYPE definition because the alias target starts with "@".
+  indexText("file:///tvp-schema.sql", `
+CREATE TYPE dbo.EmpType AS TABLE (EmployeeId INT, Name VARCHAR(100));
+CREATE TABLE Employee (EmployeeId INT, Name NVARCHAR(100));
+`);
+  const sql = `
+CREATE PROCEDURE dbo.CheckNames @employees dbo.EmpType READONLY
+AS
+SELECT e.Name FROM Employee e
+JOIN @employees emp ON emp.Name = e.Name;
+`;
+  const diags = collectStringComparisonDiagnostics(parseSql(sql), getLineStarts(sql), tablesByName, tableTypesByName);
+  const lsp005 = diags.filter(d => d.code === "LSP005");
+  assert.ok(lsp005.length > 0, "VARCHAR TVP column (via alias) vs NVARCHAR table column should fire LSP005");
+});
+
+runCase("string-comparison-tvp-parameter-direct-column-fires-LSP005", () => {
+  // Regression: direct @tvp.Col = t.Col (no alias for the TVP) was silently skipped because
+  // inferStringLikeType received BinaryExpression(operator:".", left:Variable, right:Identifier)
+  // but only handled Literal, CastExpression, and Identifier nodes.
+  indexText("file:///tvp-direct-schema.sql", `
+CREATE TYPE dbo.EmpType AS TABLE (EmployeeId INT, Name VARCHAR(100));
+CREATE TABLE Employee (EmployeeId INT, Name NVARCHAR(100));
+`);
+  const sql = `
+CREATE PROCEDURE dbo.CheckNames @employees dbo.EmpType READONLY
+AS
+SELECT e.Name FROM Employee e
+WHERE @employees.Name = e.Name;
+`;
+  const diags = collectStringComparisonDiagnostics(parseSql(sql), getLineStarts(sql), tablesByName, tableTypesByName);
+  const lsp005 = diags.filter(d => d.code === "LSP005");
+  assert.ok(lsp005.length > 0, "VARCHAR TVP column (direct @var.Col) vs NVARCHAR table column should fire LSP005");
+});
+
+runCase("string-comparison-inline-table-variable-column-fires-LSP005", () => {
+  // Regression: @tableVar.Col comparisons with inline DECLARE @t TABLE (...) were also
+  // not handled — same BinaryExpression AST shape as TVP.
+  indexText("file:///inline-schema.sql", `
+CREATE TABLE Employee (EmployeeId INT, Name NVARCHAR(100));
+`);
+  const sql = `
+DECLARE @tmp TABLE (EmployeeId INT, Name VARCHAR(100));
+SELECT e.Name FROM Employee e
+JOIN @tmp t ON t.Name = e.Name;
+`;
+  const diags = collectStringComparisonDiagnostics(parseSql(sql), getLineStarts(sql), tablesByName, tableTypesByName);
+  const lsp005 = diags.filter(d => d.code === "LSP005");
+  assert.ok(lsp005.length > 0, "VARCHAR inline table-variable column vs NVARCHAR table column should fire LSP005");
+});
+
+runCase("string-comparison-same-type-tvp-stays-quiet", () => {
+  // Same string type on both sides (both VARCHAR) must not fire.
+  indexText("file:///tvp-quiet-schema.sql", `
+CREATE TYPE dbo.EmpType AS TABLE (EmployeeId INT, Name VARCHAR(100));
+CREATE TABLE Employee (EmployeeId INT, Name VARCHAR(100));
+`);
+  const sql = `
+CREATE PROCEDURE dbo.Check @employees dbo.EmpType READONLY
+AS
+SELECT e.Name FROM Employee e
+JOIN @employees emp ON emp.Name = e.Name;
+`;
+  const diags = collectStringComparisonDiagnostics(parseSql(sql), getLineStarts(sql), tablesByName, tableTypesByName);
+  const lsp005 = diags.filter(d => d.code === "LSP005");
+  assert.strictEqual(lsp005.length, 0, "Same string type (both VARCHAR) on TVP vs table should not fire LSP005");
+});
+
 runCase("string-comparison-inferStringLikeType-edge-cases", () => {
   const schemaUri = "file:///validation/infer-edge-schema.sql";
   indexText(schemaUri, "CREATE TABLE T (VC VARCHAR(100), NVC NVARCHAR(100), N INT);");

@@ -30,7 +30,7 @@ SaralSQL is the third option: **parse and index your `.sql` source files at edit
 |---|---|
 | **Go to Definition** | Jump to any table, view, type, or column definition |
 | **Find All References** | Locate every usage across all `.sql` files in your workspace |
-| **Auto-completion** | Table names, column names, alias-prefixed columns (`e.`) | auto expand `*`
+| **Auto-completion** | Table names, column names, alias-prefixed columns (`e.`) , auto expand `*`
 | **Hover** | See column type and definition context on hover |
 | **Real-time diagnostics** | Unknown tables, unknown columns, unsafe DML, variable issues — as you type |
 | **SSDT / .sqlproj support** | Schema contribution controlled by project membership |
